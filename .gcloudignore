@@ -1,0 +1,25 @@
+# O que NÃO sobe pro build. Sem isto o upload leva 43 MB de parquet + 14 MB de
+# zips que o container regenera/não usa.
+.git/
+.gitignore
+.claude/
+cache/
+undefined/
+*.zip
+*.parquet
+*.pyc
+__pycache__/
+.DS_Store
+
+# Scripts que só fazem sentido no laptop (túnel, vigia, launchd, pré-aquecimento
+# local). No Cloud Run não há túnel nem máquina pra manter acordada.
+tunnel.sh
+tunnel_watch.sh
+refresh.sh
+supervisor.sh
+run.sh
+setup_named_tunnel.sh
+deploy_cloudrun.sh
+bin/
+scripts/
+test_wa_notes.py

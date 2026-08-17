@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}{% if ov_tab == 'ae' %}{{ 'Leaders' if grain == 'leader' else 'AE' }} Overview{% else %}Sales Overview{% endif %} · pepeuhacker{% endblock %}
+
+{% block content %}
+{% set is_leader = (grain == 'leader') %}
+{% if ov_tab == 'ae' and is_leader %}
+{# ============= LEADERS OVERVIEW: rankings + drill (visão Sales Leaders) ============= #}
+{# No Leaders, clicar num líder vai DIRETO pros deals do time (sem o ranking). #}
+{% set leader_drill = is_leader and deal_rows is not none %}
+{% if leader_drill %}
+<h1>Deals do time · {{ deal_ae }}</h1>
+<p class="page-sub">
+  <b>{{ range_label }}</b> · time completo
+  <a href="{{ url_for('leaders_overview_team', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, region=ctx.filters.region) }}" style="color:#1D4ED8;margin-left:6px">← ranking de líderes</a>
+</p>
+{% else %}
+<h1>{{ 'Leaders Overview' if is_leader else 'AE Overview' }}</h1>
+{% include "_chart_toggles.html" %}
+{# O que cada barra é já está no título/sub de cada rank_chart, e "clique pra
+   explodir" o cursor entrega. Sobra só a janela. #}
+<p class="page-sub"><b>{{ range_label }}</b>{% if is_leader %} · cada barra é a soma do time{% endif %}</p>
+
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+
+{% set _ov_grain = 'leader' if is_leader else 'ae' %}
+{# Chart 1 — receita (R$) #}
+{{ rank_chart(rank, ('Resultado dos líderes' if is_leader else 'Resultado dos vendedores'), sub='realizado × quota · % atingimento',
+              currency=true, legend_real='Realizado', legend_quota='Quota (meta)',
+              tip_real='Vendido', tip_quota='Quota', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+
+{# Chart 2 — new logos (contagem), MESMA estrutura, logo abaixo #}
+{{ rank_chart(rank_nl, ('New logos por líder' if is_leader else 'New logos por vendedor'), sub='aquisições realizadas × meta · % atingimento',
+              currency=false, legend_real='Realizado', legend_quota='Meta',
+              tip_real='Ganhos', tip_quota='Meta', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain, modal_kind='newlogo',
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+
+{% if rank.rows or (rank_nl and rank_nl.rows) %}{{ rank_chart_script() }}{% endif %}
+{% endif %}
+
+{# ===== Drill: deals fechados pelo AE selecionado (só quando 1 AE está filtrado) ===== #}
+{% if deal_rows is not none %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Deals fechados · <span style="color:var(--fg)">{{ deal_ae }}</span>
+      <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ deal_rows|length }} deal{{ 's' if deal_rows|length != 1 else '' }} em {{ range_label }}</span></h2>
+    <span class="ph" style="margin:0">{% if is_leader %}vendedor · {% endif %}nome · MRR · aquisição ou expansão</span>
+  </div>
+  {% if deal_rows %}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Deal</th>
+          {% if is_leader %}<th>Vendedor</th>{% endif %}
+          <th>Tipo</th>
+          <th class="n">MRR</th>
+          <th>Status</th>
+          <th class="n">Data do PO</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for d in deal_rows %}
+        <tr>
+          <td class="first">{{ d.deal }}</td>
+          {% if is_leader %}<td>{{ d.ae }}</td>{% endif %}
+          <td><span class="leg-dot" style="background:{{ '#2563EB' if d.kind == 'Aquisição' else ('#0F6E56' if d.kind == 'Expansão' else '#94A3B8') }};display:inline-block;vertical-align:middle;margin-right:6px"></span>{{ d.kind }}</td>
+          <td class="n"><b>{{ d.mrr|brl }}</b></td>
+          <td>
+            {% if d.status == 'aprovação' %}
+              <span style="font-size:11.5px;font-weight:600;color:#B45309;background:#FEF3C7;padding:2px 8px;border-radius:20px">em aprovação</span>
+            {% else %}
+              <span style="font-size:11.5px;font-weight:600;color:var(--green-ink);background:#D1FAE5;padding:2px 8px;border-radius:20px">validado</span>
+            {% endif %}
+          </td>
+          <td class="n">{{ d.date }}</td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          {% if is_leader %}<td></td>{% endif %}
+          <td></td>
+          <td class="n"><b style="color:var(--green-ink)">{{ (deal_rows|sum(attribute='mrr'))|brl }}</b></td>
+          <td></td><td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p style="color:var(--muted);font-size:13.5px;margin:8px 0 0">Nenhum deal fechado por <b>{{ deal_ae }}</b> em {{ range_label }}.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% elif ov_tab == 'ae' %}
+{# ============= AE OVERVIEW: vazio por ora — novo dash será construído aqui ============= #}
+<h1>AE Overview</h1>
+<div class="panel" style="text-align:center;padding:56px 24px;color:var(--muted);font-size:14px">
+  Em construção — os rankings de receita e new logos agora vivem no <b>Sales Overview</b>.
+</div>
+
+{% else %}
+{# ======================= SALES OVERVIEW: dados macro do time ======================= #}
+<h1>Sales Overview</h1>
+
+{# ===== 1ª linha: RECEITA (meta · realizado · % realizado) — cards grandes ===== #}
+<div class="kpis-big">
+  <div class="kpi acc">
+    <div class="kpi-l">Meta de receita</div>
+    <div class="kpi-v">{{ kpis.quota|brl if kpis.quota else '—' }}</div>
+  </div>
+  <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir os deals realizados (validado + hold)">
+    <div class="kpi-l">Realizado de receita</div>
+    <div class="kpi-v">{{ kpis.realized|brl }}</div>
+  </div>
+  <div class="kpi {% if kpis.rev_att and kpis.rev_att >= 1 %}grn{% else %}warn{% endif %}">
+    <div class="kpi-l">% realizado de receita</div>
+    <div class="kpi-v">{{ (kpis.rev_att*100)|round|int if kpis.rev_att is not none else '—' }}<span class="un">%</span></div>
+  </div>
+</div>
+
+{# Card "Reporte global ARR (US$)" removido — agora o filtro mestre de moeda
+   (MRR R$ / ARR US$) no topo converte a página inteira. #}
+
+{# ===== 2ª linha: NEW LOGOS (meta · realizado · % realizado) — cards grandes ===== #}
+<div class="kpis-big" style="margin-top:16px">
+  <div class="kpi acc">
+    <div class="kpi-l">Meta de new logo</div>
+    <div class="kpi-v">{{ kpis.nl_goal if kpis.has_newlogos else '—' }}</div>
+  </div>
+  {% set _nl_drill = url_for('overview_deals', kind='newlogo', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  <div class="kpi grn" data-drill="{{ _nl_drill }}" title="Ver quais são as new logos">
+    <div class="kpi-l">Realizado de new logo</div>
+    <div class="kpi-v">{{ kpis.nl_real }}</div>
+  </div>
+  <div class="kpi {% if kpis.nl_att and kpis.nl_att >= 1 %}grn{% else %}warn{% endif %}" data-drill="{{ _nl_drill }}" title="Ver quais são as new logos">
+    <div class="kpi-l">% realizado de new logo</div>
+    <div class="kpi-v">{% if kpis.has_newlogos and kpis.nl_att is not none %}{{ (kpis.nl_att*100)|round|int }}<span class="un">%</span>{% else %}—{% endif %}</div>
+  </div>
+</div>
+
+{# ===== Aquisição × Expansão — valor total (macro) · deals · ticket médio ===== #}
+<div class="kpis-4" style="margin-top:16px">
+  {% set _acq_drill = url_for('overview_deals', kind='acq', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  {% set _exp_drill = url_for('overview_deals', kind='exp', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  <div class="kpi acc" data-drill="{{ _acq_drill }}" title="Ver os deals de aquisição">
+    <div class="kpi-l"><span class="leg-dot" style="background:#2563EB;display:inline-block;vertical-align:middle;margin-right:6px"></span>Total em aquisição</div>
+    <div class="kpi-v">{{ acq.mrr|brl }}</div>
+    <div class="kpi-deals">{{ acq.deals }} deals</div>
+  </div>
+  <div class="kpi acc" data-drill="{{ _acq_drill }}" title="Ver os deals de aquisição">
+    <div class="kpi-l">Ticket médio · aquisição</div>
+    <div class="kpi-v">{{ acq.ticket|brl }}</div>
+  </div>
+  <div class="kpi grn" data-drill="{{ _exp_drill }}" title="Ver os deals de expansão">
+    <div class="kpi-l"><span class="leg-dot" style="background:#0F6E56;display:inline-block;vertical-align:middle;margin-right:6px"></span>Total em expansão</div>
+    <div class="kpi-v">{{ exp.mrr|brl }}</div>
+    <div class="kpi-deals">{{ exp.deals }} deals</div>
+  </div>
+  <div class="kpi grn" data-drill="{{ _exp_drill }}" title="Ver os deals de expansão">
+    <div class="kpi-l">Ticket médio · expansão</div>
+    <div class="kpi-v">{{ exp.ticket|brl }}</div>
+  </div>
+</div>
+
+{# ===== Performance por vendedor/líder: receita e new logos (ex-AE Overview) ===== #}
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+{% set _ov_grain = 'leader' if is_leader else 'ae' %}
+{{ rank_chart(rank, ('Resultado dos líderes' if is_leader else 'Resultado dos vendedores'), sub='realizado × quota · % atingimento',
+              currency=true, legend_real='Realizado', legend_quota='Quota (meta)',
+              tip_real='Vendido', tip_quota='Quota', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+
+{{ rank_chart(rank_nl, ('New logos por líder' if is_leader else 'New logos por vendedor'), sub='aquisições realizadas × meta · % atingimento',
+              currency=false, legend_real='Realizado', legend_quota='Meta',
+              tip_real='Ganhos', tip_quota='Meta', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain, modal_kind='newlogo',
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+
+{% if rank.rows or (rank_nl and rank_nl.rows) %}{{ rank_chart_script() }}{% endif %}
+{% endif %}
+{% include "_drilldown.html" %}
+{% endblock %}

@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+{% block title %}Pipeline · Funil WoW · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Funil WoW</h1>
+<div class="page-sub">
+  Snapshots de domingo 12h (BRT) · o filtro de período escolhe o par comparado
+  (<b>de</b> = anterior, <b>até</b> = atual)
+</div>
+
+{# ---------- Header com totais agregados ---------- #}
+<div class="panel">
+  <div class="snap-row">
+    <div class="snap-card">
+      <div class="snap-lbl">Snapshot anterior</div>
+      <div class="snap-date">{{ snap_prev_label }}</div>
+      <div class="snap-num">{{ totals.n_prev|intg }}</div>
+      <div class="snap-sub">deals · {{ totals.a_prev|brl }}</div>
+    </div>
+    <div class="snap-arrow">→</div>
+    <div class="snap-card">
+      <div class="snap-lbl">Snapshot atual</div>
+      <div class="snap-date">{{ snap_curr_label }}</div>
+      <div class="snap-num">{{ totals.n_curr|intg }}</div>
+      <div class="snap-sub">deals · {{ totals.a_curr|brl }}</div>
+    </div>
+    <div class="snap-card snap-card-delta {% if totals.n_delta >= 0 %}is-pos{% else %}is-neg{% endif %}" style="cursor:pointer"
+         data-drill="{{ url_for('pipeline_funnel_moves', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"
+         title="Explodir todas as movimentações do funil no período">
+      <div class="snap-lbl">Variação · Deals</div>
+      <div class="snap-num">{% if totals.n_delta >= 0 %}+{% endif %}{{ totals.n_delta|intg }}</div>
+      <div class="snap-sub">
+        {% if totals.n_delta_pct is not none %}
+          {% if totals.n_delta_pct >= 0 %}+{% endif %}{{ "%.1f"|format(totals.n_delta_pct) }}%
+        {% else %}—{% endif %}
+      </div>
+    </div>
+    <div class="snap-card snap-card-delta {% if totals.a_delta >= 0 %}is-pos{% else %}is-neg{% endif %}">
+      <div class="snap-lbl">Variação · Amount</div>
+      <div class="snap-num">{% if totals.a_delta >= 0 %}+{% endif %}{{ totals.a_delta|brl }}</div>
+      <div class="snap-sub">
+        {% if totals.a_delta_pct is not none %}
+          {% if totals.a_delta_pct >= 0 %}+{% endif %}{{ "%.1f"|format(totals.a_delta_pct) }}%
+        {% else %}—{% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ---------- Funil por estágio (2 painéis lado a lado) ---------- #}
+{% macro delta_pill(delta, pct, fmt) %}
+  {% if delta > 0 %}{% set cls = 'is-pos' %}{% set sign = '+' %}
+  {% elif delta < 0 %}{% set cls = 'is-neg' %}{% set sign = '' %}
+  {% else %}{% set cls = 'is-zero' %}{% set sign = '' %}{% endif %}
+  <span class="fnl-delta {{ cls }}">
+    <span class="fnl-delta-abs">
+      {%- if fmt == 'brl' -%}{{ sign }}{{ delta|brl }}{%- else -%}{{ sign }}{{ delta|intg }}{%- endif -%}
+    </span>
+    {% if pct is not none %}
+      <span class="fnl-delta-pct">
+        {%- if pct >= 0 %}+{% endif %}{{ "%.1f"|format(pct) }}%
+      </span>
+    {% endif %}
+  </span>
+{% endmacro %}
+
+<div class="fnl-grid">
+  {# --- Painel: Quantidade de Deals --- #}
+  <div class="panel">
+    <h2>Quantidade de Deals</h2>
+    <div class="fnl fnl-with-mov">
+      {% for s in stages %}
+        {% set w_curr = (s.n_curr / n_max * 100) if n_max else 0 %}
+        {% set w_prev = (s.n_prev / n_max * 100) if n_max else 0 %}
+        <div class="fnl-row" data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}" title="Explodir o que entrou/saiu de {{ s.label }}">
+          <div class="fnl-stage">{{ s.label }}</div>
+          <div class="fnl-bars">
+            <div class="fnl-bar fnl-bar-prev" title="Anterior" style="--w:{{ w_prev }}%">
+              <span class="fnl-bar-val">{{ s.n_prev|intg }}</span>
+            </div>
+            <div class="fnl-bar fnl-bar-curr" title="Atual" style="--w:{{ w_curr }}%">
+              <span class="fnl-bar-val">{{ s.n_curr|intg }}</span>
+            </div>
+          </div>
+          <div class="fnae-mov-cell">
+            {# Cada seta explode SÓ o seu parâmetro (o data-drill mais interno vence o da linha). #}
+            <span class="fnae-mov-in" title="Explodir quem ENTROU em {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='entrou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">→ {{ s.entrou|intg }}</span>
+            <span class="fnae-mov-adv" title="Explodir quem AVANÇOU de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='avancou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↑ {{ s.adv|intg }}</span>
+            <span class="fnae-mov-lost" title="Explodir quem foi pra LOST de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='lost', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↓ {{ s.lost|intg }}</span>
+            <span class="fnae-mov-back" title="Explodir quem VOLTOU de estágio a partir de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='voltou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↩ {{ s.voltou|intg }}</span>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="fnl-legend">
+      <span><span class="fnl-leg-dot fnl-leg-prev"></span>{{ snap_prev_label }}</span>
+      <span><span class="fnl-leg-dot fnl-leg-curr"></span>{{ snap_curr_label }}</span>
+      <span class="fnae-mov-in">→ entrou na etapa</span>
+      <span class="fnae-mov-adv">↑ avançou</span>
+      <span class="fnae-mov-lost">↓ lost</span>
+      <span class="fnae-mov-back">↩ voltou</span>
+    </div>
+  </div>
+
+  {# --- Painel: Amount em Pipeline --- #}
+  <div class="panel">
+    <h2>Amount em Pipeline</h2>
+    <div class="fnl fnl-with-mov">
+      {% for s in stages %}
+        {% set w_curr = (s.a_curr / a_max * 100) if a_max else 0 %}
+        {% set w_prev = (s.a_prev / a_max * 100) if a_max else 0 %}
+        <div class="fnl-row" data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}" title="Explodir o que entrou/saiu de {{ s.label }}">
+          <div class="fnl-stage">{{ s.label }}</div>
+          <div class="fnl-bars">
+            <div class="fnl-bar fnl-bar-prev" title="Anterior" style="--w:{{ w_prev }}%">
+              <span class="fnl-bar-val">{{ s.a_prev|brl }}</span>
+            </div>
+            <div class="fnl-bar fnl-bar-curr" title="Atual" style="--w:{{ w_curr }}%">
+              <span class="fnl-bar-val">{{ s.a_curr|brl }}</span>
+            </div>
+          </div>
+          <div class="fnae-mov-cell">
+            <span class="fnae-mov-in" title="Explodir o amount que ENTROU em {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='entrou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">→ {{ s.entrou_amt|brl }}</span>
+            <span class="fnae-mov-adv" title="Explodir o amount que AVANÇOU de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='avancou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↑ {{ s.adv_amt|brl }}</span>
+            <span class="fnae-mov-lost" title="Explodir o amount que foi pra LOST de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='lost', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↓ {{ s.lost_amt|brl }}</span>
+            <span class="fnae-mov-back" title="Explodir o amount que VOLTOU de estágio a partir de {{ s.label }}"
+                  data-drill="{{ url_for('pipeline_funnel_move_deals', stage=s.id, dir='voltou', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↩ {{ s.voltou_amt|brl }}</span>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="fnl-legend">
+      <span><span class="fnl-leg-dot fnl-leg-prev"></span>{{ snap_prev_label }}</span>
+      <span><span class="fnl-leg-dot fnl-leg-curr"></span>{{ snap_curr_label }}</span>
+      <span class="fnae-mov-in">→ entrou na etapa</span>
+      <span class="fnae-mov-adv">↑ avançou</span>
+      <span class="fnae-mov-lost">↓ lost</span>
+      <span class="fnae-mov-back">↩ voltou</span>
+    </div>
+  </div>
+</div>
+
+{# ---------- Por AE: toggle Quantidade ⇄ Amount ---------- #}
+<div class="panel fnae-section" data-mode="count">
+  <div class="fnae-toggle-row">
+    <h2 style="margin:0">Movimentação por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
+    <span style="font-size:12px;white-space:nowrap">
+      <span class="fnae-mov-in">→ entrou</span> ·
+      <span class="fnae-mov-adv">↑ avançou</span> ·
+      <span class="fnae-mov-lost">↓ lost</span> ·
+      <span class="fnae-mov-back">↩ voltou</span>
+    </span>
+    <div class="fnae-toggle">
+      <button type="button" class="fnae-mode-btn active" data-mode="count">Quantidade</button>
+      <button type="button" class="fnae-mode-btn" data-mode="amount">Amount</button>
+    </div>
+  </div>
+
+  {% if ae_data %}
+  <div class="fnae-grid">
+    {% for ae in ae_data %}
+      <div class="fnae-card">
+        <div class="fnae-head">
+          <span class="fnae-name" title="Explodir o que entrou/saiu de cada etapa · {{ ae.account_executive }}"
+                data-drill="{{ url_for('pipeline_funnel_moves', name=ae.account_executive, grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"
+                style="cursor:pointer">{{ ae.account_executive }}</span>
+          <span class="fnae-stats">
+            <span class="fnae-adv">+{{ ae.adv }} </span>
+            <span class="fnae-sep">·</span>
+            <span class="fnae-lost">−{{ ae.lost }}</span>
+            {% if ae.win_rate is not none %}
+              <span class="fnae-wr">· {{ "%.0f"|format(ae.win_rate) }}%</span>
+            {% endif %}
+          </span>
+        </div>
+
+        {# Mini-funil — modo Quantidade (snap_prev cinza vs snap_curr azul + pílula delta + decomposição saída) #}
+        <div class="fnae-sub fnae-only-count">
+          <div class="fnl">
+            {% for c in ae.cells %}
+              {% set w_curr = (c.n_curr / ae.n_max * 100) if ae.n_max else 0 %}
+              {% set w_prev = (c.n_prev / ae.n_max * 100) if ae.n_max else 0 %}
+              <div class="fnl-row" data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"
+                   title="Explodir o que entrou/saiu de {{ c.label }} · {{ ae.account_executive }}">
+                <div class="fnl-stage">{{ c.label }}</div>
+                <div class="fnl-bars">
+                  <div class="fnl-bar fnl-bar-prev" title="Anterior" style="--w:{{ w_prev }}%">
+                    <span class="fnl-bar-val">{{ c.n_prev }}</span>
+                  </div>
+                  <div class="fnl-bar fnl-bar-curr" title="Atual" style="--w:{{ w_curr }}%">
+                    <span class="fnl-bar-val">{{ c.n_curr }}</span>
+                  </div>
+                </div>
+                <div class="fnae-mov-cell">
+                  <span class="fnae-mov-in" title="Explodir quem ENTROU em {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='entrou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">→ {{ c.entrou }}</span>
+                  <span class="fnae-mov-adv" title="Explodir quem AVANÇOU de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='avancou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↑ {{ c.adv }}</span>
+                  <span class="fnae-mov-lost" title="Explodir quem foi pra LOST de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='lost', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↓ {{ c.lost }}</span>
+                  <span class="fnae-mov-back" title="Explodir quem VOLTOU de estágio a partir de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='voltou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↩ {{ c.voltou }}</span>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+
+        {# Mini-funil — modo Amount #}
+        <div class="fnae-sub fnae-only-amount">
+          <div class="fnl">
+            {% for c in ae.cells %}
+              {% set w_curr = (c.a_curr / ae.a_max * 100) if ae.a_max else 0 %}
+              {% set w_prev = (c.a_prev / ae.a_max * 100) if ae.a_max else 0 %}
+              <div class="fnl-row" data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"
+                   title="Explodir o que entrou/saiu de {{ c.label }} · {{ ae.account_executive }}">
+                <div class="fnl-stage">{{ c.label }}</div>
+                <div class="fnl-bars">
+                  <div class="fnl-bar fnl-bar-prev" title="Anterior" style="--w:{{ w_prev }}%">
+                    <span class="fnl-bar-val">{{ c.a_prev|brl }}</span>
+                  </div>
+                  <div class="fnl-bar fnl-bar-curr" title="Atual" style="--w:{{ w_curr }}%">
+                    <span class="fnl-bar-val">{{ c.a_curr|brl }}</span>
+                  </div>
+                </div>
+                <div class="fnae-mov-cell">
+                  <span class="fnae-mov-in" title="Explodir o amount que ENTROU em {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='entrou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">→ {{ c.entrou_amt|brl }}</span>
+                  <span class="fnae-mov-adv" title="Explodir o amount que AVANÇOU de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='avancou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↑ {{ c.adv_amt|brl }}</span>
+                  <span class="fnae-mov-lost" title="Explodir o amount que foi pra LOST de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='lost', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↓ {{ c.lost_amt|brl }}</span>
+                  <span class="fnae-mov-back" title="Explodir o amount que VOLTOU de estágio a partir de {{ c.label }} · {{ ae.account_executive }}"
+                        data-drill="{{ url_for('pipeline_funnel_move_deals', name=ae.account_executive, grain=grain, stage=c.stage_id, dir='voltou', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}">↩ {{ c.voltou_amt|brl }}</span>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="stalled-empty">Sem deals nos estágios do funil pelo filtro atual.</div>
+  {% endif %}
+</div>
+
+<style>
+  /* Setas de movimento = protagonistas (pedido): coluna do pill de saldo saiu,
+     grid encolhe pra 3 colunas e o mov-cell ganha corpo. → azul = entrou na
+     etapa · ↑ verde = avançou · ↓ vermelho = caiu pra lost. */
+  .fnl-with-mov .fnl-row{ grid-template-columns: 130px 1fr auto; cursor:pointer; }
+  .fnae-sub .fnl-row{ grid-template-columns: 92px 1fr auto; cursor:pointer; }
+  .fnl-row:hover .fnl-stage{ color: var(--blue, #2563EB); }
+  .fnae-mov-cell{ font-size: 12px; min-width: 190px; }
+  .fnae-sub .fnae-mov-cell{ font-size: 11px; min-width: 160px; }
+  .fnae-mov-cell .fnae-mov-in{ color:#2563EB; font-weight:700; }
+  .fnae-mov-cell .fnae-mov-adv{ margin-left: 8px; font-weight:700; }
+  .fnae-mov-cell .fnae-mov-lost{ margin-left: 8px; font-weight:700; }
+  .fnae-mov-cell .fnae-mov-back{ margin-left: 8px; font-weight:700; }
+  .fnae-mov-back{ color:#D97706; }
+  .fnl-legend .fnae-mov-in{ color:#2563EB; font-weight:600; }
+  .fnl-legend .fnae-mov-back{ color:#D97706; font-weight:600; }
+  /* Setas clicáveis individualmente — cada uma explode só o seu parâmetro. */
+  .fnae-mov-cell span[data-drill]{ cursor:pointer; }
+  .fnae-mov-cell span[data-drill]:hover{ text-decoration: underline; }
+</style>
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  document.querySelectorAll('.fnae-section').forEach(section => {
+    section.querySelectorAll('.fnae-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        section.querySelectorAll('.fnae-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        section.dataset.mode = btn.dataset.mode;
+      });
+    });
+  });
+})();
+</script>
+{% endblock %}

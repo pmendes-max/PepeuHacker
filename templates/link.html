@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Link de acesso · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Link de acesso</h1>
+<div class="page-sub">
+  Mesmo dashboard, mesmos dados — só endereços diferentes de chegar nele.
+</div>
+
+<div class="panel">
+  {# Público primeiro: é o único que funciona pra quem está em OUTRO local. #}
+  <div class="lk-row lk-primary">
+    <div>
+      <div class="lk-lbl">Para compartilhar <span class="lk-tag">de qualquer lugar</span></div>
+      <div class="lk-url">{{ urls.public or 'túnel fora do ar' }}</div>
+      <div class="lk-note">
+        {% if urls.public %}Funciona de qualquer rede. <b>Sem senha</b> — quem tiver o link entra.
+        Esta URL <b>muda</b> quando o túnel reinicia: volte aqui em vez de decorar.
+        {% else %}O túnel não está publicando. Suba com <code>./tunnel.sh</code> e recarregue.{% endif %}
+      </div>
+    </div>
+    {% if urls.public %}<button type="button" class="lk-copy" data-copy="{{ urls.public }}">Copiar</button>{% endif %}
+  </div>
+
+  <div class="lk-row">
+    <div>
+      <div class="lk-lbl">Mesma rede <span class="lk-tag lk-ok">estável</span></div>
+      <div class="lk-url" id="lk-mdns">{{ urls.mdns or '—' }}</div>
+      <div class="lk-note">Nome fixo da máquina: vale quando o IP mudar, mas só na mesma rede.</div>
+    </div>
+    {% if urls.mdns %}<button type="button" class="lk-copy" data-copy="{{ urls.mdns }}">Copiar</button>{% endif %}
+  </div>
+
+  <div class="lk-row">
+    <div>
+      <div class="lk-lbl">Endereço por IP <span class="lk-tag lk-warn">muda sozinho</span></div>
+      <div class="lk-url">{{ urls.ip or '—' }}</div>
+      <div class="lk-note">Funciona agora, mas o IP é DHCP e troca a cada renovação — o link antigo (10.8.160.226) morreu assim.</div>
+    </div>
+    {% if urls.ip %}<button type="button" class="lk-copy" data-copy="{{ urls.ip }}">Copiar</button>{% endif %}
+  </div>
+</div>
+
+<style>
+  .lk-row{display:flex;align-items:center;justify-content:space-between;gap:20px;
+    padding:18px 20px;border:1px solid var(--border);border-radius:12px;margin-bottom:12px}
+  .lk-primary{border-width:2px;border-color:#2563EB;
+    background:color-mix(in srgb, #2563EB 6%, var(--surface,#fff))}
+  .lk-lbl{font-size:12.5px;font-weight:600;color:var(--muted);margin-bottom:6px}
+  .lk-tag{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;
+    background:#2563EB;color:#fff;border-radius:20px;padding:2px 8px;margin-left:6px}
+  .lk-tag.lk-warn{background:#D97706}
+  .lk-tag.lk-ok{background:#15803D}
+  .lk-url{font-size:22px;font-weight:800;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+  .lk-note{margin-top:6px;font-size:12.5px;color:var(--muted)}
+  .lk-copy{border:1px solid var(--border);background:var(--surface,#fff);color:inherit;
+    border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;
+    white-space:nowrap;font-family:inherit}
+  .lk-copy:hover{border-color:#2563EB;color:#2563EB}
+</style>
+
+<script>
+(function(){
+  "use strict";
+  document.querySelectorAll('.lk-copy').forEach(function(b){
+    b.addEventListener('click', function(){
+      const v = b.dataset.copy || '';
+      const done = function(){ const t = b.textContent; b.textContent = 'Copiado ✓';
+                               setTimeout(function(){ b.textContent = t; }, 1400); };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(v).then(done);
+      } else {
+        // http:// não é secure context — clipboard API fica indisponível.
+        const ta = document.createElement('textarea');
+        ta.value = v; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } finally { ta.remove(); }
+      }
+    });
+  });
+})();
+</script>
+{% endblock %}

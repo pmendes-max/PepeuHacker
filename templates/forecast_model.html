@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Forecast · Modelo Analytics · pepeuhacker{% endblock %}
+
+{% macro pct(v) %}{% if v is not none %}{{ (v*100)|round|int }}%{% else %}—{% endif %}{% endmacro %}
+
+{% block content %}
+{% set is_leader = (grain == 'leader') %}
+<h1>Forecast · Modelo Analytics</h1>
+<p class="page-sub">
+  <b>{{ range_label }}</b> · Done = PO Won · Forecast = deals em Negotiation/Decision/Procurement
+  ponderados por conversão histórica (segmento × estágio × tipo)
+</p>
+
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+{{ rank_chart(chart, 'Projeção do modelo · por ' ~ unit, sub='Done + Forecast × Quota · % atingimento',
+              currency=true, legend_real='Done + Forecast', legend_quota='Quota',
+              tip_real='Done+Forecast', tip_quota='Quota', tip_line='Atingimento', toggle=true) }}
+{% if chart and chart.rows %}{{ rank_chart_script() }}{% endif %}
+
+{# ---------- Detalhe por vendedor/líder ---------- #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Detalhe por {{ unit }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· Done + Forecast do modelo vs Quota</span></h2>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ 'Líder' if is_leader else 'Vendedor' }}</th>
+          <th>Segmento</th>
+          <th class="n">Done</th>
+          <th class="n">Forecast</th>
+          <th class="n grp">Projeção</th>
+          <th class="n">Quota</th>
+          <th class="n grp">% atingimento</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in table %}
+        <tr>
+          <td class="first">{{ r.account_executive }}</td>
+          <td style="color:var(--muted)">{{ r.segment }}</td>
+          <td class="n" style="color:#0F6E56">{% if r.done %}{{ r.done|brl }}{% else %}—{% endif %}</td>
+          <td class="n" style="color:#2563EB">{% if r.forecast %}{{ r.forecast|brl }}{% else %}—{% endif %}</td>
+          <td class="n grp"><b>{{ r.projection|brl }}</b></td>
+          <td class="n">{% if r.quota %}{{ r.quota|brl }}{% else %}—{% endif %}</td>
+          <td class="n grp"><b style="color:{{ '#0F6E56' if (r.attainment and r.attainment >= 1) else '#185FA5' }}">{{ pct(r.attainment) }}</b></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          <td></td>
+          <td class="n" style="color:#0F6E56"><b>{{ totals.done|brl }}</b></td>
+          <td class="n" style="color:#2563EB"><b>{{ totals.forecast|brl }}</b></td>
+          <td class="n grp"><b>{{ totals.projection|brl }}</b></td>
+          <td class="n"><b>{{ totals.quota|brl }}</b></td>
+          <td class="n grp"><b>{{ pct(totals.attainment) }}</b></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ---------- Matriz de probabilidades usada ---------- #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Probabilidades do modelo <span style="font-size:13px;font-weight:400;color:var(--muted)">· conversão Q4+Q1, já com desconto de segurança de {{ ((1-safety)*100)|round|int }}%</span></h2>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Segmento</th><th>Estágio</th>
+          <th class="n">Aquisição</th><th class="n">Expansão</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for seg in ['enterprise','midmarket','commercial'] %}
+        {% for st in stage_order %}
+        <tr>
+          {% if loop.first %}<td class="first"><b>{{ seg_label[seg] }}</b></td>{% else %}<td></td>{% endif %}
+          <td>{{ stage_label[st] }}</td>
+          <td class="n">{{ (prob[seg][st].acq*safety*100)|round|int }}%<span style="color:var(--muted-2);font-size:11px"> ({{ (prob[seg][st].acq*100)|round|int }}%)</span></td>
+          <td class="n">{{ (prob[seg][st].exp*safety*100)|round|int }}%<span style="color:var(--muted-2);font-size:11px"> ({{ (prob[seg][st].exp*100)|round|int }}%)</span></td>
+        </tr>
+        {% endfor %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="ph" style="margin:12px 2px 0">Percentual <b>efetivo</b> (original entre parênteses) — desconto de segurança de {{ ((1-safety)*100)|round|int }}% aplicado a todas as taxas. Só entram deals em <b>Negotiation · Decision · Procurement</b> com close date no trimestre. Times: <b>Commercial</b> = Bernardo · João Tavares · <b>MidMarket</b> = Fernando · Arthur · <b>Enterprise</b> = Scopel · Gustavo Giovani.</p>
+</div>
+{% endblock %}

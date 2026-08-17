@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Pipeline · Visitas · pepeuhacker{% endblock %}
+
+{% block content %}
+{% set is_leader = (grain == 'leader') %}
+{% set unit = 'líder' if is_leader else 'vendedor' %}
+<h1>Visitas</h1>
+{% include "_chart_toggles.html" %}
+{# Campo/IA Center são termos do negócio, não explicação da página — ficam.
+   O resto (o que é a barra, quem filtra) sai. #}
+<p class="page-sub">
+  <b>{{ range_label }}</b> · campo <b>{{ tot_field }}</b> (AE foi ao cliente) ·
+  IA Center <b>{{ tot_ia }}</b> (cliente veio à Tractian)
+</p>
+
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+
+{# Chart 1 — visitas do vendedor no cliente (campo) #}
+{{ rank_chart(chart_field, 'Visitas no cliente · por ' ~ unit,
+              sub='vendedor foi até o cliente (campo)', currency=false, single=true,
+              legend_real='Visitas', tip_real='Visitas',
+              order_note='ordenado por nº de visitas (maior → menor) · clique pra filtrar') }}
+
+{# Chart 2 — visitas de clientes no IA Center #}
+{{ rank_chart(chart_ia, 'Visitas ao IA Center · por ' ~ unit,
+              sub='cliente veio ao IA Center da Tractian', currency=false, single=true,
+              legend_real='Visitas', tip_real='Visitas',
+              order_note='ordenado por nº de visitas (maior → menor) · clique pra filtrar') }}
+
+{% if (chart_field and chart_field.rows) or (chart_ia and chart_ia.rows) %}{{ rank_chart_script() }}{% endif %}
+
+{% if not chart_field and not chart_ia %}
+<div class="panel"><p style="color:var(--muted);padding:8px 0">Nenhuma visita registrada no período <b>{{ range_label }}</b> para os filtros atuais.</p></div>
+{% endif %}
+{% endblock %}

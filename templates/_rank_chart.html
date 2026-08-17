@@ -1,0 +1,151 @@
+{# ============================================================================
+   Combo bar+line REUSÁVEL — padrão único de chart de ranking do dashboard.
+   2 barras (realizado verde + quota/meta cinza) + linha no eixo direito.
+   Geometria pré-computada no Python (_build_rank_chart) → dict `rk`.
+   `r.line_label` já vem formatado ("117%" ou "2,5x"); a cor da linha usa `r.hit`.
+   TODA coluna é clicável (drill via r.drill_url — cobre as 2 barras e o ponto).
+   Usado por /overview (receita, new logos) e /pipeline (cobertura early/late).
+   Chame rank_chart(...) por chart e rank_chart_script() UMA vez no fim da página.
+   ========================================================================== #}
+{% macro rank_chart(rk, title, sub='', currency=true,
+                    legend_real='Realizado', legend_quota='Quota',
+                    legend_line='% atingimento',
+                    tip_real='Realizado', tip_quota='Quota', tip_line='Atingimento',
+                    order_note='ordenado por % de atingimento (maior → menor) · clique no nome pra ver o detalhe',
+                    goal_label='', toggle=false, single=false,
+                    modal_endpoint='', modal_grain='', modal_bucket='', modal_kind='',
+                    modal_from='', modal_to='', show_line=true) %}
+{% set _dd_extra = '&grain=' ~ modal_grain ~ '&bucket=' ~ modal_bucket ~ ('&kind=' ~ modal_kind if modal_kind else '') ~ ('&date_from=' ~ modal_from if modal_from else '') ~ ('&date_to=' ~ modal_to if modal_to else '') %}
+{% if rk and rk.rows %}
+{% set lt = ' leg-toggle is-on' if toggle else '' %}
+<div class="panel">
+  <div class="panel-head">
+    {# Só emite o span quando há sub — senão o título fecha com um "·" órfão. #}
+    <h2>{{ title }}{% if sub %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ sub }}</span>{% endif %}</h2>
+    <span class="ph" style="margin:0">{{ order_note }}</span>
+  </div>
+  {# --c = cor da série, pro chip acender na própria cor (regra global
+     .leg-toggle.is-on). Mesma cor do swatch/linha, nunca uma segunda escolha. #}
+  <div class="rank-legend">
+    <span class="rl-item{{ lt }}" style="--c:#0F6E56"{% if toggle %} data-ch="real"{% endif %}><span class="rl-sw" style="background:#0F6E56"></span>{{ legend_real }}</span>
+    {% if not single %}
+    <span class="rl-item{{ lt }}" style="--c:#64748B"{% if toggle %} data-ch="quota"{% endif %}><span class="rl-sw" style="background:#94A3B8"></span>{{ legend_quota }}</span>
+    {% if show_line %}<span class="rl-item{{ lt }}" style="--c:#1D4ED8"{% if toggle %} data-ch="line"{% endif %}><span class="rl-line"></span>{{ legend_line }}</span>{% endif %}
+    {% if rk.goal_y is not none %}<span class="rl-item{{ lt }}" style="--c:#B45309"{% if toggle %} data-ch="goal"{% endif %}><span class="rl-line rl-line-goal"></span>{{ goal_label }}</span>{% endif %}
+    {% endif %}
+  </div>
+  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden;position:relative"
+       data-real-label="{{ tip_real }}" data-quota-label="{{ tip_quota }}" data-line-label="{{ tip_line }}"{% if single %} data-single="1"{% endif %}>
+    <svg viewBox="0 0 {{ rk.w }} {{ rk.h }}" width="{{ rk.w }}" height="{{ rk.h }}"
+         style="min-width:100%;display:block" font-family="inherit">
+      {# gridlines + eixo esquerdo #}
+      {% for t in rk.yL %}
+        <line x1="{{ rk.left }}" y1="{{ t.y }}" x2="{{ rk.right_x }}" y2="{{ t.y }}"
+              stroke="var(--border-soft)" stroke-width="1"/>
+        <text x="{{ rk.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="13" fill="var(--muted)">{{ t.label }}</text>
+      {% endfor %}
+      {# eixo direito (linha) #}
+      {% for t in rk.yR %}
+        <text x="{{ rk.right_x + 10 }}" y="{{ t.y + 4.5 }}" text-anchor="start" font-size="13" fill="#2563EB">{{ t.label }}</text>
+      {% endfor %}
+      {# barras: realizado (verde) + quota/meta (cinza), com rótulo de valor em cima #}
+      {% for r in rk.rows %}
+        {% if r.qh > 0 %}
+          <rect class="rk-quota" x="{{ r.qx }}" y="{{ r.qy }}" width="{{ r.qw }}" height="{{ r.qh }}" rx="3" fill="#94A3B8"/>
+          <text class="rk-quota" x="{{ r.qx + r.qw/2 }}" y="{{ r.qy - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#64748B" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{{ r.quota|brl|replace('R$ ','') }}{% else %}{{ r.quota|intg }}{% endif %}</text>
+        {% endif %}
+        {% if r.rh > 0 %}
+          <rect class="rk-real" x="{{ r.rx }}" y="{{ r.ry }}" width="{{ r.rw }}" height="{{ r.rh }}" rx="3" fill="#0F6E56"/>
+          <text class="rk-real" x="{{ r.rx + r.rw/2 }}" y="{{ r.ry - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#0F6E56" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{{ r.realized|brl|replace('R$ ','') }}{% else %}{{ r.realized|intg }}{% endif %}</text>
+        {% endif %}
+        {% if modal_endpoint %}
+          <text x="{{ r.cx }}" y="{{ rk.base_y + 18 }}" text-anchor="end" font-size="13" fill="var(--fg-soft)"
+                transform="rotate(-35 {{ r.cx }} {{ rk.base_y + 18 }})" style="cursor:pointer"
+                data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}?name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}">{{ r.short }}</text>
+        {% else %}
+          <a href="{{ r.drill_url }}">
+            <text x="{{ r.cx }}" y="{{ rk.base_y + 18 }}" text-anchor="end" font-size="13" fill="var(--fg-soft)"
+                  transform="rotate(-35 {{ r.cx }} {{ rk.base_y + 18 }})">{{ r.short }}</text>
+          </a>
+        {% endif %}
+      {% endfor %}
+      {# baseline #}
+      <line x1="{{ rk.left }}" y1="{{ rk.base_y }}" x2="{{ rk.right_x }}" y2="{{ rk.base_y }}" stroke="var(--border)" stroke-width="1.5"/>
+      {# meta dinâmica (linha tracejada) — só quando há goal_y #}
+      {% if rk.goal_y is not none %}
+      <line class="rk-goal" x1="{{ rk.left }}" y1="{{ rk.goal_y }}" x2="{{ rk.right_x }}" y2="{{ rk.goal_y }}"
+            stroke="#D97706" stroke-width="2" stroke-dasharray="7 5"/>
+      <text class="rk-goal" x="{{ rk.right_x - 4 }}" y="{{ rk.goal_y - 7 }}" text-anchor="end" font-size="12.5" font-weight="700"
+            fill="#B45309" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{{ goal_label }}</text>
+      {% endif %}
+      {# linha do eixo direito #}
+      {% if rk.line_pts %}<polyline class="rk-line" points="{{ rk.line_pts }}" fill="none" stroke="#2563EB" stroke-width="3" stroke-linejoin="round"/>{% endif %}
+      {# Tendência (regressão linear) de cada série de barra — tracejada, na cor da série. #}
+      {% if rk.trend_real %}<polyline class="rk-real" points="{{ rk.trend_real }}" fill="none" stroke="#0F6E56" stroke-width="2.5" stroke-dasharray="8 5" stroke-linecap="round"/>{% endif %}
+      {% if rk.trend_quota %}<polyline class="rk-quota" points="{{ rk.trend_quota }}" fill="none" stroke="#64748B" stroke-width="2.5" stroke-dasharray="8 5" stroke-linecap="round"/>{% endif %}
+      {% for r in rk.rows if r.attainment is not none %}
+        <circle class="rk-line" cx="{{ r.cx }}" cy="{{ r.ay }}" r="5.5" fill="var(--surface)" stroke="#2563EB" stroke-width="2.5"/>
+        <text class="rk-line" x="{{ r.cx }}" y="{{ r.aly }}" text-anchor="middle" font-size="13" font-weight="700"
+              fill="{{ '#0F6E56' if r.hit else '#185FA5' }}" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{{ r.line_label }}</text>
+      {% endfor %}
+      {# zonas de hover clicáveis (por cima) — cobrem as 2 barras e o ponto → drill #}
+      {% for r in rk.rows %}
+        {% set _hz %}<rect class="rank-hz" x="{{ r.zx }}" y="{{ rk.top }}" width="{{ rk.step }}" height="{{ rk.base_y - rk.top }}"
+              fill="#2563EB" fill-opacity="0" pointer-events="all"
+              data-name="{{ r.name }}" data-leader="{{ r.leader or '' }}"
+              {% if modal_endpoint %}data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}?name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}"{% endif %}
+              data-realized="{% if currency %}{{ r.realized|brl }}{% else %}{{ r.realized|intg }}{% endif %}"
+              data-quota="{% if currency %}{{ r.quota|brl }}{% else %}{{ r.quota|intg }}{% endif %}"
+              data-att="{{ r.line_label }}"></rect>{% endset %}
+        {% if modal_endpoint %}{{ _hz|safe }}{% else %}<a href="{{ r.drill_url }}">{{ _hz|safe }}</a>{% endif %}
+      {% endfor %}
+    </svg>
+    <div class="rank-tip" hidden></div>
+  </div>
+</div>
+{% endif %}
+{% endmacro %}
+
+{# Script de hover — chame UMA vez por página; itera todas as .rank-wrap. #}
+{% macro rank_chart_script() %}
+<script>
+(function(){
+  "use strict";
+  // Legenda clicável (liga/desliga série) — igual ao /demand. Só nos charts com
+  // .leg-toggle (habilitado via toggle=true na macro). Esconde os elementos .rk-<ch>.
+  document.querySelectorAll('.rank-legend .leg-toggle').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      const panel = btn.closest('.panel');
+      const wrap = panel ? panel.querySelector('.rank-wrap') : null;
+      if (!wrap || !btn.dataset.ch) return;
+      const on = btn.classList.toggle('is-on');
+      btn.classList.toggle('is-off', !on);
+      wrap.classList.toggle('off-' + btn.dataset.ch, !on);
+    });
+  });
+  document.querySelectorAll('.rank-wrap').forEach(function(wrap){
+    const tip = wrap.querySelector('.rank-tip');
+    if (!tip) return;
+    const rl = wrap.dataset.realLabel || 'Realizado';
+    const ql = wrap.dataset.quotaLabel || 'Quota';
+    const ll = wrap.dataset.lineLabel || 'Atingimento';
+    const single = wrap.dataset.single === '1';
+    wrap.querySelectorAll('.rank-hz').forEach(z => {
+      z.addEventListener('mousemove', e => {
+        tip.innerHTML = '<b>' + z.dataset.name + '</b>'
+          + (z.dataset.leader ? '<br><span style="opacity:.7">' + z.dataset.leader + '</span>' : '')
+          + '<br>' + rl + ': <b>' + z.dataset.realized + '</b>'
+          + (single ? '' : ('<br>' + ql + ': ' + z.dataset.quota
+          + '<br>' + ll + ': ' + z.dataset.att));
+        tip.hidden = false;
+        let x = e.clientX + 14, y = e.clientY + 14;
+        if (x + tip.offsetWidth > window.innerWidth - 8) x = e.clientX - tip.offsetWidth - 14;
+        tip.style.left = x + 'px';
+        tip.style.top = y + 'px';
+      });
+      z.addEventListener('mouseleave', () => { tip.hidden = true; });
+    });
+  });
+})();
+</script>
+{% endmacro %}

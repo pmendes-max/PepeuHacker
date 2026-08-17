@@ -1,0 +1,199 @@
+{# ============================================================
+   Drill-down modal COMPARTILHADO (explode ao clicar).
+   Uso nos relatórios:
+     1) include uma vez:  {% include "_drilldown.html" %}
+     2) marque o elemento clicável com:  data-drill="{{ url_for('rota_deals', **args) }}"
+        (opcional data-drill-title="..." pra um título imediato antes do fetch)
+   O endpoint deve devolver JSON:
+     { "title": str, "subtitle": str,
+       "columns": [ {"key","label","type"?: text|money|int|date, "align"?: left|right} ],
+       "rows": [ { <key>: value, ... } ] }
+   Um só modal atende todos os relatórios — cada endpoint define suas colunas.
+   ============================================================ #}
+<div id="dd-modal" class="dd-overlay" hidden>
+  <div class="dd-panel" role="dialog" aria-modal="true" aria-labelledby="dd-title">
+    <div class="dd-head">
+      <div>
+        <div id="dd-title" class="dd-title">—</div>
+        <div id="dd-sub" class="dd-sub"></div>
+      </div>
+      <div class="dd-actions">
+        <button type="button" class="dd-csv" id="dd-csv">⬇ CSV</button>
+        <button type="button" class="dd-close" id="dd-close" aria-label="Fechar">&times;</button>
+      </div>
+    </div>
+    <div class="dd-body">
+      <table class="dd-table">
+        <thead><tr id="dd-head-row"></tr></thead>
+        <tbody id="dd-rows"></tbody>
+      </table>
+      <div id="dd-loading" class="dd-empty">Carregando…</div>
+      <div id="dd-empty" class="dd-empty" hidden>Sem deals para este recorte.</div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .dd-overlay{position:fixed;inset:0;background:rgba(15,23,42,.55);display:flex;
+    align-items:center;justify-content:center;z-index:1000;padding:24px}
+  .dd-overlay[hidden]{display:none}
+  .dd-panel{background:var(--surface,#fff);color:inherit;border-radius:12px;
+    width:min(960px,96vw);max-height:88vh;display:flex;flex-direction:column;
+    box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}
+  .dd-head{display:flex;align-items:flex-start;justify-content:space-between;
+    gap:16px;padding:16px 20px;border-bottom:1px solid rgba(100,116,139,.2)}
+  .dd-title{font-size:18px;font-weight:700}
+  .dd-sub{font-size:12px;opacity:.7;margin-top:3px}
+  .dd-actions{display:flex;align-items:center;gap:10px}
+  .dd-csv{background:none;border:1px solid rgba(100,116,139,.4);border-radius:7px;
+    padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;color:inherit;
+    white-space:nowrap}
+  .dd-csv:hover{border-color:var(--blue,#2563EB);color:var(--blue,#2563EB)}
+  .dd-close{background:none;border:none;font-size:26px;line-height:1;cursor:pointer;
+    color:inherit;opacity:.55;padding:0 4px}
+  .dd-close:hover{opacity:1}
+  .dd-body{overflow:auto;padding:0 4px 8px}
+  .dd-table{width:100%;border-collapse:collapse;font-size:13px}
+  .dd-table th,.dd-table td{padding:8px 12px;text-align:left;white-space:nowrap}
+  .dd-table thead th{position:sticky;top:0;background:var(--surface,#fff);z-index:1;
+    border-bottom:1px solid rgba(100,116,139,.25);cursor:pointer;font-weight:600;
+    user-select:none}
+  .dd-table thead th:hover{color:var(--blue,#2563EB)}
+  .dd-table th.dd-num,.dd-table td.dd-num{text-align:right}
+  .dd-table tbody tr:nth-child(even){background:rgba(100,116,139,.06)}
+  .dd-table td.dd-wrap{white-space:normal;max-width:320px}
+  .dd-empty{padding:24px;text-align:center;opacity:.6;font-size:13px}
+  .dd-link{color:var(--blue,#2563EB);text-decoration:none}
+  .dd-link:hover{text-decoration:underline}
+  [data-drill]{cursor:pointer}
+</style>
+
+<script>
+(function(){
+  "use strict";
+  const modal = document.getElementById('dd-modal');
+  if (!modal || modal.dataset.wired) return;
+  modal.dataset.wired = '1';
+
+  const $ = id => document.getElementById(id);
+  const elHeadRow=$('dd-head-row'), elRows=$('dd-rows'), elTitle=$('dd-title'),
+        elSub=$('dd-sub'), elEmpty=$('dd-empty'), elLoad=$('dd-loading');
+  const fmtInt = n => Number(n||0).toLocaleString('pt-BR').replace(/,/g,'.');
+  const esc = s => String(s==null?'':s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const fmtMoney = v => (window.fmtMoneyMode ? window.fmtMoneyMode(v, {zeroDash:true})
+                        : (Number(v) > 0 ? 'R$ ' + fmtInt(Math.round(v)) : '—'));
+  const fmtDate  = s => { if(!s) return '—'; const p=String(s).slice(0,10).split('-');
+                          return p.length===3 ? `${p[2]}/${p[1]}/${p[0]}` : s; };
+  const isNum = t => t==='money' || t==='int' || t==='money_signed';
+  const fmtSigned = v => (window.fmtMoneyMode ? window.fmtMoneyMode(v, {signed:true})
+                         : (Number(v)>=0?'+':'−') + 'R$ ' + fmtInt(Math.abs(Math.round(v))));
+  const fmtCell = (v,t) => t==='money' ? fmtMoney(v) : t==='date' ? fmtDate(v)
+                        : t==='int' ? fmtInt(v) : t==='money_signed' ? fmtSigned(v)
+                        : esc(v==null?'—':v);
+
+  let cols = [], rows = [], sortI = -1, sortDir = 1;
+
+  function renderHead(){
+    elHeadRow.innerHTML = cols.map((c,i) =>
+      `<th data-i="${i}" class="${isNum(c.type)||c.align==='right'?'dd-num':''}">${esc(c.label)}</th>`
+    ).join('');
+    elHeadRow.querySelectorAll('th').forEach(th => th.addEventListener('click', () => {
+      const i = +th.dataset.i;
+      if (sortI===i) sortDir = -sortDir;
+      else { sortI=i; sortDir = isNum(cols[i].type)||cols[i].type==='date' ? -1 : 1; }
+      renderBody();
+    }));
+  }
+  function sortedRows(){
+    let rs = rows.slice();
+    if (sortI >= 0) {
+      // `sortKey` permite ordenar por um campo diferente do exibido — ex.: a
+      // coluna mostra "M3S4" mas ordena pela data da semana, que é monótona.
+      const c = cols[sortI], sk = c.sortKey || c.key, num = isNum(c.type);
+      rs.sort((a,b) => {
+        let x=a[sk], y=b[sk];
+        if (num){ x=+x||0; y=+y||0; } else { x=String(x||'').toLowerCase(); y=String(y||'').toLowerCase(); }
+        return x<y?-sortDir : x>y?sortDir : 0;
+      });
+    }
+    return rs;
+  }
+  function renderBody(){
+    const rs = sortedRows();
+    elRows.innerHTML = rs.map(r => '<tr>' + cols.map(c => {
+      const cls = (isNum(c.type)||c.align==='right') ? 'dd-num' : (c.wrap ? 'dd-wrap' : '');
+      let inner = fmtCell(r[c.key], c.type);
+      if (c.link && r[c.link]) {
+        inner = `<a href="${esc(r[c.link])}" target="_blank" rel="noopener" class="dd-link">${inner}</a>`;
+      }
+      // Coluna com `drill`: a célula vira um 2º nível — clicar recarrega o
+      // modal com a URL guardada na linha (delegação global de [data-drill]).
+      if (c.drill && r[c.drill]) {
+        inner = `<span class="dd-link" data-drill="${esc(r[c.drill])}">${inner}</span>`;
+      }
+      return `<td class="${cls}">${inner}</td>`;
+    }).join('') + '</tr>').join('');
+    elEmpty.hidden = rs.length > 0;
+  }
+
+  function open(url, presetTitle){
+    elTitle.textContent = presetTitle || '—';
+    elSub.textContent = ''; elHeadRow.innerHTML=''; elRows.innerHTML='';
+    elEmpty.hidden = true; elLoad.hidden = false; elLoad.textContent = 'Carregando…';
+    modal.hidden = false; document.body.style.overflow = 'hidden';
+    sortI = -1; sortDir = 1;
+    // Passa a moeda ativa pro endpoint (só o subtítulo/total usa; valores das
+    // linhas são convertidos no cliente).
+    const mode = (window.__MONEY__ && window.__MONEY__.mode) || 'mrr';
+    url += (url.indexOf('?') >= 0 ? '&' : '?') + 'money=' + mode;
+    fetch(url, {headers:{'X-Requested-With':'fetch'}})
+      .then(r => r.json())
+      .then(j => {
+        cols = j.columns || []; rows = j.rows || [];
+        elTitle.textContent = j.title || presetTitle || '';
+        elSub.textContent = j.subtitle || '';
+        elLoad.hidden = true;
+        renderHead(); renderBody();
+      })
+      .catch(() => { elLoad.textContent = 'Erro ao carregar.'; });
+  }
+  function close(){ modal.hidden = true; document.body.style.overflow=''; }
+
+  // Delegação: qualquer elemento com data-drill abre o modal (sobrevive a re-render).
+  document.addEventListener('click', e => {
+    const el = e.target.closest('[data-drill]');
+    if (el && el.getAttribute('data-drill')) {
+      e.preventDefault();
+      open(el.getAttribute('data-drill'), el.getAttribute('data-drill-title'));
+    }
+  });
+  function exportCsv(){
+    if (!cols.length) return;
+    const linkCol = cols.find(c => c.link);
+    const headers = cols.map(c => c.label).concat(linkCol ? ['Link HubSpot'] : []);
+    const arr = window.__MONEY__ && window.__MONEY__.mode === 'arr';
+    const conv = v => arr ? Number(v||0) * window.__MONEY__.months / window.__MONEY__.rate : Number(v||0);
+    const raw = (v,t) => (t==='money'||t==='money_signed') ? (v==null?'':Math.round(conv(v)))
+                       : t==='int' ? (v==null?'':Math.round(v))
+                       : t==='date' ? fmtDate(v) : (v==null?'':v);
+    const q = v => { v = v==null?'':String(v); return /[",\n;]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; };
+    const lines = [headers.map(q).join(',')];
+    sortedRows().forEach(r => {
+      const cells = cols.map(c => raw(r[c.key], c.type));
+      if (linkCol) cells.push(r[linkCol.link] || '');
+      lines.push(cells.map(q).join(','));
+    });
+    const name = (elTitle.textContent || 'deals').replace(/[^\w\-]+/g,'_').replace(/^_+|_+$/g,'');
+    const blob = new Blob(['﻿' + lines.join('\n')], {type:'text/csv;charset=utf-8;'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name + '.csv';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  }
+  $('dd-csv').addEventListener('click', exportCsv);
+  $('dd-close').addEventListener('click', close);
+  modal.addEventListener('click', e => { if (e.target===modal) close(); });
+  document.addEventListener('keydown', e => { if (e.key==='Escape' && !modal.hidden) close(); });
+})();
+</script>

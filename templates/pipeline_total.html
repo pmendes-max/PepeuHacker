@@ -1,0 +1,287 @@
+{% extends "base.html" %}
+{% block title %}Pipeline Total · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Pipeline Total</h1>
+<div class="page-sub">
+  Deals <b>abertos</b> do Sales BR · amount por estágio do funil
+  {%- if ctx.filters.date_from or ctx.filters.date_to %} · close date em <b>{{ ctx.period_text }}</b>{% endif %}
+  {%- if n_sem_close %} ·
+  <span title="O HubSpot não tem close date nesses deals, então a janela de datas não consegue classificá-los.">{{ n_sem_close }} deals sem close date ficaram fora</span>
+  {%- endif %}
+</div>
+
+{# ---------- Totais ----------
+   `_drill` carrega os filtros da página pro endpoint, pra a lista explodida
+   bater exatamente com o que está na tela. #}
+{% set _drill = dict(keep, grain=('leader' if grain == 'leader' else 'ae')) %}
+<div class="panel">
+  <div class="stats-strip">
+    <div class="stat c-blue" data-drill="{{ url_for('pipeline_total_deals', **_drill) }}"
+         title="Explodir todos os deals abertos do recorte">
+      <div class="stat-l">Amount em pipeline</div>
+      <div class="stat-v">{{ total_amount|brl }}</div>
+    </div>
+    <div class="stat c-slate" data-drill="{{ url_for('pipeline_total_deals', **_drill) }}"
+         title="Explodir todos os deals abertos do recorte">
+      <div class="stat-l">Deals abertos</div>
+      <div class="stat-v">{{ total_deals|intg }}</div>
+    </div>
+    <div class="stat c-slate">
+      <div class="stat-l">Ticket médio</div>
+      <div class="stat-v">{{ ticket|brl }}</div>
+    </div>
+    {% if by == 'fcat' and weighted_total is not none %}
+    {# Só faz sentido na quebra por forecast category: é o amount × peso do
+       modelo (Funnel 25 · Probable 50 · Best Case 75 · Commit 100). #}
+    <div class="stat is-total">
+      <div class="stat-l">Ponderado <span class="stat-q">· pesos do modelo</span></div>
+      <div class="stat-v">{{ weighted_total|brl }}</div>
+      {% if weighted_cov %}
+      {# Cobertura do ponderado: sem isso o número é lido como forecast do funil
+         inteiro, quando a maior parte do pipe não tem categoria no HubSpot. #}
+      <div class="stat-s">cobre {{ ((1 - weighted_cov.unclassified_pct - weighted_cov.zero_pct)*100)|round|int }}% do pipe</div>
+      {% endif %}
+    </div>
+    {% else %}
+    <div class="stat is-total">
+      <div class="stat-l">Estágios com pipe</div>
+      <div class="stat-v">{{ rows|length }}</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+{# ---------- Empilhamento: escolhe qual dimensão colore as barras ----------
+   Mesmo registro que alimenta os filtros (_PT_DIMS), então nunca divergem. #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Amount por estágio do funil{% if by %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· empilhado por {{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</span>{% endif %}</h2>
+    <span class="ph" style="margin:0">altura da barra = R$ em pipeline · ordem do funil</span>
+  </div>
+
+  {# `keep` vem da rota já sem chaves vazias (ver comentário lá). #}
+  <div class="grain-switch" style="margin-bottom:14px">
+    <a class="grain-btn {% if not by %}active{% endif %}"
+       href="{{ url_for(request.endpoint, **keep) }}">Sem quebra</a>
+    {% for d in dims %}
+      <a class="grain-btn {% if by == d.key %}active{% endif %}"
+         href="{{ url_for(request.endpoint, by=d.key, **keep) }}">{{ d.label }}</a>
+    {% endfor %}
+  </div>
+
+  {% if rows %}
+  <div class="dchart" data-chart="pt-stack"
+       data-channels="{% for s in segs %}{{ s.key }} {% endfor %}">
+    {% if by %}
+    <div class="legend legend-toggle">
+      {% for s in segs %}
+        <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}"
+                style="--c:{{ s.color }};--ci:{{ s.ink }}">
+          <span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}{% if s.pct is defined and s.pct is not none %} · {{ (s.pct*100)|int }}%{% endif %}
+        </button>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="vbars-wrap">
+      <div class="vbars pt-bars" style="--count:{{ rows|length }}">
+        {% for r in rows %}
+          {% set h_pct = (r.amount / max_amount * 100) if max_amount else 0 %}
+          <div class="vbar{% if r.amount <= 0 %} is-empty{% endif %}"
+               data-name="{{ r.label }}"
+               data-total="{{ r.amount|round|int }}"
+               data-deals="{{ r.deals }}"
+               data-drill="{{ url_for('pipeline_total_deals', stage=r.sid, **_drill) }}"
+               title="Explodir os deals em {{ r.label }}"
+               {% if by %}{% for s in segs %}data-{{ s.key }}="{{ (r.segs[s.key] or 0)|round|int }}" {% endfor %}{% endif %}>
+            {# Sem .vbar-tip: nesta página o hover não tem conteúdo próprio (o
+               rótulo e a contagem já estão visíveis) e um tip vazio virava um
+               retângulo escuro no hover. Detalhe fica no drill. #}
+            <div class="vbar-track" style="--h:{{ h_pct }}%">
+              <div class="vbar-val">{{ r.amount|brl }}</div>
+              <div class="vbar-col">
+                {% if by %}
+                  {% for s in segs %}
+                    {% set v = (r.segs[s.key] or 0)|round|int %}
+                    {% if v > 0 %}
+                      {# Segmento explode o cruzamento estágio × categoria — mais
+                         específico que a barra, então tem drill próprio. #}
+                      <div class="vbar-seg" data-ch="{{ s.key }}"
+                           data-drill="{{ url_for('pipeline_total_deals', stage=r.sid, by=by, seg=s.key, **_drill) }}"
+                           title="{{ r.label }} · {{ s.label }}"
+                           style="background:{{ s.color }};flex:{{ v }}"></div>
+                    {% endif %}
+                  {% endfor %}
+                {% else %}
+                  <div class="vbar-seg" style="background:#2563EB;flex:1"></div>
+                {% endif %}
+              </div>
+            </div>
+            <div class="vbar-name">{{ r.label }}</div>
+            <div class="vbar-sub">{{ r.deals }} deal{{ 's' if r.deals != 1 }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="stalled-empty">Nenhum deal aberto com os filtros atuais.</div>
+  {% endif %}
+</div>
+
+{# ---------- Composição do total pela dimensão empilhada ----------
+   Responde "quanto do meu pipe é X" sem somar barras de cabeça. #}
+{% if seg_totals %}
+<div class="panel">
+  <h2>Composição do pipeline por {{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</th>
+          {% if by == 'fcat' %}<th class="n">Prob.</th>{% endif %}
+          <th class="n">Deals</th>
+          <th class="n">Amount</th>
+          {% if by == 'fcat' %}<th class="n grp">Ponderado</th>{% endif %}
+          <th class="n">% do pipe</th>
+          <th style="width:26%">Peso</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% set max_seg = (seg_totals|map(attribute='amount')|max) or 1 %}
+      {% for s in seg_totals %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}</td>
+          {# Peso do modelo de forecast. OMIT e "sem categoria" não têm
+             probabilidade definida — mostram "—", não 0%, porque a diferença
+             entre "vale zero" e "ninguém classificou" importa. #}
+          {% if by == 'fcat' %}<td class="n">{% if s.pct is not none %}{{ (s.pct*100)|int }}%{% else %}—{% endif %}</td>{% endif %}
+          <td class="n">{{ s.deals|intg }}</td>
+          <td class="n"><b>{{ s.amount|brl }}</b></td>
+          {% if by == 'fcat' %}<td class="n grp">{% if s.weighted is not none %}<b>{{ s.weighted|brl }}</b>{% else %}—{% endif %}</td>{% endif %}
+          <td class="n">{{ (s.share*100)|round|int }}%</td>
+          <td><div style="height:11px;border-radius:6px;background:{{ s.color }};min-width:2px;width:{{ (s.amount/max_seg*100)|round(1) }}%"></div></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          {% if by == 'fcat' %}<td class="n">—</td>{% endif %}
+          <td class="n"><b>{{ total_deals|intg }}</b></td>
+          <td class="n"><b>{{ total_amount|brl }}</b></td>
+          {% if by == 'fcat' %}<td class="n grp"><b>{{ weighted_total|brl }}</b></td>{% endif %}
+          <td class="n"><b>100%</b></td>
+          <td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% if weighted_cov and (weighted_cov.unclassified_pct or weighted_cov.zero_pct) %}
+  <p class="ph" style="margin:12px 2px 0">
+    <b>{{ (weighted_cov.unclassified_pct*100)|round|int }}%</b> do amount está sem forecast category
+    no HubSpot e <b>{{ (weighted_cov.zero_pct*100)|round|int }}%</b> em <b>Not forecasted</b> (peso 0) —
+    o ponderado só reflete o restante. É preenchimento no HubSpot, não cálculo do dashboard.
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<style>
+  /* Os defaults de .vbars foram dimensionados pro gráfico de ~30 AEs: barra
+     limitada a 64px e nome rotacionado -32° (nome de pessoa é longo e não
+     cabe reto). Aqui são 7 estágios de nome curto, então os dois viram
+     estorvo — barra fina num painel largo e rótulo torto sem necessidade. */
+  .pt-bars{
+    height: 320px;
+    padding-top: 34px;
+    margin-bottom: 46px;      /* era 130px: espaço pro rótulo diagonal */
+    min-width: 100%;
+  }
+  .pt-bars .vbar-col{
+    width: clamp(40px, 62%, 120px);   /* cap 64px → 120px */
+    gap: 2px;
+  }
+  .pt-bars .vbar-seg{ border-radius: 4px; }
+
+  /* Rótulo reto e centrado, no lugar do diagonal. */
+  .pt-bars .vbar-name{
+    position: absolute;
+    top: calc(100% + 9px);
+    left: 0; right: auto;
+    width: 100%;
+    transform: none;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg);
+    white-space: nowrap;
+  }
+  /* Contagem de deals abaixo do nome — contexto, não protagonista. */
+  .pt-bars .vbar-sub{
+    position: absolute;
+    top: calc(100% + 26px);
+    left: 0; width: 100%;
+    text-align: center;
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+</style>
+
+<script>
+(function(){
+  "use strict";
+  // Chips da legenda recalculam as barras de verdade (mesmo comportamento do
+  // Stale): desligar um segmento tira o valor do total e reescala as alturas —
+  // senão o gráfico mentiria, mostrando barra cheia com segmento escondido.
+  const chart = document.querySelector('.dchart[data-chart="pt-stack"]');
+  if (!chart) return;
+  const KEYS = (chart.dataset.channels || '').trim().split(/\s+/).filter(Boolean);
+  if (!KEYS.length) return;
+
+  const bars = Array.from(chart.querySelectorAll('.vbar'));
+  // Compacto, pra bater com o que o filtro `brl` já escreveu no 1º render.
+  const fmt = (v) => (window.fmtBRLCompact ? window.fmtBRLCompact(v)
+                                           : 'R$ ' + Math.round(v));
+
+  function activeKeys(){
+    return Array.from(chart.querySelectorAll('.leg-toggle.is-on')).map(b => b.dataset.ch);
+  }
+
+  function render(){
+    const act = activeKeys();
+    const on = new Set(act);
+    const totals = bars.map(bar =>
+      act.reduce((sum, k) => sum + (Number(bar.dataset[k]) || 0), 0));
+    const max = Math.max.apply(null, totals.concat([0])) || 1;
+
+    bars.forEach((bar, i) => {
+      // Esconde o segmento aqui em vez de via CSS por chave: as chaves mudam com
+      // a dimensão escolhida (acq/exp, inbound/…, commit/…), então uma regra
+      // estática por chave teria que ser reescrita a cada dimensão nova.
+      bar.querySelectorAll('.vbar-seg[data-ch]').forEach(seg => {
+        seg.style.display = on.has(seg.dataset.ch) ? '' : 'none';
+      });
+      const track = bar.querySelector('.vbar-track');
+      const val   = bar.querySelector('.vbar-val');
+      if (track) track.style.setProperty('--h', (totals[i] / max * 100) + '%');
+      if (val)   val.textContent = fmt(totals[i]);
+      bar.classList.toggle('is-empty', totals[i] <= 0);
+    });
+  }
+
+  chart.querySelectorAll('.leg-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      btn.classList.toggle('is-on');
+      // Nunca deixa zerar a seleção: gráfico sem série nenhuma não comunica
+      // nada e o usuário fica sem saber como voltar.
+      if (!activeKeys().length) { btn.classList.add('is-on'); return; }
+      render();
+    });
+  });
+})();
+</script>
+{% endblock %}

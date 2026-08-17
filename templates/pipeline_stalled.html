@@ -1,0 +1,300 @@
+{% extends "base.html" %}
+{% block title %}Pipeline · Stale · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Stale no Funil</h1>
+<div class="page-sub">
+  SLAs por stage:
+  <b>Qualifying</b> 14d ·
+  <b>Scoping</b> 21d ·
+  <b>Negotiation</b> 14d ·
+  <b>Decision</b> 14d ·
+  <b>Procurement</b> 21d.
+</div>
+
+{# ---------- Sumário compacto por stage (estado atual) ---------- #}
+<div class="panel">
+  <div class="stl-summary">
+    {% for s in summary_by_stage %}
+      <div class="stl-summary-cell" style="cursor:pointer;--c:{{ s.color }};--ci:{{ s.ink or s.color }}"
+           data-drill="{{ url_for('pipeline_stalled_deals', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region, stages=s.key) }}"
+           title="Explodir os deals parados em {{ s.label }}">
+        <span class="stl-summary-dot" style="background:{{ s.color }}"></span>
+        <div>
+          <div class="stl-summary-lbl">{{ s.label }} <span class="stl-summary-th">&gt;{{ s.threshold }}d</span></div>
+          <div class="stl-summary-num">{{ s.n_deals|intg }}</div>
+        </div>
+      </div>
+    {% endfor %}
+    <div class="stl-summary-cell stl-summary-total" id="stl-total-cell"
+         data-drill="{{ url_for('pipeline_stalled_deals', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region) }}"
+         title="Explodir todos os deals parados">
+      <div>
+        <div class="stl-summary-lbl">Total</div>
+        <div class="stl-summary-num" id="stl-total-num">{{ total_stalled|intg }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ---------- Chart 1: Stacked por AE × Stage (estado atual) ----------
+   Os chips da legenda FILTRAM de verdade: o JS recalcula o total de cada barra,
+   as alturas, o card Total e injeta `stages=` nos drills — só o que está
+   selecionado explode. #}
+<div class="panel">
+  <h2>Deals parados por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
+  <div class="dchart" data-chart="stl-stack">
+    <div class="legend legend-toggle">
+      {% for s in summary_by_stage %}
+        <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}" style="--c:{{ s.color }};--ci:{{ s.ink or s.color }}">
+          <span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}
+        </button>
+      {% endfor %}
+    </div>
+
+    {% if rows_now %}
+    <div class="vbars-wrap">
+      <div class="vbars stl-bars" style="--count:{{ rows_now|length }}">
+        {% for r in rows_now %}
+          {% set h_pct = (r.total / max_total_now * 100) if max_total_now else 0 %}
+          <div class="vbar{% if r.total <= 0 %} is-empty{% endif %}"
+               data-name="{{ r.account_executive }}"
+               data-drill="{{ url_for('pipeline_stalled_deals', name=r.account_executive, grain=grain) }}"
+               data-total="{{ r.total }}"
+               data-qual="{{ r.n_qual }}" data-proj="{{ r.n_proj }}"
+               data-nego="{{ r.n_nego }}" data-cons="{{ r.n_cons }}"
+               data-proc="{{ r.n_proc }}">
+            {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
+            <div class="vbar-track" style="--h:{{ h_pct }}%">
+              <div class="vbar-val">{{ r.total }}</div>
+              <div class="vbar-col">
+                {% for s in summary_by_stage %}
+                  {% set n = r['n_' + s.key] %}
+                  {% if n > 0 %}
+                    <div class="vbar-seg" data-ch="{{ s.key }}" data-n="{{ n }}"
+                         style="background:{{ s.color }};flex:{{ n }}"></div>
+                  {% endif %}
+                {% endfor %}
+              </div>
+            </div>
+            <div class="vbar-name">{{ r.account_executive }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="stalled-empty">Sem deals parados pelo filtro atual ✓</div>
+    {% endif %}
+  </div>
+</div>
+
+{# ---------- Chart 2: Movimentação WoW (saiu vs entrou da inatividade) ----------
+   Também tem chips de estágio: o saldo (saiu/entrou/net), as barras e os drills
+   respeitam a seleção. Tudo é explodível (cards e segmentos das barras). #}
+<div class="panel">
+  <h2>Movimentação WoW <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ snap_prev_label }} → {{ snap_curr_label }}</span></h2>
+
+  <div class="dchart" data-chart="stl-wow">
+    <div class="legend legend-toggle" style="margin-bottom:10px">
+      {% for s in summary_by_stage %}
+        <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}" style="--c:{{ s.color }};--ci:{{ s.ink or s.color }}">
+          <span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}
+        </button>
+      {% endfor %}
+    </div>
+
+    <div class="stl-wow-tot">
+      <div class="stl-wow-tot-cell stl-wow-pos" style="cursor:pointer"
+           data-drill="{{ url_for('pipeline_stalled_wow_deals', grain=grain, dir='saiu', leader=ctx.filters.leader, region=ctx.filters.region) }}"
+           title="Explodir os deals que saíram da inatividade">
+        <div class="stl-wow-tot-lbl">Saiu da inatividade</div>
+        <div class="stl-wow-tot-num" id="stl-wow-saiu">+{{ wow_total_saiu|intg }}</div>
+      </div>
+      <div class="stl-wow-tot-cell stl-wow-neg" style="cursor:pointer"
+           data-drill="{{ url_for('pipeline_stalled_wow_deals', grain=grain, dir='entrou', leader=ctx.filters.leader, region=ctx.filters.region) }}"
+           title="Explodir os deals que entraram na inatividade">
+        <div class="stl-wow-tot-lbl">Entrou na inatividade</div>
+        <div class="stl-wow-tot-num" id="stl-wow-entrou">−{{ wow_total_entrou|intg }}</div>
+      </div>
+      <div class="stl-wow-tot-cell stl-wow-net {% if (wow_total_saiu - wow_total_entrou) >= 0 %}is-pos{% else %}is-neg{% endif %}" id="stl-wow-net-cell" style="cursor:pointer"
+           data-drill="{{ url_for('pipeline_stalled_wow_deals', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region) }}"
+           title="Explodir toda a movimentação (saiu + entrou)">
+        <div class="stl-wow-tot-lbl">Net (saiu − entrou)</div>
+        <div class="stl-wow-tot-num" id="stl-wow-net">
+          {% set _net = wow_total_saiu - wow_total_entrou %}
+          {% if _net >= 0 %}+{% endif %}{{ _net|intg }}
+        </div>
+      </div>
+    </div>
+
+    {% if rows_wow %}
+    <div class="wow-wrap">
+      <div class="wow-chart stl-wow-chart" style="--count:{{ rows_wow|length }}">
+        <div class="wow-zero-bar"></div>
+        {% for r in rows_wow %}
+          {% set h_pos = (r.saiu   / wow_y_max * 100) if wow_y_max else 0 %}
+          {% set h_neg = (r.entrou / wow_y_max * 100) if wow_y_max else 0 %}
+          <div class="wow-col" data-net="{{ r.net }}"
+               data-saiu-qual="{{ r.saiu_qual }}" data-saiu-proj="{{ r.saiu_proj }}"
+               data-saiu-nego="{{ r.saiu_nego }}" data-saiu-cons="{{ r.saiu_cons }}"
+               data-saiu-proc="{{ r.saiu_proc }}"
+               data-entrou-qual="{{ r.entrou_qual }}" data-entrou-proj="{{ r.entrou_proj }}"
+               data-entrou-nego="{{ r.entrou_nego }}" data-entrou-cons="{{ r.entrou_cons }}"
+               data-entrou-proc="{{ r.entrou_proc }}">
+            {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
+            <div class="wow-pos-area">
+              <div class="wow-seg stl-wow-seg-saiu" style="height:{{ h_pos }}%"
+                   data-amt="{{ r.saiu }}"
+                   data-drill="{{ url_for('pipeline_stalled_wow_deals', name=r.account_executive, grain=grain, dir='saiu') }}"
+                   title="Deals de {{ r.account_executive }} que saíram da inatividade"></div>
+            </div>
+
+            <div class="wow-neg-area">
+              <div class="wow-seg stl-wow-seg-entrou" style="height:{{ h_neg }}%"
+                   data-amt="{{ r.entrou }}"
+                   data-drill="{{ url_for('pipeline_stalled_wow_deals', name=r.account_executive, grain=grain, dir='entrou') }}"
+                   title="Deals de {{ r.account_executive }} que entraram na inatividade"></div>
+            </div>
+
+            <div class="wow-extra"></div>
+
+            <div class="wow-name">
+              <span class="wow-name-text">{{ r.account_executive }}</span>
+              <span class="wow-name-net {% if r.net >= 0 %}is-pos{% elif r.net < 0 %}is-neg{% endif %}">
+                {% if r.net >= 0 %}+{% endif %}{{ r.net }}
+              </span>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="stalled-empty">Sem movimentação WoW pelo filtro atual.</div>
+    {% endif %}
+  </div>
+</div>
+
+<style>
+  /* O tratamento de cor desta página (tinta da cor do stage no card, número na
+     cor cheia, chips que acendem) virou a linguagem do site — mora em
+     static/style.css (.stat / .stl-summary-cell / .dchart .leg-toggle). Aqui
+     ficou só o que é específico dos charts do Stale. */
+
+  /* Barras empilhadas com respiro e cantos suaves entre segmentos. */
+  .stl-bars .vbar-col{ gap: 2px; }
+  .stl-bars .vbar-seg{ border-radius: 4px; }
+  .stl-wow-chart .wow-seg{ border-radius: 5px; }
+
+  /* Rótulo de dados nos segmentos do stacked (nº de deals por stage) — as 5
+     cores novas são escuras, então o texto é branco. Segmento baixo demais
+     esconde o rótulo (overflow) em vez de vazar no vizinho. */
+  .stl-bars .vbar-seg{position:relative;overflow:hidden}
+  .stl-bars .vbar-seg::after{
+    content:attr(data-n);
+    position:absolute;inset:0;
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:11px;font-weight:800;letter-spacing:-.2px;
+    pointer-events:none;
+  }
+  /* Rótulo de dados nas barras do WoW (nº de deals). */
+  .stl-wow-chart .wow-seg{position:relative;overflow:hidden;cursor:pointer}
+  .stl-wow-chart .wow-seg::after{
+    content:attr(data-amt);
+    position:absolute;inset:0;
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:11px;font-weight:800;pointer-events:none;
+  }
+  .stl-wow-chart .wow-seg[data-amt="0"]{visibility:hidden}
+</style>
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  const KEYS = ['qual','proj','nego','cons','proc'];
+  const fmt = n => Number(n||0).toLocaleString('pt-BR');
+
+  // Injeta/atualiza `stages=` na URL do drill conforme a seleção dos chips —
+  // explodir respeita EXATAMENTE os filtros selecionados.
+  function setDrill(el, active, all){
+    if (!el) return;
+    let base = el.dataset.drillBase;
+    if (base === undefined){ base = el.getAttribute('data-drill') || ''; el.dataset.drillBase = base; }
+    if (!base) return;
+    el.setAttribute('data-drill',
+      all ? base : base + (base.indexOf('?') >= 0 ? '&' : '?') + 'stages=' + active.join(','));
+  }
+  function activeKeys(chart){
+    return Array.from(chart.querySelectorAll('.leg-toggle.is-on')).map(b => b.dataset.ch);
+  }
+
+  // ---- Chart 1 (stacked): filtro recalcula totais, alturas e o card Total ----
+  const stack = document.querySelector('.dchart[data-chart="stl-stack"]');
+  function stackRecompute(){
+    if (!stack) return;
+    const active = activeKeys(stack);
+    const all = active.length === KEYS.length;
+    stack.dataset.channels = active.join(' ');
+    const bars = Array.from(stack.querySelectorAll('.vbar'));
+    const totals = bars.map(b => active.reduce((s,k) => s + (+b.dataset[k] || 0), 0));
+    const max = Math.max.apply(null, totals.concat([1]));
+    bars.forEach((b,i) => {
+      const t = totals[i];
+      const val = b.querySelector('.vbar-val');   if (val) val.textContent = t;
+      const trk = b.querySelector('.vbar-track'); if (trk) trk.style.setProperty('--h', (t/max*100)+'%');
+      const tt  = b.querySelector('.tip-total');  if (tt)  tt.textContent = 'Total: ' + t + ' deals parados';
+      b.classList.toggle('is-empty', t <= 0);
+      setDrill(b, active, all);
+    });
+    const sum = totals.reduce((a,b) => a+b, 0);
+    const numEl = document.getElementById('stl-total-num'); if (numEl) numEl.textContent = fmt(sum);
+    setDrill(document.getElementById('stl-total-cell'), active, all);
+  }
+
+  // ---- Chart 2 (WoW): filtro recalcula saiu/entrou/net por AE e os 3 cards ----
+  const wow = document.querySelector('.dchart[data-chart="stl-wow"]');
+  function wowRecompute(){
+    if (!wow) return;
+    const active = activeKeys(wow);
+    const all = active.length === KEYS.length;
+    const cols = Array.from(wow.querySelectorAll('.wow-col'));
+    const data = cols.map(c => {
+      const saiu   = active.reduce((s,k) => s + (+c.getAttribute('data-saiu-'+k)   || 0), 0);
+      const entrou = active.reduce((s,k) => s + (+c.getAttribute('data-entrou-'+k) || 0), 0);
+      return {saiu, entrou};
+    });
+    const yMax = Math.max.apply(null, data.map(d => Math.max(d.saiu, d.entrou)).concat([1]));
+    cols.forEach((c,i) => {
+      const {saiu, entrou} = data[i], net = saiu - entrou;
+      const sp = c.querySelector('.stl-wow-seg-saiu'), sn = c.querySelector('.stl-wow-seg-entrou');
+      if (sp){ sp.style.height = (saiu/yMax*100)+'%';   sp.setAttribute('data-amt', saiu);   setDrill(sp, active, all); }
+      if (sn){ sn.style.height = (entrou/yMax*100)+'%'; sn.setAttribute('data-amt', entrou); setDrill(sn, active, all); }
+      const nb = c.querySelector('.tip-net-b');    if (nb) nb.textContent = (net >= 0 ? '+' : '') + net;
+      const sb = c.querySelector('.tip-saiu-b');   if (sb) sb.textContent = saiu;
+      const eb = c.querySelector('.tip-entrou-b'); if (eb) eb.textContent = entrou;
+      const nn = c.querySelector('.wow-name-net');
+      if (nn){ nn.textContent = (net >= 0 ? '+' : '') + net;
+               nn.classList.toggle('is-pos', net >= 0); nn.classList.toggle('is-neg', net < 0); }
+      c.dataset.net = net;
+    });
+    const tSaiu = data.reduce((s,d) => s+d.saiu, 0), tEnt = data.reduce((s,d) => s+d.entrou, 0);
+    const net = tSaiu - tEnt;
+    const eS = document.getElementById('stl-wow-saiu');   if (eS) eS.textContent = '+' + fmt(tSaiu);
+    const eE = document.getElementById('stl-wow-entrou'); if (eE) eE.textContent = '−' + fmt(tEnt);
+    const eN = document.getElementById('stl-wow-net');    if (eN) eN.textContent = (net >= 0 ? '+' : '') + fmt(net);
+    const cN = document.getElementById('stl-wow-net-cell');
+    if (cN){ cN.classList.toggle('is-pos', net >= 0); cN.classList.toggle('is-neg', net < 0); }
+    document.querySelectorAll('.stl-wow-tot-cell').forEach(c => setDrill(c, active, all));
+  }
+
+  [[stack, stackRecompute], [wow, wowRecompute]].forEach(([chart, fn]) => {
+    if (!chart) return;
+    chart.querySelectorAll('.leg-toggle').forEach(btn => {
+      btn.addEventListener('click', () => { btn.classList.toggle('is-on'); fn(); });
+    });
+    fn();   // estado inicial (também arma os data-drill-base)
+  });
+})();
+</script>
+{% endblock %}

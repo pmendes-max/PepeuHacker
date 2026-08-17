@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}Forecast · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Forecast</h1>
+{% include "_chart_toggles.html" %}
+{# Parágrafo explicativo virou linha de parâmetros: mantém o que o leitor
+   precisa pra interpretar (janela + pesos) e devolve a área pro dado. #}
+<p class="page-sub">
+  Close date em <b>{{ range_label }}</b> · pesos por forecast category:
+  Funnel <b>25</b> · Probable <b>50</b> · Best Case <b>75</b> · Commit <b>100</b>
+</p>
+
+{# Cores vêm dos modificadores (acc/grn/warn), não de style inline no número —
+   inline sobrescrevia o --c do card e gerava card cinza com número azul. #}
+{# 3+3: linha 1 = o que se projeta, linha 2 = a base de cálculo. #}
+<div class="kpis-3">
+  <div class="kpi acc" data-drill="{{ url_for('forecast_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir todos os deals da projeção">
+    <div class="kpi-l">Projeção do quarter <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.projection|brl }}</div>
+    <div class="kpi-s">realizado + ponderado</div>
+  </div>
+  <div class="kpi grn">
+    <div class="kpi-l">Realizado <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.realized|brl }}</div>
+    <div class="kpi-s">{{ totals.realized_deals }} PO Won · por data de validação</div>
+  </div>
+  <div class="kpi acc">
+    <div class="kpi-l">Forecast ponderado <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.weighted|brl }}</div>
+    <div class="kpi-s">pipeline aberto × %</div>
+  </div>
+  <div class="kpi warn">
+    <div class="kpi-l">On-hold <span class="kpi-q">· MRR</span></div>
+    <div class="kpi-v">{{ totals.hold|brl }}</div>
+    <div class="kpi-s">MRR em validação financeira</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-l">Pipeline bruto <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.gross|brl }}</div>
+    <div class="kpi-s">{{ totals.deals }} deals abertos · {{ totals.n_ae }} AEs</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-l">Conversão implícita</div>
+    <div class="kpi-v">{{ (totals.blended*100)|round|int }}<span class="un">%</span></div>
+    <div class="kpi-s">ponderado ÷ bruto (pipeline)</div>
+  </div>
+</div>
+
+{% if totals.mgr_count %}
+<p style="margin:-10px 0 20px;font-size:12.5px;color:var(--muted)">
+  Inclui vendas diretas de {{ totals.mgr_count }} gestor{{ 'es' if totals.mgr_count != 1 else '' }}
+  nos totais e na linha de cada um — Realizado <b>{{ totals.mgr_realized|brl }}</b> ·
+  pipeline ponderado <b>{{ totals.mgr_weighted|brl }}</b> (amount) — fora das barras do gráfico.
+</p>
+{% endif %}
+
+{% if by_ae %}
+{# ------- Chart: forecast ponderado (pipeline) por AE ------- #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Realizado + Forecast ponderado por {{ 'líder' if grain == 'leader' else 'AE' }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· deal amount</span></h2>
+    <span class="ph" style="margin:0">barra = Realizado (Won) + Σ amount × % do pipeline · clique na legenda pra filtrar</span>
+  </div>
+  <div class="dchart fc-chart" data-channels="realized {% for c in cats %}{{ c.key }} {% endfor %}">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="realized" style="--c:#065F46">
+        <span class="leg-dot" style="background:#065F46"></span>Realizado (Won)
+      </button>
+      {% for c in cats %}
+      <button type="button" class="leg-toggle is-on" data-ch="{{ c.key }}" style="--c:{{ c.color }};--ci:{{ c.ink or c.color }}">
+        <span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }} · {{ (c.pct*100)|int }}%
+      </button>
+      {% endfor %}
+    </div>
+    <div class="vbars" style="--count:{{ chart_rows|length }}">
+      {% for r in chart_rows %}
+        {% set ptot = r.projection|round|int %}
+        {% set h_pct = (ptot / max_projection * 100) if max_projection else 0 %}
+        <div class="vbar{% if ptot <= 0 %} is-empty{% endif %}"
+             data-name="{{ r.account_executive }}" data-leader="{{ r.leader or '' }}"
+             {% if ptot > 0 %}data-drill="{{ url_for('forecast_deals', name=r.account_executive, grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"{% endif %}
+             data-gross="{{ r.gross|round|int }}" data-hold="{{ r.hold|round|int }}"
+             data-realized="{{ r.realized|round|int }}"
+             {% for c in cats %}data-{{ c.key }}="{{ r['w_' ~ c.key]|round|int }}" {% endfor %}>
+          <div class="vbar-tip"></div>
+          <div class="vbar-track" style="--h:{{ h_pct }}%">
+            <div class="vbar-val">{{ r.projection|brl }}</div>
+            <div class="vbar-col">
+              {% set rv = r.realized|round|int %}
+              {% if rv > 0 %}<div class="vbar-seg" data-ch="realized" style="background:#065F46;flex:{{ rv }}"></div>{% endif %}
+              {% for c in cats %}
+                {% set cv = r['w_' ~ c.key]|round|int %}
+                {% if cv > 0 %}<div class="vbar-seg" data-ch="{{ c.key }}" style="background:{{ c.color }};flex:{{ cv }}"></div>{% endif %}
+              {% endfor %}
+            </div>
+          </div>
+          <div class="vbar-name">{{ r.account_executive }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ------- Composição por forecast category (pipeline aberto) ------- #}
+<div class="panel">
+  <h2>Composição do pipeline por forecast category</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Categoria</th><th class="n">Prob.</th><th class="n">Deals</th>
+          <th class="n">Bruto</th><th class="n">Ponderado</th>
+          <th style="width:34%">Peso no forecast</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% set max_w = (by_cat|map(attribute='weighted')|max) or 1 %}
+      {% for c in by_cat %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }}</td>
+          <td class="n">{{ (c.pct*100)|int }}%</td>
+          <td class="n">{{ c.deals }}</td>
+          <td class="n">{{ c.gross|brl }}</td>
+          <td class="n"><b>{{ c.weighted|brl }}</b></td>
+          <td><div style="height:11px;border-radius:6px;background:{{ c.color }};min-width:2px;width:{{ (c.weighted/max_w*100)|round(1) }}%"></div></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total pipeline</b></td>
+          <td class="n">—</td>
+          <td class="n">{{ by_cat|sum(attribute='deals') }}</td>
+          <td class="n">{{ (by_cat|sum(attribute='gross'))|brl }}</td>
+          <td class="n"><b style="color:#185FA5">{{ totals.weighted|brl }}</b></td>
+          <td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ------- Detalhe por AE ------- #}
+<div class="panel">
+  <h2>Detalhe por {{ 'líder' if grain == 'leader' else 'AE' }}</h2>
+  <p class="ph" style="margin:-2px 0 14px">Ponderado, Realizado e Projeção em <b>deal amount</b>; On-hold em <b>MRR</b>.</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ 'Líder' if grain == 'leader' else 'AE' }}</th>{% if grain != 'leader' %}<th>Líder</th>{% endif %}<th>Região</th>
+          {% for c in cats %}<th class="n">{{ c.label }}</th>{% endfor %}
+          <th class="n">Ponderado</th>
+          <th class="n grp">Realizado</th>
+          <th class="n grp">Projeção</th>
+          <th class="n">On-hold<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">MRR</span></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in by_ae %}
+        <tr>
+          <td class="first">{{ r.account_executive }}{% if r.is_manager %} <span class="badge" style="background:#EEF2FF;color:#3730A3;font-size:10px;padding:1px 6px;vertical-align:middle">gestor</span>{% endif %}</td>
+          {% if grain != 'leader' %}<td style="color:var(--muted)">{{ r.leader or "—" }}</td>{% endif %}
+          <td style="color:var(--muted)">{{ r.region or "—" }}</td>
+          {# Tinta (c.ink), não a cor de preenchimento: o #93C5FD do Funnel mede
+             1,8:1 como texto. Mesma regra dos chips. #}
+          {% for c in cats %}<td class="n" style="color:{{ c.ink or c.color }}">{{ r['w_' ~ c.key]|brl }}</td>{% endfor %}
+          <td class="n" style="color:#2563EB">{{ r.weighted|brl }}</td>
+          <td class="n grp" style="color:#0F6E56">{% if r.realized %}{{ r.realized|brl }}{% else %}—{% endif %}</td>
+          <td class="n grp"><b>{{ r.projection|brl }}</b></td>
+          <td class="n" style="color:#854F0B">{% if r.hold %}{{ r.hold|brl }}{% else %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% else %}
+<div class="panel">
+  <p style="color:var(--muted);padding:8px 0">Nenhum deal com close date no período <b>{{ range_label }}</b> para os filtros atuais.</p>
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  // Delega no formatador global (base.html) — era uma cópia local da mesma
+  // lógica; duas cópias divergem no primeiro ajuste de formato.
+  const fmtBRL = (n) => window.fmtBRLCompact(n);
+  function refresh(chart){
+    const active = (chart.dataset.channels || '').split(' ').filter(Boolean);
+    const cont = chart.querySelector('.vbars');
+    const rows = Array.from(cont.children).filter(c => c.classList.contains('vbar'));
+    const labelFor = ch => {
+      const b = chart.querySelector('.leg-toggle[data-ch="'+ch+'"]');
+      return b ? b.textContent.trim() : ch;
+    };
+    rows.forEach(r => { let t=0; active.forEach(ch => t += parseFloat(r.dataset[ch]||'0')); r._t = t; });
+    const max = Math.max(1, ...rows.map(r => r._t));
+    rows.sort((a,b) => b._t - a._t);
+    const frag = document.createDocumentFragment(); let vis = 0;
+    rows.forEach(r => {
+      frag.appendChild(r);
+      r.querySelector('.vbar-track').style.setProperty('--h', (r._t/max*100) + '%');
+      r.querySelectorAll('.vbar-seg').forEach(seg => {
+        const ch = seg.dataset.ch, v = parseFloat(r.dataset[ch]||'0');
+        if (active.includes(ch) && v > 0) { seg.style.display=''; seg.style.flex = String(v); }
+        else seg.style.display = 'none';
+      });
+      r.querySelector('.vbar-val').textContent = fmtBRL(r._t);
+      if (r._t > 0) { r.classList.remove('is-empty'); vis++; } else r.classList.add('is-empty');
+      const tip = r.querySelector('.vbar-tip');
+      const parts = ['<b>'+r.dataset.name+'</b>'];
+      if (r.dataset.leader) parts.push('<span style="opacity:.7">'+r.dataset.leader+'</span>');
+      active.forEach(ch => { const v = parseFloat(r.dataset[ch]||'0'); if (v>0) parts.push(labelFor(ch)+': '+fmtBRL(v)); });
+      parts.push('Projeção: <b>'+fmtBRL(r._t)+'</b> <span style="opacity:.6">amount</span>');
+      const hold = parseFloat(r.dataset.hold||'0');
+      if (hold > 0) parts.push('On-hold (MRR): '+fmtBRL(hold));
+      tip.innerHTML = parts.join('<br>');
+    });
+    cont.appendChild(frag);
+    cont.style.setProperty('--count', Math.max(vis,1));
+  }
+  document.querySelectorAll('.fc-chart').forEach(chart => {
+    chart.querySelectorAll('.leg-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('is-on');
+        const active = Array.from(chart.querySelectorAll('.leg-toggle.is-on')).map(b => b.dataset.ch);
+        chart.dataset.channels = active.join(' ');
+        refresh(chart);
+      });
+    });
+    refresh(chart);
+  });
+})();
+</script>
+{% endblock %}

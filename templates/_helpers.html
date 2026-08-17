@@ -1,0 +1,14 @@
+{% macro attainment_badge(at) %}
+  {% set at = at|float %}
+  {% if at >= 150 %}
+    <span class="badge" style="background:#E1F5EE;color:#085041">{{ "%.1f"|format(at)|replace(".",",") }}%</span>
+  {% elif at >= 100 %}
+    <span class="badge" style="background:#E1F5EE;color:#0F6E56">{{ "%.1f"|format(at)|replace(".",",") }}%</span>
+  {% elif at >= 75 %}
+    <span class="badge" style="background:#E6F1FB;color:#185FA5">{{ "%.1f"|format(at)|replace(".",",") }}%</span>
+  {% elif at >= 50 %}
+    <span class="badge" style="background:#FAEEDA;color:#854F0B">{{ "%.1f"|format(at)|replace(".",",") }}%</span>
+  {% else %}
+    <span class="badge" style="background:#FCEBEB;color:#A32D2D">{{ "%.1f"|format(at)|replace(".",",") }}%</span>
+  {% endif %}
+{% endmacro %}

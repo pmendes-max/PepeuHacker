@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}Sales Overtime · pepeuhacker{% endblock %}
+
+{% block content %}
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+<h1>Sales Overtime</h1>
+{% include "_chart_toggles.html" %}
+
+{# Resumo da janela selecionada (o recorte vem do filtro de Período · trimestres). #}
+<div class="kpis-big">
+  <div class="kpi acc">
+    <div class="kpi-l">Quota acumulada</div>
+    <div class="kpi-v">{{ totals.quota|brl }}</div>
+  </div>
+  <div class="kpi grn"{% if totals.drill_real %} data-drill="{{ totals.drill_real }}" title="Explodir os deals do período"{% endif %}>
+    <div class="kpi-l">Realizado acumulado</div>
+    <div class="kpi-v">{{ totals.realized|brl }}</div>
+    <div class="kpi-deals">{{ totals.deals }} deals</div>
+  </div>
+  <div class="kpi {% if totals.att and totals.att >= 1 %}grn{% else %}warn{% endif %}">
+    <div class="kpi-l">% atingimento no período</div>
+    <div class="kpi-v">{% if totals.att is not none %}{{ (totals.att*100)|round|int }}<span class="un">%</span>{% else %}—{% endif %}</div>
+  </div>
+</div>
+
+{# Chart 1 — RECEITA por trimestre: Realizado × Quota + linha de atingimento. #}
+<div style="margin-top:16px">
+{{ rank_chart(rk, 'Receita por trimestre', sub='realizado × quota · % atingimento',
+              currency=true, legend_real='Realizado', legend_quota='Quota',
+              tip_real='Realizado', tip_quota='Quota', tip_line='Atingimento',
+              order_note='ordem cronológica · clique no trimestre p/ explodir os deals',
+              toggle=true, modal_endpoint=url_for('overview_deals'), modal_grain=grain) }}
+</div>
+
+{# Chart 2 — NEW LOGOS por trimestre: mesma lógica, em contagem. #}
+{% if rk_nl %}
+<div class="kpis-big" style="margin-top:16px">
+  <div class="kpi acc">
+    <div class="kpi-l">Meta de new logo acumulada</div>
+    <div class="kpi-v">{{ totals.nl_quota }}</div>
+  </div>
+  <div class="kpi grn"{% if totals.drill_nl %} data-drill="{{ totals.drill_nl }}" title="Explodir as new logos do período"{% endif %}>
+    <div class="kpi-l">New logos realizados</div>
+    <div class="kpi-v">{{ totals.nl_real }}</div>
+  </div>
+  <div class="kpi {% if totals.nl_att and totals.nl_att >= 1 %}grn{% else %}warn{% endif %}">
+    <div class="kpi-l">% atingimento de new logo</div>
+    <div class="kpi-v">{% if totals.nl_att is not none %}{{ (totals.nl_att*100)|round|int }}<span class="un">%</span>{% else %}—{% endif %}</div>
+  </div>
+</div>
+<div style="margin-top:16px">
+{{ rank_chart(rk_nl, 'New logos por trimestre', sub='realizado × meta · % atingimento',
+              currency=false, legend_real='Realizado', legend_quota='Meta',
+              tip_real='New logos', tip_quota='Meta', tip_line='Atingimento',
+              order_note='ordem cronológica · clique no trimestre p/ explodir as new logos',
+              toggle=true, modal_endpoint=url_for('overview_deals'), modal_grain=grain) }}
+</div>
+{% endif %}
+
+{# Chart 3 — TICKET MÉDIO por trimestre: aquisição × expansão (só barras). #}
+{% if rk_tk %}
+<div style="margin-top:16px">
+{{ rank_chart(rk_tk, 'Ticket médio por trimestre', sub='aquisição × expansão',
+              currency=true, legend_real='Aquisição', legend_quota='Expansão',
+              tip_real='Ticket aquisição', tip_quota='Ticket expansão',
+              order_note='ordem cronológica · valor médio por deal ganho',
+              toggle=true, show_line=false,
+              modal_endpoint=url_for('overview_deals'), modal_grain=grain) }}
+</div>
+{% endif %}
+
+{# Chart 4 — UNIT PRICE: preço médio do sensor (só deals de Smart Trac). #}
+{% if rk_up %}
+<div style="margin-top:16px">
+{{ rank_chart(rk_up, 'Unit price por trimestre', sub='preço médio por sensor · Smart Trac · venda validada',
+              currency=true, legend_real='Venda nova', legend_quota='Expansão',
+              tip_real='Preço/sensor · nova', tip_quota='Preço/sensor · expansão',
+              order_note='ordem cronológica · MRR do sensor ÷ sensores (registro de venda)',
+              toggle=true, show_line=false,
+              modal_endpoint=url_for('overview_deals'), modal_grain=grain) }}
+</div>
+{% endif %}
+
+{# Chart 5 — CONVERSÃO DE FUNIL ao longo do tempo: 4 linhas configuráveis. #}
+{% from "_line_chart.html" import line_chart %}
+<div style="margin-top:16px">
+  <form method="get" class="conv-filters auto-apply">
+    {# preserva os filtros globais e a janela de trimestres; só os c1f..c4t saem #}
+    {% set _conv_keys = ['c1f','c1t','c2f','c2t','c3f','c3t','c4f','c4t','conv_type','cq_from','cq_to','conv_roll','refresh'] %}
+    {% for k, v in request.args.items() %}
+      {% if k not in _conv_keys %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}
+    {% endfor %}
+    {% for p in conv_pairs %}
+      <span class="conv-pair">
+        <span class="conv-dot" style="background:{{ conv_colors[loop.index0] }}"></span>
+        <select name="c{{ p.i }}f">
+          {% for num, sid, lbl in conv_stages %}<option value="{{ num }}" {% if p.a == num %}selected{% endif %}>S{{ num }}</option>{% endfor %}
+        </select>
+        <span class="conv-arrow">→</span>
+        <select name="c{{ p.i }}t">
+          {% for num, sid, lbl in conv_stages %}<option value="{{ num }}" {% if p.b == num %}selected{% endif %}>S{{ num }}</option>{% endfor %}
+        </select>
+      </span>
+    {% endfor %}
+    <span class="conv-pair">
+      <select name="conv_type">
+        <option value="" {% if not conv_type %}selected{% endif %}>Todos os deals</option>
+        <option value="acq" {% if conv_type == 'acq' %}selected{% endif %}>Só aquisição</option>
+        <option value="exp" {% if conv_type == 'exp' %}selected{% endif %}>Só expansão</option>
+      </select>
+    </span>
+    {# Coorte rolling: cada ponto do gráfico acumula o trimestre vigente + os
+       últimos X — o funil arrasta entre quarters. #}
+    <span class="conv-pair">
+      <span class="conv-arrow">Coorte</span>
+      <select name="conv_roll">
+        <option value="0" {% if conv_roll == 0 %}selected{% endif %}>Só o trimestre</option>
+        <option value="1" {% if conv_roll == 1 %}selected{% endif %}>Vigente + 1 anterior</option>
+        <option value="2" {% if conv_roll == 2 %}selected{% endif %}>Vigente + 2 anteriores</option>
+        <option value="3" {% if conv_roll == 3 %}selected{% endif %}>Vigente + 3 anteriores</option>
+        <option value="5" {% if conv_roll == 5 %}selected{% endif %}>Vigente + 5 anteriores</option>
+        <option value="7" {% if conv_roll == 7 %}selected{% endif %}>Vigente + 7 anteriores</option>
+      </select>
+    </span>
+  </form>
+</div>
+
+{{ line_chart(lc, 'Conversão · snapshot do funil', sub='ativos no destino ÷ ativos na origem, na mesma janela',
+              order_note=('janela = trimestre + ' ~ conv_roll ~ ' anteriores · visão de inventário') if conv_roll else 'visão de inventário do funil') }}
+
+{{ line_chart(lc_cohort, 'Conversão · coorte de entrada', sub='dos que entraram na origem na janela, % que chegou ao destino',
+              order_note=('janela = trimestre + ' ~ conv_roll ~ ' anteriores · modelo canônico (WbD/Roberge) · janelas recentes são coortes imaturas') if conv_roll else 'modelo canônico · trimestres recentes são coortes imaturas') }}
+
+<style>
+  .conv-filters{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:14px}
+  .conv-pair{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border,#d7dde5);
+    border-radius:8px;padding:5px 10px;background:var(--surface,#fff)}
+  .conv-pair select{border:none;background:none;font-size:13px;font-weight:600;
+    color:inherit;padding:2px 4px;cursor:pointer}
+  .conv-dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .conv-arrow{color:var(--muted,#64748b);font-size:12px}
+</style>
+
+{% if rk and rk.rows %}{{ rank_chart_script() }}{% endif %}
+{% include "_drilldown.html" %}
+{% endblock %}

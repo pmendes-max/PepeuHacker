@@ -1,0 +1,114 @@
+{# ============================================================================
+   Liga/desliga cada gráfico da página. Monta os chips a partir dos .panel que
+   têm <h2>, então não precisa registrar gráfico nenhum — vale pra qualquer
+   página que inclua este partial. A escolha fica salva por página
+   (localStorage), útil pra montar print/apresentação sem o que não interessa.
+   Some sozinho quando há menos de 2 gráficos.
+   ========================================================================== #}
+<div class="chart-toggles" id="chart-toggles" hidden></div>
+
+<style>
+  .chart-toggles{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
+  .chart-toggles[hidden]{display:none}
+  .ct-chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--border,#d7dde5);
+    border-radius:20px;padding:5px 13px;font-size:12.5px;font-weight:600;cursor:pointer;
+    background:var(--surface,#fff);color:var(--muted,#64748b);user-select:none;
+    transition:opacity .12s}
+  .ct-chip:hover{border-color:var(--blue,#2563EB)}
+  .ct-chip.is-on{color:var(--fg,#0f172a)}
+  .ct-chip.is-off{opacity:.5}
+  .ct-box{width:12px;height:12px;border-radius:3px;border:1.5px solid var(--muted,#94a3b8);
+    display:inline-block;position:relative}
+  .ct-chip.is-on .ct-box{background:var(--blue,#2563EB);border-color:var(--blue,#2563EB)}
+  .ct-chip.is-on .ct-box::after{content:"";position:absolute;left:3px;top:0;width:4px;height:8px;
+    border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
+</style>
+
+<script>
+(function(){
+  "use strict";
+  // O partial é incluído no TOPO da página (logo após o h1), então os .panel
+  // ainda não existem quando este script roda. Espera o DOM montar.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  function init(){
+  var bar = document.getElementById('chart-toggles');
+  if (!bar || bar.dataset.wired) return;
+  bar.dataset.wired = '1';
+
+  // Gráficos = .panel com título. Ignora o próprio bar e painéis sem h2.
+  var panels = [].slice.call(document.querySelectorAll('.panel')).filter(function(p){
+    return p.querySelector('h2');
+  });
+  if (panels.length < 2) return;          // 1 gráfico só: não faz sentido
+
+  var KEY = 'chartToggles:' + location.pathname;
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { saved = {}; }
+
+  function save(){
+    var st = {};
+    panels.forEach(function(p, i){ st[i] = !p.hidden; });
+    try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {}
+  }
+
+  // Nome do chip = título principal (sem o subtítulo depois do "·"), porque
+  // chip curto é o ponto. MAS quando dois painéis colapsam no mesmo nome — ex:
+  // "Conversão · snapshot do funil" e "Conversão · coorte de entrada" viravam
+  // dois chips "Conversão" indistinguíveis — os empatados recuperam o
+  // qualificador. Resolve antes de montar, senão o 1º chip não sabe que vai
+  // colidir com o 3º.
+  // Desambiguador = o título até o <span> do subtítulo ("Conversão · snapshot
+   // do funil"), NÃO o h2.textContent inteiro — este arrasta a descrição longa
+   // ("· ativos no destino ÷ ativos na origem…") e o chip vira um parágrafo.
+  function fullName(panel){
+    var h2 = panel.querySelector('h2');
+    var head = h2.childNodes[0] && h2.childNodes[0].textContent || h2.textContent;
+    return (head || '').replace(/\s+/g, ' ').trim().replace(/·$/, '').trim();
+  }
+  function shortName(panel){
+    var h2 = panel.querySelector('h2');
+    return (h2.childNodes[0] && h2.childNodes[0].textContent || h2.textContent)
+             .replace(/·.*$/, '').trim();
+  }
+  var shorts = panels.map(shortName);
+  var seen = {};
+  shorts.forEach(function(s){ seen[s] = (seen[s] || 0) + 1; });
+  var names = panels.map(function(p, i){
+    return seen[shorts[i]] > 1 ? fullName(p) : shorts[i];
+  });
+
+  panels.forEach(function(panel, i){
+    var name = names[i];
+    var on = saved[i] !== false;
+    panel.hidden = !on;
+
+    var chip = document.createElement('span');
+    chip.className = 'ct-chip ' + (on ? 'is-on' : 'is-off');
+    chip.setAttribute('role', 'button');
+    chip.tabIndex = 0;
+    chip.innerHTML = '<span class="ct-box"></span>';
+    chip.appendChild(document.createTextNode(name));
+
+    function toggle(){
+      var vis = panel.hidden;                 // vai ficar visível?
+      panel.hidden = !vis;
+      chip.classList.toggle('is-on', vis);
+      chip.classList.toggle('is-off', !vis);
+      save();
+    }
+    chip.addEventListener('click', toggle);
+    chip.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+    bar.appendChild(chip);
+  });
+
+  bar.hidden = false;
+  }
+})();
+</script>

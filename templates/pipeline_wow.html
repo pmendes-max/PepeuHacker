@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+{% block title %}Pipeline PoP · {{ focus|capitalize }} · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Movimentação PoP · Pipeline {{ focus|capitalize }}</h1>
+<div class="page-sub">
+  <b>{{ snap_prev_label }}</b> → <b>{{ snap_curr_label }}</b> (BRT) ·
+  deals em <b>{{ focus_label }}</b> em ao menos um dos snapshots
+</div>
+
+{# ---- Snapshot cards ---- #}
+<div class="panel">
+  <div class="snap-row">
+    <div class="snap-card">
+      <div class="snap-lbl">Snapshot anterior</div>
+      <div class="snap-date">{{ snap_prev_label }}</div>
+      <div class="snap-num">{{ total_prev|brl }}</div>
+      <div class="snap-sub">{{ deals_prev|intg }} deals em {{ focus|capitalize }}</div>
+    </div>
+    <div class="snap-arrow">→</div>
+    <div class="snap-card">
+      <div class="snap-lbl">Snapshot atual</div>
+      <div class="snap-date">{{ snap_curr_label }}</div>
+      <div class="snap-num">{{ total_curr|brl }}</div>
+      <div class="snap-sub">{{ deals_curr|intg }} deals em {{ focus|capitalize }}</div>
+    </div>
+    {# Saldo = só o que aumentou/diminuiu de pipe (novo + cresceu − encolheu − lost).
+       Won saiu daqui e virou card próprio, a pedido. #}
+    <div class="snap-card snap-card-delta {% if cat_totals.net >= 0 %}is-pos{% else %}is-neg{% endif %}"
+         data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat='novo,cresceu,encolheu,lost', leader=ctx.filters.leader, region=ctx.filters.region) }}"
+         title="Explodir os deals que compõem o saldo">
+      <div class="snap-lbl">Saldo do período</div>
+      {# Sinal fora do |brl| pra sair "−R$ 185k" e não "R$ -185k". #}
+      <div class="snap-num">{{ '+' if cat_totals.net >= 0 else '−' }}{{ (cat_totals.net if cat_totals.net >= 0 else -cat_totals.net)|brl }}</div>
+      <div class="snap-sub">
+        {% if total_prev > 0 %}
+          {% set pct = (cat_totals.net / total_prev * 100) %}
+          {{ '+' if pct >= 0 else '−' }}{{ "%.1f"|format(pct if pct >= 0 else -pct) }}% do pipe anterior · sem won
+        {% else %}sem won{% endif %}
+      </div>
+    </div>
+    {# 5ª categoria: Early = quanto avançou pra Late; Late = won. #}
+    <div class="snap-card{% if cat_deals[fifth_cat] %} snap-card-drill{% endif %}"
+         {% if cat_deals[fifth_cat] %}data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat=fifth_cat, leader=ctx.filters.leader, region=ctx.filters.region) }}"
+         title="Explodir os deals {{ 'movidos pra Late' if fifth_cat == 'late' else 'ganhos' }} no período"{% endif %}>
+      <div class="snap-lbl">{{ 'Movido pra Late' if fifth_cat == 'late' else 'Won no período' }}</div>
+      <div class="snap-num">{{ (-cat_totals[fifth_cat])|brl }}</div>
+      <div class="snap-sub">{{ cat_deals[fifth_cat]|intg }} deal{{ 's' if cat_deals[fifth_cat] != 1 else '' }} · {{ 'avançou de estágio' if fifth_cat == 'late' else 'saiu do pipe como receita' }}</div>
+    </div>
+  </div>
+</div>
+
+{# ---- Chart por AE ---- #}
+<div class="panel">
+  <h2>Por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
+  <div class="dchart" data-chart="wow-{{ focus }}">
+    <div class="legend legend-toggle">
+      {# cor = preenchimento (ponto/barra) · ink = texto do chip. Os dois pastéis
+         (cresceu/encolheu) precisam de ink próprio: como texto de 12px eles
+         desapareciam no fundo claro. Ver nota em .leg-toggle.is-on. #}
+      {% for key, label, cor, ink in [
+        ('novo',     'Novo deal',          '#15803d', '#15803d'),
+        ('cresceu',  'Cresceu em amount',  '#86efac', '#047857'),
+        ('encolheu', 'Encolheu em amount', '#fdba74', '#B45309'),
+        ('lost',     'Lost',               '#dc2626', '#B91C1C'),
+        ('won',      fifth_label,          '#94a3b8', '#475569'),
+      ] %}
+        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}" style="--c:{{ cor }};--ci:{{ ink }}">
+          <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
+        </button>
+      {% endfor %}
+    </div>
+
+    {% if rows %}
+    <div class="wow-wrap">
+      <div class="wow-chart" style="--count:{{ rows|length }}">
+        {# Linha Y=0 contínua (vertical-center do chart-area) #}
+        <div class="wow-zero-bar"></div>
+        {% for r in rows %}
+          {% set h_novo     = (r.novo / y_max * 100) %}
+          {% set h_cresceu  = (r.cresceu / y_max * 100) %}
+          {% set h_encolheu = (-r.encolheu / y_max * 100) %}
+          {% set h_lost     = (-r.lost / y_max * 100) %}
+          {# Area tem 200px: abaixo de 9% (~18px) o rotulo nao cabe dentro do
+             segmento e passa a ser desenhado pra fora da barra. #}
+          {% set CURTO = 9 %}
+          <div class="wow-col" data-net="{{ r.net }}"
+               {# O número embaixo do nome é o net, que exclui a 5ª categoria —
+                  então a explosão da coluna traz só o que compõe o saldo. #}
+               {% if r.net %}data-drill="{{ url_for('pipeline_wow_deals', focus=focus, name=r.account_executive, grain=grain, cat='novo,cresceu,encolheu,lost') }}"{% endif %}>
+            <div class="wow-col-tip">
+              <b>{{ r.account_executive }}</b><br>
+              <span class="tip-net {% if r.net >= 0 %}is-pos{% else %}is-neg{% endif %}">
+                Net: {% if r.net >= 0 %}+{% endif %}{{ r.net|brl }}
+              </span>
+              <hr>
+              <span class="tip-pos">+ Novo:</span> {{ r.novo|brl }} <span class="tip-deals">({{ r.deals_novo }} deals)</span><br>
+              <span class="tip-pos">+ Cresceu:</span> {{ r.cresceu|brl }} <span class="tip-deals">({{ r.deals_cresceu }} deals)</span><br>
+              <span class="tip-neg">− Encolheu:</span> {{ (-r.encolheu)|brl }} <span class="tip-deals">({{ r.deals_encolheu }} deals)</span><br>
+              <span class="tip-neg">− Lost:</span> {{ (-r.lost)|brl }} <span class="tip-deals">({{ r.deals_lost }} deals)</span><br>
+              <hr>
+              <span class="tip-neutral">{{ fifth_label }}:</span> {{ (-r.won)|brl }} <span class="tip-deals">({{ r.deals_won }} deals)</span>
+            </div>
+
+            <div class="wow-pos-area">
+              {# Rotulos de segmento baixo saem da barra e empilham AQUI, na
+                 mesma ordem do stack — assim nunca se sobrepoem entre si nem
+                 invadem o segmento vizinho. #}
+              {# Prioridade: se os DOIS saem pra fora, o de maior valor fica nitido e
+                 o menor entra como secundario (is-minor) — quem manda no saldo e
+                 quem tem mais impacto. #}
+              {% set pos_out_2 = (r.cresceu > 0 and h_cresceu < CURTO) and (r.novo > 0 and h_novo < CURTO) %}
+              <div class="wow-out wow-out-pos">
+                {% if r.cresceu > 0 and h_cresceu < CURTO %}<span class="wow-out-lbl{% if pos_out_2 and r.cresceu < r.novo %} is-minor{% endif %}" data-ch="cresceu">{{ r.cresceu|brl }}</span>{% endif %}
+                {% if r.novo > 0 and h_novo < CURTO %}<span class="wow-out-lbl{% if pos_out_2 and r.novo <= r.cresceu %} is-minor{% endif %}" data-ch="novo">{{ r.novo|brl }}</span>{% endif %}
+              </div>
+              {% if r.cresceu > 0 %}
+                <div class="wow-seg wow-seg-cresceu{% if h_cresceu < CURTO %} is-short{% endif %}" data-ch="cresceu"
+                     style="height:{{ h_cresceu }}%"
+                     data-amt="{{ r.cresceu|brl }}"></div>
+              {% endif %}
+              {% if r.novo > 0 %}
+                <div class="wow-seg wow-seg-novo{% if h_novo < CURTO %} is-short{% endif %}" data-ch="novo"
+                     style="height:{{ h_novo }}%"
+                     data-amt="{{ r.novo|brl }}"></div>
+              {% endif %}
+            </div>
+
+            <div class="wow-neg-area">
+              {% if r.encolheu < 0 %}
+                <div class="wow-seg wow-seg-encolheu{% if h_encolheu < CURTO %} is-short{% endif %}" data-ch="encolheu"
+                     style="height:{{ h_encolheu }}%"
+                     data-amt="{{ (-r.encolheu)|brl }}"></div>
+              {% endif %}
+              {% if r.lost < 0 %}
+                <div class="wow-seg wow-seg-lost{% if h_lost < CURTO %} is-short{% endif %}" data-ch="lost"
+                     style="height:{{ h_lost }}%"
+                     data-amt="{{ (-r.lost)|brl }}"></div>
+              {% endif %}
+              {% set neg_out_2 = (r.encolheu < 0 and h_encolheu < CURTO) and (r.lost < 0 and h_lost < CURTO) %}
+              <div class="wow-out wow-out-neg">
+                {% if r.encolheu < 0 and h_encolheu < CURTO %}<span class="wow-out-lbl{% if neg_out_2 and -r.encolheu < -r.lost %} is-minor{% endif %}" data-ch="encolheu">{{ (-r.encolheu)|brl }}</span>{% endif %}
+                {% if r.lost < 0 and h_lost < CURTO %}<span class="wow-out-lbl{% if neg_out_2 and -r.lost <= -r.encolheu %} is-minor{% endif %}" data-ch="lost">{{ (-r.lost)|brl }}</span>{% endif %}
+              </div>
+            </div>
+
+            <div class="wow-extra" data-ch="won">
+              {% if r.won < 0 %}
+                {# Tem número próprio, então explode só a 5ª categoria desse AE. #}
+                <div class="wow-won" data-drill="{{ url_for('pipeline_wow_deals', focus=focus, name=r.account_executive, grain=grain, cat=fifth_cat) }}"
+                     title="Explodir · {{ fifth_label }} de {{ r.account_executive }}">{{ '→ Late' if fifth_cat == 'late' else 'Won' }} {{ (-r.won)|brl }}</div>
+              {% endif %}
+            </div>
+
+            <div class="wow-name" title="Net PoP: {{ r.net|brl }}">
+              <span class="wow-name-text">{{ r.account_executive }}</span>
+              <span class="wow-name-net {% if r.net >= 0 %}is-pos{% elif r.net < 0 %}is-neg{% endif %}">
+                {% if r.net >= 0 %}+{% endif %}{{ r.net|brl }}
+              </span>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="empty-state">Sem deals em {{ focus_label }} nos snapshots dessa janela.</div>
+    {% endif %}
+  </div>
+</div>
+
+{# ---- Legenda com números: total de cada categoria na janela. Fecha o net do
+   gráfico (novo + cresceu + encolheu + lost); Won fica de fora, informativo. ---- #}
+<div class="panel">
+  <h2>Movimentação por categoria <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ snap_prev_label }} → {{ snap_curr_label }}</span></h2>
+  <div class="wow-tot-row">
+    {% set cats = [
+      ('novo',     'Novo deal',          '#15803d', cat_totals.novo,      1),
+      ('cresceu',  'Cresceu em amount',  '#86efac', cat_totals.cresceu,   1),
+      ('encolheu', 'Encolheu em amount', '#fdba74', cat_totals.encolheu, -1),
+      ('lost',     'Lost',               '#dc2626', cat_totals.lost,     -1),
+      (fifth_cat,  fifth_label ~ ' (informativo)', '#94a3b8', cat_totals[fifth_cat], -1),
+    ] %}
+    {% for key, label, cor, val, sinal in cats %}
+      {# Cada card explode SÓ a sua categoria. #}
+      <div class="wow-tot{% if cat_deals[key] %} wow-tot-drill{% endif %}"
+           {% if cat_deals[key] %}data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat=key, leader=ctx.filters.leader, region=ctx.filters.region) }}"
+           title="Explodir os deals de {{ label }}"{% endif %}>
+        <div class="wow-tot-lbl"><span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}</div>
+        <div class="wow-tot-num {% if sinal > 0 %}is-pos{% else %}is-neg{% endif %}">
+          {% if val %}{{ '+' if sinal > 0 else '−' }}{% endif %}{{ (val if sinal > 0 else -val)|brl }}
+        </div>
+        <div class="wow-tot-sub">{{ cat_deals[key]|intg }} deal{{ 's' if cat_deals[key] != 1 else '' }}</div>
+      </div>
+    {% endfor %}
+    <div class="wow-tot wow-tot-net wow-tot-drill"
+         data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat='novo,cresceu,encolheu,lost', leader=ctx.filters.leader, region=ctx.filters.region) }}"
+         title="Explodir os deals que compõem o saldo">
+      <div class="wow-tot-lbl">Saldo do período</div>
+      <div class="wow-tot-num {% if cat_totals.net >= 0 %}is-pos{% else %}is-neg{% endif %}">
+        {{ '+' if cat_totals.net >= 0 else '−' }}{{ (cat_totals.net if cat_totals.net >= 0 else -cat_totals.net)|brl }}
+      </div>
+      <div class="wow-tot-sub">novo + cresceu − encolheu − lost</div>
+    </div>
+  </div>
+
+  {# Ponte entre os 2 snapshots: o saldo não fecha a diferença sozinho porque
+     won, transferências entre estágios, voltas de estágio e reaberturas também
+     mexem no total. Deixa a conta auditável em vez de "sobrar" diferença.
+     Desde a migração pra eventos (wow_events) todas as parcelas saem da MESMA
+     conta, então isto fecha EXATO — se sobrar diferença aqui, é bug. #}
+  <div class="wow-bridge">
+    {{ total_prev|brl }}
+    <span>{% if cat_totals.net >= 0 %}+{% else %}−{% endif %} saldo {{ (cat_totals.net if cat_totals.net >= 0 else -cat_totals.net)|brl }}</span>
+    {% if fifth_cat == 'late' and cat_totals.late %}<span>− movido p/ Late {{ (-cat_totals.late)|brl }} ({{ cat_deals.late }})</span>{% endif %}
+    {% if cat_totals.won %}<span>− won {{ (-cat_totals.won)|brl }}</span>{% endif %}
+    {% if cat_totals.transferiu %}<span>{% if cat_totals.transferiu >= 0 %}+{% else %}−{% endif %} transferência entre estágios {{ (cat_totals.transferiu if cat_totals.transferiu >= 0 else -cat_totals.transferiu)|brl }} ({{ cat_deals.transferiu }})</span>{% endif %}
+    {% if cat_totals.regrediu %}<span>− voltou de estágio {{ (-cat_totals.regrediu)|brl }} ({{ cat_deals.regrediu }})</span>{% endif %}
+    {% if cat_totals.reabriu %}<span>+ reabriu {{ cat_totals.reabriu|brl }} ({{ cat_deals.reabriu }})</span>{% endif %}
+    <b>= {{ total_curr|brl }}</b>
+  </div>
+</div>
+
+<style>
+  /* Rótulo de barra: o montante de cada segmento vem do data-amt que já existia
+     (só era usado no tooltip). Fica DENTRO do segmento e desaparece junto quando
+     o canal é desligado na legenda.
+     O rótulo pode ser MAIS LARGO que o segmento (que é 70% da coluna): fica
+     centrado na barra e usa a largura da coluna inteira, senão nao caberia
+     "US$ 1.234k" nem numa fonte legivel. */
+  .wow-seg{position:relative;overflow:visible}
+  .wow-seg::after{
+    content:attr(data-amt);
+    position:absolute;
+    left:50%;transform:translateX(-50%);
+    top:0;bottom:0;
+    display:flex;align-items:center;justify-content:center;
+    font-size:11.5px;font-weight:800;letter-spacing:-.3px;
+    white-space:nowrap;pointer-events:none;
+  }
+  /* Contraste por cor de fundo do segmento. */
+  .wow-seg-novo::after, .wow-seg-lost::after{color:#fff}
+  .wow-seg-cresceu::after{color:#14532d}
+  .wow-seg-encolheu::after{color:#7c2d12}
+
+  /* Segmento baixo demais pro rótulo caber dentro: o valor sai da barra e vai
+     pro contêiner .wow-out, que FLUI junto ao stack (acima no lado positivo,
+     abaixo no negativo). Empilhado em flex, então dois rótulos externos na mesma
+     área nunca se sobrepõem — e nunca invadem o segmento vizinho. */
+  .wow-seg.is-short::after{content:none}
+
+  .wow-out{
+    flex:0 0 auto;
+    display:flex;align-items:center;
+    line-height:14px;
+    pointer-events:none;
+  }
+  .wow-out-pos{flex-direction:column;justify-content:flex-end}
+  /* column-reverse: o rótulo do segmento mais próximo do stack fica em cima. */
+  .wow-out-neg{flex-direction:column-reverse;justify-content:flex-end}
+  .wow-out-lbl{
+    font-size:11.5px;font-weight:800;letter-spacing:-.3px;white-space:nowrap;
+    color:var(--fg);
+  }
+  /* Secundario: perde peso pro de maior impacto ler primeiro. */
+  .wow-out-lbl.is-minor{font-size:10px;font-weight:600;color:var(--muted)}
+  .wow-out:empty{display:none}
+
+  /* Texto grande de propósito: esse bloco é lido em print/apresentação. */
+  .wow-tot-row{display:flex;flex-wrap:wrap;gap:14px}
+  .wow-tot{flex:1 1 170px;border:1px solid var(--border);border-radius:12px;
+    padding:16px 18px;background:var(--surface)}
+  .wow-tot-net{border-width:2px;border-color:var(--fg)}
+  .wow-tot-lbl{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;
+    color:var(--muted);margin-bottom:8px;white-space:nowrap}
+  .wow-tot-num{font-size:30px;font-weight:800;letter-spacing:-.6px;line-height:1.1}
+  .wow-tot-num.is-pos{color:#15803d}
+  .wow-tot-num.is-neg{color:#dc2626}
+  .wow-tot-net .wow-tot-num{color:var(--fg)}
+  .wow-tot-sub{margin-top:6px;font-size:13px;color:var(--muted)}
+  .wow-tot-drill{cursor:pointer;transition:border-color .15s ease,transform .15s ease}
+  .wow-tot-drill:hover{border-color:var(--blue,#2563EB);transform:translateY(-1px)}
+  .wow-bridge{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
+    font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}
+  .wow-bridge b{color:var(--fg)}
+</style>
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  // Toggles: escondem segmentos por canal (CSS-only via data-channels no chart)
+  document.querySelectorAll('.dchart[data-chart^="wow-"]').forEach(chart => {
+    const channels = ['novo','cresceu','encolheu','lost','won'];
+    chart.dataset.channels = channels.join(' ');
+    chart.querySelectorAll('.leg-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('is-on');
+        const active = Array.from(chart.querySelectorAll('.leg-toggle.is-on'))
+                            .map(b => b.dataset.ch);
+        chart.dataset.channels = active.join(' ');
+      });
+    });
+  });
+})();
+</script>
+{% endblock %}

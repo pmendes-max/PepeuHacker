@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block title %}Funil II · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Funil II</h1>
+<div class="page-sub">{{ base_label|capitalize }} <b>{{ period_label }}</b></div>
+
+{# ---------- Totais ---------- #}
+<div class="panel">
+  <div class="stats-strip">
+    <div class="stat c-blue" data-drill="{{ total_drill }}">
+      <div class="stat-l">Oportunidades</div>
+      <div class="stat-v">{{ total_n|intg }}</div>
+    </div>
+    <div class="stat c-slate" data-drill="{{ total_drill }}">
+      <div class="stat-l">Valor total</div>
+      <div class="stat-v">{{ total_amount|brl }}</div>
+    </div>
+    <div class="stat c-green" data-drill="{{ won_row.drill }}">
+      <div class="stat-l">Won</div>
+      <div class="stat-v">{{ won_row.n|intg }}</div>
+    </div>
+    <div class="stat c-red" data-drill="{{ lost_row.drill }}">
+      <div class="stat-l">Lost</div>
+      <div class="stat-v">{{ lost_row.n|intg }}</div>
+    </div>
+    <div class="stat is-total">
+      <div class="stat-l">Win rate</div>
+      <div class="stat-v">{% if win_rate is not none %}{{ win_rate|pctraw }}{% else %}—{% endif %}</div>
+    </div>
+  </div>
+</div>
+
+{# ---------- O funil ----------
+   Cada etapa é um TRAPÉZIO: topo = os deals dela, base = os da etapa seguinte.
+   Empilhados sem gap, o afunilamento é contínuo — a inclinação de cada lateral
+   É a perda daquele passo. Termina na ponta do Won. A taxa do passo fica colada
+   na borda entre as duas faixas; Won/Lost de cada etapa ficam à direita, com
+   denominador próprio (por isso não somam entre linhas). #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Funil</h2>
+    <span class="ph" style="margin:0">largura = deals na etapa</span>
+  </div>
+
+  {# Base do período: entrada na etapa ou criação do deal. #}
+  <div class="grain-switch" style="margin-bottom:16px">
+    {% for b in bases %}
+      <a class="grain-btn {% if b.active %}active{% endif %}" href="{{ b.url }}">{{ b.label }}</a>
+    {% endfor %}
+  </div>
+
+  {% if total_n %}
+  <div class="f2v">
+    {% for r in bands %}
+    <div class="f2v-row">
+      <div class="f2v-label">
+        <div class="f2v-stage" style="--c:{{ r.color }}">{{ r.label }}</div>
+        <div class="f2v-meta">{{ r.n|intg }} · {{ r.amount|brl }}</div>
+      </div>
+
+      <div class="f2v-bandwrap">
+        {# clip-path desenha o trapézio; as 4 larguras vêm do servidor pra a
+           forma bater exatamente com as contagens. #}
+        <div class="f2v-band" data-drill="{{ r.drill }}"
+             title="Explodir os {{ r.n }} deals de {{ r.label }}"
+             style="background:{{ r.color }};
+                    clip-path: polygon({{ (50 - r.w_top / 2)|round(3) }}% 0%,
+                                       {{ (50 + r.w_top / 2)|round(3) }}% 0%,
+                                       {{ (50 + r.w_bot / 2)|round(3) }}% 100%,
+                                       {{ (50 - r.w_bot / 2)|round(3) }}% 100%)"></div>
+        {% if r.has_step %}
+        <span class="f2v-step" data-drill="{{ r.next_drill }}"
+              title="{{ r.next }} dos {{ r.n }} de {{ r.label }} chegaram em {{ r.next_label }}">
+          {% if r.next_pct is not none %}{{ r.next_pct|pctraw }}{% else %}—{% endif %}
+        </span>
+        {% endif %}
+      </div>
+
+      <div class="f2v-rates">
+        {% if not r.is_terminal %}
+          {% if not r.won_in_step %}
+          <span class="f2-pill f2-won" data-drill="{{ r.won_drill }}"
+                title="{{ r.won }} de {{ r.n }} foram ganhos">
+            <b>{% if r.won_pct is not none %}{{ r.won_pct|pctraw }}{% else %}—{% endif %}</b>
+            <i>Won</i>
+          </span>
+          {% endif %}
+          <span class="f2-pill f2-lost" data-drill="{{ r.lost_drill }}"
+                title="{{ r.lost }} de {{ r.n }} foram perdidos">
+            <b>{% if r.lost_pct is not none %}{{ r.lost_pct|pctraw }}{% else %}—{% endif %}</b>
+            <i>Lost</i>
+          </span>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="stalled-empty">
+    {% if base_mode == 'created' %}Nenhum deal foi criado nesse período.
+    {% else %}Nenhuma oportunidade entrou em alguma etapa nesse período.{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# ---------- Tabela ---------- #}
+{% if total_n %}
+<div class="panel">
+  <h2>Conversão por etapa</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Etapa</th>
+          {# Na base de criação a coluna não é "quem entrou na janela", é "quem
+             da safra chegou até aqui" — o rótulo tem que dizer isso. #}
+          <th class="n">{% if base_mode == 'created' %}Chegaram{% else %}Entraram{% endif %}</th>
+          <th class="n">Valor</th>
+          <th class="n grp">Próxima etapa</th>
+          <th class="n">%</th>
+          <th class="n grp">Won</th>
+          <th class="n">%</th>
+          <th class="n grp">Lost</th>
+          <th class="n">%</th>
+          <th class="n grp">Em aberto</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in stage_rows %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ r.color }}"></span>{{ r.label }}</td>
+          <td class="n"><b><span class="f2-cell" data-drill="{{ r.drill }}">{{ r.n|intg }}</span></b></td>
+          <td class="n">{{ r.amount|brl }}</td>
+          {# Em Procurement a próxima etapa é Won — não repete a coluna. #}
+          <td class="n grp">{% if r.has_next %}<span class="f2-cell" data-drill="{{ r.next_drill }}">{{ r.next|intg }}</span>{% else %}—{% endif %}</td>
+          <td class="n">{% if r.has_next and r.next_pct is not none %}{{ r.next_pct|pctraw }}{% else %}—{% endif %}</td>
+          <td class="n grp"><span class="f2-cell" data-drill="{{ r.won_drill }}">{{ r.won|intg }}</span></td>
+          <td class="n f2-c-won">{% if r.won_pct is not none %}<b>{{ r.won_pct|pctraw }}</b>{% else %}—{% endif %}</td>
+          <td class="n grp"><span class="f2-cell" data-drill="{{ r.lost_drill }}">{{ r.lost|intg }}</span></td>
+          <td class="n f2-c-lost">{% if r.lost_pct is not none %}<b>{{ r.lost_pct|pctraw }}</b>{% else %}—{% endif %}</td>
+          <td class="n grp"><span class="f2-cell" data-drill="{{ r.open_drill }}">{{ r.open|intg }}</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<style>
+  /* Funil de verdade: cada etapa é um TRAPÉZIO (clip-path) cujo topo tem a
+     largura dela e a base a largura da etapa seguinte. Empilhados sem gap, as
+     laterais formam uma silhueta contínua e a inclinação de cada lado É a perda
+     do passo. Grid no CONTAINER (linhas são display:contents) pra as 3 colunas
+     — rótulo / funil / taxas — alinharem entre linhas. */
+  .f2v{
+    display: grid;
+    grid-template-columns: max-content minmax(240px, 1fr) max-content;
+    align-items: stretch;
+    column-gap: 16px;
+    row-gap: 0;                 /* zero: é o gap que quebraria a silhueta */
+    margin-top: 2px;
+  }
+  .f2v-row{ display: contents; }
+
+  .f2v-label{
+    display: flex; flex-direction: column; justify-content: center;
+    text-align: right;
+    padding: 4px 0;
+  }
+  .f2v-stage{
+    font-size: 13px; font-weight: 600; color: var(--fg);
+    white-space: nowrap;
+    border-right: 3px solid var(--c);
+    padding-right: 9px;
+  }
+  .f2v-meta{
+    font-size: 11px; color: var(--muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+    padding-right: 12px; margin-top: 2px;
+  }
+
+  .f2v-bandwrap{ position: relative; height: 54px; }
+  .f2v-band{
+    position: absolute; inset: 0;
+    cursor: pointer;
+    transition: filter .12s ease;
+  }
+  .f2v-band:hover{ filter: brightness(1.1); }
+  /* Taxa do passo, montada NA borda entre as duas faixas (metade pra fora, pra
+     ler como "o que passou daqui pra baixo"). z-index acima da faixa seguinte. */
+  .f2v-step{
+    position: absolute;
+    left: 50%; bottom: 0;
+    transform: translate(-50%, 50%);
+    z-index: 2;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #1D4ED8;
+    background: var(--surface);
+    border: 1px solid color-mix(in srgb, #2563EB 40%, transparent);
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .10);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .f2v-step:hover{ background: color-mix(in srgb, #2563EB 12%, transparent); }
+
+  .f2v-rates{
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 0;
+  }
+
+  .f2-pill{
+    display: inline-flex; align-items: baseline; gap: 5px;
+    padding: 4px 9px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    background: color-mix(in srgb, var(--c) 12%, transparent);
+    color: var(--c);
+  }
+  .f2-pill:hover{ background: color-mix(in srgb, var(--c) 22%, transparent); }
+  .f2-pill b{ font-weight: 700; font-variant-numeric: tabular-nums; }
+  .f2-pill i{ font-style: normal; opacity: .8; font-size: 11px; }
+  .f2-won { --c: #15803D; }
+  .f2-lost{ --c: #B91C1C; }
+
+  /* Números da tabela viram alvo de drill sem parecer link solto. */
+  .f2-cell{ cursor: pointer; border-bottom: 1px dotted var(--muted-2); }
+  .f2-cell:hover{ color: var(--accent, #2563EB); }
+  .f2-c-won b { color: #15803D; }
+  .f2-c-lost b{ color: #B91C1C; }
+</style>
+{% endblock %}

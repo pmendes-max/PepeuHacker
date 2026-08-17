@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Pipeline · pepeuhacker{% endblock %}
+
+{% block content %}
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+{# Chart 1 — cobertura EARLY stage. Janela PRÓPRIA (ciclo M3+M1+M2), não o filtro
+   da página: por isso o período do card vem de `early_period`. Sem textos
+   explicativos (h1/sub/order_note) — dashboard clean pra prints. #}
+{{ rank_chart(cov_early, 'Cobertura Early · close date ' ~ early_period,
+              currency=true, legend_real='Amount em cobertura',
+              legend_quota=('Quota do trimestre' if early.use_full_quota else 'Quota remanescente'),
+              legend_line='Cobertura (Nx)', tip_real='Amount em cobertura',
+              tip_quota=('Quota do trimestre' if early.use_full_quota else 'Quota remanescente'),
+              tip_line='Cobertura',
+              order_note='',
+              goal_label=early_goal_label, toggle=true,
+              modal_endpoint=url_for('pipeline_coverage_deals'), modal_grain=grain, modal_bucket='early',
+              modal_from=early.close_from, modal_to=early.close_to) }}
+
+{# Chart 2 — cobertura LATE stage, MESMA estrutura + META DINÂMICA (progressão semanal) #}
+{{ rank_chart(cov_late, 'Cobertura Late',
+              currency=true, legend_real='Amount em cobertura', legend_quota='Quota remanescente',
+              legend_line='Cobertura (Nx)', tip_real='Amount em cobertura', tip_quota='Quota remanescente',
+              tip_line='Cobertura', order_note='',
+              goal_label=late_goal_label, toggle=true,
+              modal_endpoint=url_for('pipeline_coverage_deals'), modal_grain=grain, modal_bucket='late',
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+
+{% if (cov_early and cov_early.rows) or (cov_late and cov_late.rows) %}{{ rank_chart_script() }}{% endif %}
+{% include "_drilldown.html" %}
+
+{% endblock %}

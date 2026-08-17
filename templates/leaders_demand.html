@@ -1,0 +1,364 @@
+{% extends "base.html" %}
+{% block title %}Sales BR · Leaders — Geração de Demanda{% endblock %}
+
+{% block content %}
+<h1>Geração de Demanda</h1>
+
+{# ------- Chart 1: Geradas pelo time do líder (auto) ------- #}
+<div class="panel">
+  <h2>Geradas pelo time do líder</h2>
+  <div class="dchart" data-channels="acq exp goal" data-chart="auto"
+       data-color-acq="#2563EB" data-color-exp="#1E3A8A"
+       data-goal-mode="per-bar"
+       data-goal-per-ae="{{ weekly_goal_per_ae }}">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" style="--c:#2563EB">
+        <span class="leg-dot" style="background:#2563EB"></span>Aquisição
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="exp" style="--c:#1E3A8A">
+        <span class="leg-dot" style="background:#1E3A8A"></span>Expansão
+      </button>
+      {% if weekly_goal_per_ae %}
+      <button type="button" class="leg-toggle is-on leg-goal" data-ch="goal" style="--c:var(--blue)">
+        <span class="leg-dot" style="background:var(--blue);border:1.5px dashed #fff;box-shadow:0 0 0 1px var(--blue)"></span>Meta · {{ weekly_goal_per_ae }}/AE
+      </button>
+      {% endif %}
+    </div>
+    {% set ae_auto = by_ae|sort(attribute='auto_total', reverse=true)|list %}
+    <div class="vbars" style="--count:{{ ae_auto|length }}">
+      {% for r in ae_auto %}
+        {% set aa = r.auto_acq|int %}
+        {% set ae_ = r.auto_exp|int %}
+        {% set total_init = aa + ae_ %}
+        {% set h_pct = (total_init / max_auto * 100) if max_auto else 0 %}
+        {% set goal = r.goal|int %}
+        {% set goal_pct = (goal / max_auto * 100) if (max_auto and goal) else 0 %}
+        <div class="vbar{% if total_init <= 0 %} is-empty{% endif %}"
+             data-acq="{{ aa }}" data-exp="{{ ae_ }}"
+             data-goal="{{ goal }}" data-team-size="{{ r.team_size }}"
+             data-name="{{ r.account_executive }}"
+             {% if total_init > 0 %}data-drill="{{ url_for('demand_deals', name=r.account_executive, grain='leader', date_from=range_from, date_to=range_to, source='auto') }}"{% endif %}>
+          <div class="vbar-tip"></div>
+          <div class="vbar-track" style="--h:{{ h_pct }}%">
+            {% if goal > 0 %}
+            <div class="vbar-mark" style="--gp:{{ goal_pct }}%" data-ch="goal">
+              <span class="vbar-mark-label">{{ goal }}</span>
+            </div>
+            {% endif %}
+            <div class="vbar-val">{{ total_init|intg }}</div>
+            <div class="vbar-col">
+              {% if aa > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ aa }}"></div>{% endif %}
+              {% if ae_ > 0 %}<div class="vbar-seg" data-ch="exp" style="background:#1E3A8A;flex:{{ ae_ }}"></div>{% endif %}
+            </div>
+          </div>
+          <div class="vbar-name">{{ r.account_executive }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ------- Chart 2: Recebidas pelo time — split Inbound/Outbound/Expansão ------- #}
+<div class="panel">
+  <h2>Recebidas pelo time do líder</h2>
+  <div class="dchart" data-channels="inbound outbound exp" data-chart="rcv">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="inbound" style="--c:#10B981;--ci:#047857">
+        <span class="leg-dot" style="background:#10B981"></span>Inbound
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="outbound" style="--c:#6366F1">
+        <span class="leg-dot" style="background:#6366F1"></span>Outbound
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="exp" style="--c:#047857">
+        <span class="leg-dot" style="background:#047857"></span>Expansão
+      </button>
+    </div>
+    {% set ae_rcv = by_ae|sort(attribute='rcv_total', reverse=true)|list %}
+    <div class="vbars" style="--count:{{ ae_rcv|length }}">
+      {% for r in ae_rcv %}
+        {% set rin  = r.rcv_inbound|int %}
+        {% set rout = r.rcv_outbound|int %}
+        {% set re   = r.rcv_exp|int %}
+        {% set total_init = rin + rout + re %}
+        {% set h_pct = (total_init / max_rcv * 100) if max_rcv else 0 %}
+        <div class="vbar{% if total_init <= 0 %} is-empty{% endif %}"
+             data-inbound="{{ rin }}" data-outbound="{{ rout }}" data-exp="{{ re }}"
+             data-name="{{ r.account_executive }}"
+             {% if total_init > 0 %}data-drill="{{ url_for('demand_deals', name=r.account_executive, grain='leader', date_from=range_from, date_to=range_to, source='received') }}"{% endif %}>
+          <div class="vbar-tip"></div>
+          <div class="vbar-track" style="--h:{{ h_pct }}%">
+            <div class="vbar-val">{{ total_init|intg }}</div>
+            <div class="vbar-col">
+              {% if rin  > 0 %}<div class="vbar-seg" data-ch="inbound"  style="background:#10B981;flex:{{ rin }}"></div>{% endif %}
+              {% if rout > 0 %}<div class="vbar-seg" data-ch="outbound" style="background:#6366F1;flex:{{ rout }}"></div>{% endif %}
+              {% if re   > 0 %}<div class="vbar-seg" data-ch="exp"      style="background:#047857;flex:{{ re }}"></div>{% endif %}
+            </div>
+          </div>
+          <div class="vbar-name">{{ r.account_executive }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ------- Distribuição da demanda ------- #}
+<div class="panel">
+  <h2>Distribuição da demanda</h2>
+  <div class="dchart" data-channels="acq rcv" data-chart="dist" data-keep-order="1" data-val-mode="pct">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" style="--c:#2563EB">
+        <span class="leg-dot" style="background:#2563EB"></span>Próprio do time
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="rcv" style="--c:#10B981;--ci:#047857">
+        <span class="leg-dot" style="background:#10B981"></span>Recebidas pelo time
+      </button>
+    </div>
+    {% set ae_dist = by_ae|sort(attribute='pct_auto', reverse=true)|list %}
+    {% set max_total_dist = (ae_dist|map(attribute='total_generated')|map('int')|max) or 1 %}
+    <div class="vbars" style="--count:{{ ae_dist|length }}">
+      {% for r in ae_dist %}
+        {% set total = r.total_generated|int %}
+        {% set auto  = r.auto_total|int %}
+        {% set rcv   = r.rcv_total|int %}
+        {% set h_pct = (total / max_total_dist * 100) if max_total_dist else 0 %}
+        <div class="vbar{% if total <= 0 %} is-empty{% endif %}"
+             data-acq="{{ auto }}" data-rcv="{{ rcv }}" data-name="{{ r.account_executive }}"
+             {% if total > 0 %}data-drill="{{ url_for('demand_deals', name=r.account_executive, grain='leader', date_from=range_from, date_to=range_to) }}"{% endif %}>
+          <div class="vbar-tip"></div>
+          <div class="vbar-track" style="--h:{{ h_pct }}%">
+            <div class="vbar-val">{{ "%.0f"|format(r.pct_auto) }}%</div>
+            <div class="vbar-col">
+              {% if auto > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ auto }}"></div>{% endif %}
+              {% if rcv  > 0 %}<div class="vbar-seg" data-ch="rcv" style="background:#10B981;flex:{{ rcv }}"></div>{% endif %}
+            </div>
+          </div>
+          <div class="vbar-name">{{ r.account_executive }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ------- Trend (semanal/mensal/trimestral) — período INDEPENDENTE do filtro ------- #}
+{% if trend %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Geração de Demanda Total</h2>
+    <div class="grain-switch">
+      <a href="{{ grain_urls.week }}"    class="grain-btn {% if grain=='week' %}active{% endif %}">Semanal</a>
+      <a href="{{ grain_urls.month }}"   class="grain-btn {% if grain=='month' %}active{% endif %}">Mensal</a>
+      <a href="{{ grain_urls.quarter }}" class="grain-btn {% if grain=='quarter' %}active{% endif %}">Trimestral</a>
+    </div>
+  </div>
+  <div class="dchart" data-channels="auto_acq auto_exp received_inbound received_outbound received_exp" data-chart="trend" data-keep-order="1">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="auto_acq" style="--c:#2563EB"><span class="leg-dot" style="background:#2563EB"></span>Próprio · Aquisição</button>
+      <button type="button" class="leg-toggle is-on" data-ch="auto_exp" style="--c:#1E3A8A"><span class="leg-dot" style="background:#1E3A8A"></span>Próprio · Expansão</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_inbound" style="--c:#10B981;--ci:#047857"><span class="leg-dot" style="background:#10B981"></span>Recebidas · Inbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_outbound" style="--c:#6366F1"><span class="leg-dot" style="background:#6366F1"></span>Recebidas · Outbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_exp" style="--c:#047857"><span class="leg-dot" style="background:#047857"></span>Recebidas · Expansão</button>
+    </div>
+    {% set t_max = trend|map(attribute='total')|max or 1 %}
+    <div class="tchart">
+      <div class="tchart-bars">
+        {% for t in trend %}
+          {% set total = t.total|int %}
+          {% set h_pct = (total / t_max * 100) if t_max else 0 %}
+          <div class="tchart-bar"
+               {% if total > 0 %}data-drill="{{ url_for('demand_deals', date_from=t.period_from, date_to=t.period_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" data-drill-title="Demanda · {{ t.label }}"{% endif %}
+               data-auto_acq="{{ t.auto_acq|int }}"
+               data-auto_exp="{{ t.auto_exp|int }}"
+               data-received_inbound="{{ t.received_inbound|int }}"
+               data-received_outbound="{{ t.received_outbound|int }}"
+               data-received_exp="{{ t.received_exp|int }}">
+            <div class="tchart-tip"></div>
+            <div class="tchart-track" style="--h:{{ h_pct }}%">
+              <div class="tchart-val">{{ total|intg }}</div>
+              <div class="tchart-col">
+                {% if t.auto_acq          > 0 %}<div class="tchart-seg" data-ch="auto_acq"          style="background:#2563EB;flex:{{ t.auto_acq|int }}"></div>{% endif %}
+                {% if t.auto_exp          > 0 %}<div class="tchart-seg" data-ch="auto_exp"          style="background:#1E3A8A;flex:{{ t.auto_exp|int }}"></div>{% endif %}
+                {% if t.received_inbound  > 0 %}<div class="tchart-seg" data-ch="received_inbound"  style="background:#10B981;flex:{{ t.received_inbound|int }}"></div>{% endif %}
+                {% if t.received_outbound > 0 %}<div class="tchart-seg" data-ch="received_outbound" style="background:#6366F1;flex:{{ t.received_outbound|int }}"></div>{% endif %}
+                {% if t.received_exp      > 0 %}<div class="tchart-seg" data-ch="received_exp"      style="background:#047857;flex:{{ t.received_exp|int }}"></div>{% endif %}
+              </div>
+            </div>
+            <div class="tchart-x">{{ t.label }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  const fmtInt = n => Number(n||0).toLocaleString('pt-BR').replace(/,/g,'.');
+
+  // Recompute vbars chart based on active channels (sums, sorts, hides zeros).
+  // Suporta meta global (data-goal-value) ou meta por barra (data-goal-mode=per-bar + data-goal por linha).
+  function refreshVbars(chart) {
+    const active = (chart.dataset.channels || '').split(' ').filter(Boolean);
+    const keepOrder = chart.dataset.keepOrder === '1';
+    const valMode   = chart.dataset.valMode || 'total';
+    const cont = chart.querySelector('.vbars');
+    const rows = Array.from(cont.children).filter(c => c.classList.contains('vbar'));
+    const barChannels = active.filter(c => c !== 'goal');
+    const labelFor = (ch) => {
+      const b = chart.querySelector(`.leg-toggle[data-ch="${ch}"]`);
+      return b ? b.textContent.trim() : ch;
+    };
+    rows.forEach(r => {
+      let total = 0;
+      barChannels.forEach(ch => total += parseInt(r.dataset[ch]||'0', 10));
+      r._total = total;
+    });
+    const dataMax = Math.max(1, ...rows.map(r => r._total));
+    // Modo de meta: per-bar (cada linha tem data-goal próprio) ou global (data-goal-value único)
+    const goalMode  = chart.dataset.goalMode || 'global';
+    const goalValue = parseInt(chart.dataset.goalValue || '0', 10);
+    const goalActive = active.includes('goal');
+    let max = dataMax;
+    if (goalActive) {
+      if (goalMode === 'per-bar') {
+        const maxRowGoal = Math.max(0, ...rows.map(r => parseInt(r.dataset.goal || '0', 10)));
+        max = Math.max(dataMax, maxRowGoal);
+      } else if (goalValue > 0) {
+        max = Math.max(dataMax, goalValue);
+      }
+    }
+    if (!keepOrder) rows.sort((a,b) => b._total - a._total);
+    const frag = document.createDocumentFragment();
+    let visible = 0;
+    rows.forEach(r => {
+      frag.appendChild(r);
+      const track = r.querySelector('.vbar-track');
+      track.style.setProperty('--h', (r._total / max * 100) + '%');
+      r.querySelectorAll('.vbar-seg').forEach(seg => {
+        const ch = seg.dataset.ch;
+        const v = parseInt(r.dataset[ch]||'0', 10);
+        if (barChannels.includes(ch) && v > 0) {
+          seg.style.display = '';
+          seg.style.flex = String(v);
+        } else {
+          seg.style.display = 'none';
+        }
+      });
+      if (valMode === 'pct') {
+        const a = parseInt(r.dataset.acq||'0', 10);
+        const b = parseInt(r.dataset.rcv||'0', 10);
+        const t = a + b;
+        const pct = t > 0 ? Math.round(a / t * 100) : 0;
+        r.querySelector('.vbar-val').textContent = pct + '%';
+      } else {
+        r.querySelector('.vbar-val').textContent = fmtInt(r._total);
+      }
+      if (r._total > 0) { r.classList.remove('is-empty'); visible++; }
+      else r.classList.add('is-empty');
+      // Per-bar goal mark: posição relativa ao max dinâmico
+      const mark = r.querySelector('.vbar-mark');
+      if (mark) {
+        const rowGoal = parseInt(r.dataset.goal || '0', 10);
+        if (goalActive && goalMode === 'per-bar' && rowGoal > 0) {
+          mark.style.display = '';
+          mark.style.setProperty('--gp', (rowGoal / max * 100) + '%');
+        } else {
+          mark.style.display = 'none';
+        }
+      }
+      const tip = r.querySelector('.vbar-tip');
+      const parts = [`<b>${r.dataset.name}</b>`];
+      barChannels.forEach(ch => {
+        const v = parseInt(r.dataset[ch]||'0', 10);
+        if (v > 0) parts.push(`${labelFor(ch)}: ${fmtInt(v)}`);
+      });
+      parts.push(`Total: <b>${fmtInt(r._total)}</b>`);
+      // Tooltip de meta por barra (se tiver)
+      if (goalMode === 'per-bar') {
+        const rowGoal = parseInt(r.dataset.goal || '0', 10);
+        const teamSize = parseInt(r.dataset.teamSize || '0', 10);
+        if (rowGoal > 0) {
+          const pace = r._total >= rowGoal ? '✓ acima' : `−${fmtInt(rowGoal - r._total)} pra meta`;
+          parts.push(`Meta time (${teamSize} AE): <b>${fmtInt(rowGoal)}</b> · ${pace}`);
+        }
+      }
+      tip.innerHTML = parts.join('<br>');
+    });
+    cont.appendChild(frag);
+    cont.style.setProperty('--count', Math.max(visible, 1));
+
+    // Linha de meta GLOBAL (modo legacy do AE)
+    const goalLine = chart.querySelector('.vbar-goal');
+    if (goalLine) {
+      if (goalActive && goalMode !== 'per-bar' && goalValue > 0) {
+        goalLine.style.display = '';
+        goalLine.style.setProperty('--gp', (goalValue / max * 100) + '%');
+      } else {
+        goalLine.style.display = 'none';
+      }
+    }
+  }
+
+  // Recompute tchart (trend) — keep order, just adjust heights/totals.
+  function refreshTchart(chart) {
+    const active = (chart.dataset.channels || '').split(' ').filter(Boolean);
+    const bars = Array.from(chart.querySelectorAll('.tchart-bar'));
+    bars.forEach(b => {
+      let total = 0;
+      active.forEach(ch => total += parseInt(b.dataset[ch]||'0', 10));
+      b._total = total;
+    });
+    const max = Math.max(1, ...bars.map(b => b._total));
+    bars.forEach(b => {
+      const track = b.querySelector('.tchart-track');
+      track.style.setProperty('--h', (b._total / max * 100) + '%');
+      b.querySelectorAll('.tchart-seg').forEach(seg => {
+        const ch = seg.dataset.ch;
+        const v = parseInt(b.dataset[ch]||'0', 10);
+        if (active.includes(ch) && v > 0) {
+          seg.style.display = '';
+          seg.style.flex = String(v);
+        } else {
+          seg.style.display = 'none';
+        }
+      });
+      b.querySelector('.tchart-val').textContent = fmtInt(b._total);
+      const tip = b.querySelector('.tchart-tip');
+      if (tip) {
+        const lines = [];
+        active.forEach(ch => {
+          const v = parseInt(b.dataset[ch]||'0', 10);
+          if (v > 0) {
+            const label = ch.replace('_', ' · ').replace('auto', 'Próprio').replace('received', 'Recebidas')
+                           .replace('acq', 'Aquisição').replace('exp', 'Expansão')
+                           .replace('inbound', 'Inbound').replace('outbound', 'Outbound');
+            lines.push(`${label}: ${fmtInt(v)}`);
+          }
+        });
+        lines.push(`Total: <b>${fmtInt(b._total)}</b>`);
+        tip.innerHTML = lines.join('<br>');
+      }
+    });
+  }
+
+  // Wire toggles + initial render.
+  document.querySelectorAll('.dchart').forEach(chart => {
+    const isVbars = !!chart.querySelector('.vbars');
+    const refresh = () => isVbars ? refreshVbars(chart) : refreshTchart(chart);
+    chart.querySelectorAll('.leg-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('is-on');
+        const active = Array.from(chart.querySelectorAll('.leg-toggle.is-on')).map(b => b.dataset.ch);
+        chart.dataset.channels = active.join(' ');
+        refresh();
+      });
+    });
+    refresh();
+  });
+
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>{% block title %}pepeuhacker{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_v('style.css') }}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><rect width=%2224%22 height=%2224%22 rx=%226%22 fill=%22%232563EB%22/><path d=%22M5 8h14v3h-5.5v8h-3v-8H5z%22 fill=%22white%22/></svg>">
+</head>
+<body>
+
+{# Header sticky: dashbar + subnav + filters acompanham o scroll. #}
+<div class="topbar-sticky">
+
+{# TIER 1 — qual dashboard (grande, colorido, prominente) #}
+<div class="dashbar dashbar-{{ ctx.view }}">
+  <div class="dashbar-inner">
+    <div class="brand">
+      <img class="brand-logo" src="{{ url_for('static', filename='tractian-logo.svg') }}?v={{ asset_v('tractian-logo.svg') }}" alt="Tractian" width="124" height="18">
+      <span class="brand-divider" aria-hidden="true"></span>
+      <span class="brand-tag">Sales Dashboard</span>
+    </div>
+    <div class="dash-switch">
+      <a href="{{ ctx.view_url_ae }}" class="dash-tab dash-ae {% if ctx.view == 'ae' %}active{% endif %}">
+        <div class="dash-name">Sales AE BR</div>
+      </a>
+      <a href="{{ ctx.view_url_leaders }}" class="dash-tab dash-leaders {% if ctx.view == 'leaders' %}active{% endif %}">
+        <div class="dash-name">Sales Leaders</div>
+      </a>
+      <a href="{{ ctx.view_url_sdr }}" class="dash-tab dash-sdr {% if ctx.view == 'sdr' %}active{% endif %}">
+        <div class="dash-name">Pré Sales BR</div>
+      </a>
+    </div>
+  </div>
+</div>
+
+{# TIER 2 — páginas dentro do dashboard #}
+<div class="subnav">
+  <div class="subnav-inner">
+    <nav>
+      {% if ctx.view == 'leaders' %}
+        <a href="{{ url_for('leaders_overview', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/leaders/overview') %}active{% endif %}">Overview</a>
+        <a href="{{ url_for('leaders_demand', **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/demand' %}active{% endif %}">Geração de Demanda</a>
+        <a href="{{ url_for('leaders_pipeline', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/leaders/pipeline') %}active{% endif %}">Pipeline</a>
+        <a href="{{ url_for('leaders_forecast', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/leaders/forecast') %}active{% endif %}">Forecast</a>
+      {% elif ctx.view == 'sdr' %}
+        <a href="{{ url_for('sdr_effort', **ctx.filters) }}" class="{% if ctx.current_path == '/sdr/effort' %}active{% endif %}">Esforço</a>
+        <span class="nav-coming">+ outras telas em breve</span>
+      {% else %}
+        <a href="{{ url_for('overview', **ctx.filters) }}"   class="{% if ctx.current_path.startswith('/overview') %}active{% endif %}">Overview</a>
+        <a href="{{ url_for('demand', **ctx.filters) }}"     class="{% if ctx.current_path == '/demand' %}active{% endif %}">Geração de Demanda</a>
+        <a href="{{ url_for('pipeline', **ctx.filters) }}"   class="{% if ctx.current_path.startswith('/pipeline') %}active{% endif %}">Pipeline</a>
+        <a href="{{ url_for('forecast', **ctx.filters) }}"   class="{% if ctx.current_path.startswith('/forecast') %}active{% endif %}">Forecast</a>
+      {% endif %}
+    </nav>
+  </div>
+</div>
+
+{# Sub-tabs da Overview — AE (Sales · AE) e Leaders (Sales · Leaders) #}
+{% if ctx.current_path and ctx.current_path.startswith('/overview') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('overview', **ctx.filters) }}"    class="{% if ctx.current_path == '/overview' %}active{% endif %}">Sales Overview</a>
+    <a href="{{ url_for('overview_ae', **ctx.filters) }}" class="{% if ctx.current_path == '/overview/ae' %}active{% endif %}">AE Overview</a>
+    <a href="{{ url_for('overview_overtime', **ctx.filters) }}" class="{% if ctx.current_path == '/overview/overtime' %}active{% endif %}">Sales Overtime</a>
+  </div>
+</div>
+{% elif ctx.current_path and ctx.current_path.startswith('/leaders/overview') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('leaders_overview', **ctx.filters) }}"      class="{% if ctx.current_path == '/leaders/overview' %}active{% endif %}">Sales Overview</a>
+    <a href="{{ url_for('leaders_overview_team', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/overview/team' %}active{% endif %}">Leaders Overview</a>
+    <a href="{{ url_for('leaders_overview_overtime', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/overview/overtime' %}active{% endif %}">Sales Overtime</a>
+  </div>
+</div>
+{% endif %}
+
+{# Sub-tabs do Pipeline (Cobertura · WoW Early · WoW Late · Inatividade · Funil) #}
+{% if ctx.current_path and ctx.current_path.startswith('/pipeline') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('pipeline', **ctx.filters) }}"             class="{% if ctx.current_path == '/pipeline' %}active{% endif %}">Cobertura</a>
+    <a href="{{ url_for('pipeline_total', **ctx.filters) }}"       class="{% if ctx.current_path == '/pipeline/total' %}active{% endif %}">Pipeline Total</a>
+    <a href="{{ url_for('pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
+    <a href="{{ url_for('pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
+    <a href="{{ url_for('pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled'   %}active{% endif %}">Stale</a>
+    <a href="{{ url_for('pipeline_activity',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled-activity'   %}active{% endif %}">Inatividade</a>
+    <a href="{{ url_for('pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel'    %}active{% endif %}">Funil</a>
+    <a href="{{ url_for('pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/visits'    %}active{% endif %}">Visitas</a>
+  </div>
+</div>
+{% elif ctx.current_path and ctx.current_path.startswith('/leaders/pipeline') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('leaders_pipeline', **ctx.filters) }}"             class="{% if ctx.current_path == '/leaders/pipeline' %}active{% endif %}">Cobertura</a>
+    <a href="{{ url_for('leaders_pipeline_total', **ctx.filters) }}"       class="{% if ctx.current_path == '/leaders/pipeline/total' %}active{% endif %}">Pipeline Total</a>
+    <a href="{{ url_for('leaders_pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
+    <a href="{{ url_for('leaders_pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
+    <a href="{{ url_for('leaders_pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/stalled'   %}active{% endif %}">Stale</a>
+    <a href="{{ url_for('leaders_pipeline_activity',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/stalled-activity'   %}active{% endif %}">Inatividade</a>
+    <a href="{{ url_for('leaders_pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel'    %}active{% endif %}">Funil</a>
+    <a href="{{ url_for('leaders_pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('leaders_pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/visits'    %}active{% endif %}">Visitas</a>
+  </div>
+</div>
+{% endif %}
+
+{# Sub-tabs do Forecast (Forecast · Modelo Analytics) — AE e Leaders #}
+{% if ctx.current_path and ctx.current_path.startswith('/forecast') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('forecast', **ctx.filters) }}"       class="{% if ctx.current_path == '/forecast' %}active{% endif %}">Forecast</a>
+    <a href="{{ url_for('forecast_model', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/model' %}active{% endif %}">Modelo Analytics</a>
+  </div>
+</div>
+{% elif ctx.current_path and ctx.current_path.startswith('/leaders/forecast') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('leaders_forecast', **ctx.filters) }}"       class="{% if ctx.current_path == '/leaders/forecast' %}active{% endif %}">Forecast</a>
+    <a href="{{ url_for('leaders_forecast_model', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/forecast/model' %}active{% endif %}">Modelo Analytics</a>
+  </div>
+</div>
+{% endif %}
+
+<div class="filters">
+  <div class="filters-inner">
+
+    <form method="get" id="filter-form">
+      <input type="hidden" name="preset" id="preset-input" value="{{ ctx.active_preset or '' }}">
+      <input type="hidden" name="date_from" id="date-from" value="{{ ctx.filters.date_from }}">
+      <input type="hidden" name="date_to"   id="date-to"   value="{{ ctx.filters.date_to }}">
+      <input type="hidden" name="money" value="{{ ctx.filters.money }}">
+      {# Carrega adiante os parâmetros que pertencem aos GRÁFICOS (janela de
+         trimestres, pares de conversão, etc.). Sem isso, mexer em Líder/AE
+         zeraria o recorte do gráfico — some agora que tudo auto-aplica. #}
+      {% set _own = ['preset','date_from','date_to','money','q_from','q_to',
+                     'leader','ae','region','role','refresh',
+                     'dtype','source','fcat'] %}
+      {% for k, v in request.args.items() %}
+        {% if k not in _own %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}
+      {% endfor %}
+
+      {# --- Período: NENHUM nas telas de janela fixa (PoP Early/Late). A janela é
+             sempre domingo vs domingo anterior, e as datas já aparecem no
+             subtítulo da página — um date-picker aqui só permitiria montar pares
+             não-consecutivos e quebrar a comparação Early↔Late. --- #}
+      {% if ctx.period_locked %}
+      {# --- Período: TRIMESTRAL nas abas que pedem série (Sales Overtime) --- #}
+      {% elif ctx.period_mode == 'quarter' %}
+      <div class="f-group">
+        <label>Período · trimestres</label>
+        <div class="daterange">
+          <button type="button" class="dr-trigger" id="dr-trigger" aria-haspopup="true" aria-expanded="false">
+            <svg class="dr-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+            <span class="dr-text">{{ ctx.q_label }}</span>
+            <span class="dr-arrow">▾</span>
+          </button>
+          <div class="dr-panel" id="dr-panel" hidden>
+            <ul class="dr-presets">
+              {% for val, lbl in ctx.q_presets %}
+                <li>
+                  <a class="dr-preset {% if ctx.q_sel == val and not (ctx.q_from or ctx.q_to) %}active{% endif %}"
+                     href="{{ ctx.q_urls[val] }}">
+                    <span class="dr-preset-label">{{ lbl }}</span>
+                  </a>
+                </li>
+              {% endfor %}
+            </ul>
+            <div class="dr-custom">
+              <span class="dr-custom-title">De trimestre a trimestre</span>
+              <div class="dr-custom-inputs">
+                <select name="q_from">
+                  <option value="">início</option>
+                  {% for o in ctx.q_opts %}<option value="{{ o.key }}" {% if ctx.q_from == o.key %}selected{% endif %}>{{ o.label }}</option>{% endfor %}
+                </select>
+                <span class="dr-arrow-r">→</span>
+                <select name="q_to">
+                  <option value="">hoje</option>
+                  {% for o in ctx.q_opts %}<option value="{{ o.key }}" {% if ctx.q_to == o.key %}selected{% endif %}>{{ o.label }}</option>{% endfor %}
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {% else %}
+      {# --- Date-range picker unificado --- #}
+      <div class="f-group">
+        <label>{{ ctx.period_label or 'Período' }}</label>
+        <div class="daterange">
+          <button type="button" class="dr-trigger" id="dr-trigger" aria-haspopup="true" aria-expanded="false">
+            <svg class="dr-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+            <span class="dr-text">
+              {% set _active = ctx.presets|selectattr('key','equalto', ctx.active_preset)|first %}
+              {% if _active %}{{ _active.label }}
+              {% elif ctx.filters.date_from or ctx.filters.date_to %}Personalizado
+              {% else %}Selecione um período{% endif %}
+            </span>
+            <span class="dr-arrow">▾</span>
+          </button>
+          <div class="dr-panel" id="dr-panel" hidden>
+            <ul class="dr-presets">
+              {% for p in ctx.presets %}
+                <li>
+                  <button type="button" class="dr-preset {% if ctx.active_preset == p.key %}active{% endif %}"
+                          data-from="{{ p.from }}" data-to="{{ p.to }}" data-preset="{{ p.key }}">
+                    <span class="dr-preset-label">{{ p.label }}</span>
+                    <span class="dr-preset-range">{{ p.from }} → {{ p.to }}</span>
+                  </button>
+                </li>
+              {% endfor %}
+            </ul>
+            <div class="dr-custom">
+              <span class="dr-custom-title">Personalizado</span>
+              <div class="dr-custom-inputs">
+                <input type="date" id="dr-from" value="{{ ctx.filters.date_from }}">
+                <span class="dr-arrow-r">→</span>
+                <input type="date" id="dr-to"   value="{{ ctx.filters.date_to }}">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="f-group">
+        <label>Líder</label>
+        <select name="leader">
+          <option value="">todos</option>
+          {% for l in ctx.options.leaders %}
+            <option value="{{ l }}" {% if ctx.filters.leader == l %}selected{% endif %}>{{ ctx.options.leader_labels[l] if ctx.options.leader_labels else l }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="f-group">
+        <label>AE</label>
+        <select name="ae">
+          <option value="">todos</option>
+          {% for a in ctx.options.aes %}
+            <option value="{{ a }}" {% if ctx.filters.ae == a %}selected{% endif %}>{{ a }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {# Filtros extra da aba (hoje: Deal Type · Source · Forecast Category do
+         Pipeline Total). Vazio nas outras abas. #}
+      {% for ef in ctx.extra_filters %}
+      <div class="f-group">
+        <label>{{ ef.label }}</label>
+        <select name="{{ ef.key }}">
+          <option value="">todos</option>
+          {% for v in ef.opts %}
+            <option value="{{ v.key }}" {% if ctx.filters[ef.key] == v.key %}selected{% endif %}>{{ v.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endfor %}
+      <a href="{{ ctx.current_path }}" class="f-btn secondary">Limpar</a>
+      <a href="{{ ctx.current_path }}?{{ ctx.querystring }}{% if ctx.querystring %}&{% endif %}refresh=1" class="f-btn refresh" title="Re-query BigQuery agora">↻ Refresh BQ</a>
+      <span class="money-toggle" title="Moeda de exibição — vale em todas as abas">
+        <a href="{{ ctx.money_url_mrr }}" class="money-opt {% if ctx.money_mode != 'arr' %}is-on{% endif %}">MRR R$</a>
+        <a href="{{ ctx.money_url_arr }}" class="money-opt {% if ctx.money_mode == 'arr' %}is-on{% endif %}">ARR US$</a>
+      </span>
+    </form>
+
+    {% if ctx.active_chips %}
+    <div class="active-chips">
+      <span class="presets-label">Ativos:</span>
+      {% for chip in ctx.active_chips %}
+        <span class="active-chip">
+          {{ chip.label }}
+          <a href="{{ chip.remove_url }}" class="x" title="remover">×</a>
+        </span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+  </div>
+</div>
+
+</div>{# /topbar-sticky #}
+
+<script>
+  // Config do filtro mestre de moeda — lido pelos formatadores JS (modais/barras).
+  window.__MONEY__ = {mode: "{{ ctx.money_mode }}", rate: {{ ctx.usd_rate }}, months: {{ ctx.months_per_year }}};
+  // Formata um valor MRR-BRL na moeda ativa (R$ MRR ou US$ ARR). Uso: fmtMoneyMode(v).
+  window.fmtMoneyMode = function(v, opts){
+    v = Number(v) || 0;
+    opts = opts || {};
+    const arr = window.__MONEY__.mode === "arr";
+    const val = arr ? v * window.__MONEY__.months / window.__MONEY__.rate : v;
+    const sym = arr ? "US$ " : "R$ ";
+    if (opts.signed) return (val >= 0 ? "+" : "−") + sym + Math.abs(Math.round(val)).toLocaleString("pt-BR").replace(/,/g,".");
+    if (opts.zeroDash && !(v > 0)) return "—";
+    return sym + Math.round(val).toLocaleString("pt-BR").replace(/,/g,".");
+  };
+  // Versão COMPACTA (R$ 5,03M / R$ 689k) — espelha o filtro `brl` do servidor
+  // (fmt_brl no app.py). Existe porque todo chart que recalcula no cliente tem
+  // que reescrever rótulos no MESMO formato que o Jinja escreveu no 1º render;
+  // sem isso a barra pula de "R$ 5,03M" pra "R$ 5.032.114" ao mexer na legenda.
+  // Global de propósito: já havia uma cópia local no forecast.html e a segunda
+  // cópia seria o começo da divergência.
+  window.fmtBRLCompact = function(v){
+    v = Number(v) || 0;
+    const M = window.__MONEY__ || {mode:'mrr', rate:5.05, months:12};
+    const arr = M.mode === 'arr';
+    const val = arr ? v * M.months / M.rate : v;
+    const sym = arr ? 'US$ ' : 'R$ ';
+    const a = Math.abs(val);
+    if (a >= 1e6) return sym + (val/1e6).toFixed(2).replace('.', ',') + 'M';
+    if (a >= 1e3) return sym + Math.round(val/1e3) + 'k';
+    return sym + Math.round(val);
+  };
+</script>
+<style>
+  .money-toggle{display:inline-flex;border:1px solid var(--border,#d7dde5);border-radius:8px;overflow:hidden;margin-left:8px}
+  .money-toggle .money-opt{padding:7px 12px;font-size:12.5px;font-weight:600;color:var(--muted,#64748b);
+    text-decoration:none;background:var(--surface,#fff);white-space:nowrap}
+  .money-toggle .money-opt.is-on{background:var(--blue,#2563EB);color:#fff}
+  .money-toggle .money-opt+.money-opt{border-left:1px solid var(--border,#d7dde5)}
+</style>
+
+<div class="wrap">
+  {% if ctx.period_text %}
+  <div class="period-badge" style="margin-bottom:18px">{{ ctx.period_text }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</div>
+
+<script>
+(function(){
+  // ---- Scroll restore ----
+  // Mantém a posição vertical ao trocar filtro/preset/grain (mesmo path).
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  const SCROLL_KEY = 'pepeuhacker:scrollY:' + location.pathname;
+
+  // Salva scrollY antes de qualquer navegação same-path (form submit ou link interno)
+  const saveScroll = () => sessionStorage.setItem(SCROLL_KEY, window.scrollY);
+  document.addEventListener('submit', saveScroll, true);
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a[href]');
+    if (!a) return;
+    try {
+      const u = new URL(a.href, location.origin);
+      if (u.pathname === location.pathname) saveScroll();
+    } catch (_) {}
+  }, true);
+
+  // Restaura ao carregar
+  window.addEventListener('load', () => {
+    const y = sessionStorage.getItem(SCROLL_KEY);
+    if (y !== null) {
+      window.scrollTo(0, parseInt(y, 10) || 0);
+      sessionStorage.removeItem(SCROLL_KEY);
+    }
+  });
+
+  // ---- Date-range picker (filtro unificado de período)
+  const drTrigger = document.getElementById('dr-trigger');
+  const drPanel   = document.getElementById('dr-panel');
+  const dateFrom  = document.getElementById('date-from');
+  const dateTo    = document.getElementById('date-to');
+  const presetIn  = document.getElementById('preset-input');
+  const drFrom    = document.getElementById('dr-from');
+  const drTo      = document.getElementById('dr-to');
+
+  // As telas de janela fixa (PoP Early/Late) NÃO renderizam o date-picker, então
+  // aqui drTrigger/drPanel vêm null. Sem este guard o addEventListener estoura
+  // TypeError e mata todo o resto DESTE bloco — inclusive o auto-aplicar dos
+  // filtros de Líder/AE logo abaixo, que pararia de submeter no change.
+  if (drTrigger && drPanel) {
+    const closeDr = () => {
+      drPanel.hidden = true;
+      drTrigger.setAttribute('aria-expanded', 'false');
+    };
+    const openDr = () => {
+      drPanel.hidden = false;
+      drTrigger.setAttribute('aria-expanded', 'true');
+    };
+    drTrigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      drPanel.hidden ? openDr() : closeDr();
+    });
+    document.addEventListener('click', (e) => {
+      if (!drPanel.hidden && !drPanel.contains(e.target) && e.target !== drTrigger) closeDr();
+    });
+  }
+
+  // Preset click → set hidden date inputs + submete form (mantém scroll).
+  // No modo TRIMESTRE os presets são links (<a href>) — deixa navegar normal.
+  document.querySelectorAll('.dr-preset').forEach(btn => {
+    if (btn.tagName === 'A') return;
+    btn.addEventListener('click', () => {
+      dateFrom.value = btn.dataset.from;
+      dateTo.value   = btn.dataset.to;
+      presetIn.value = btn.dataset.preset;
+      document.getElementById('filter-form').submit();
+    });
+  });
+
+  // ---- AUTO-APLICAR: sem botão "Aplicar" em lugar nenhum ----
+  // Qualquer mudança num filtro já recarrega com o novo recorte.
+  const form = document.getElementById('filter-form');
+  if (form) {
+    form.querySelectorAll('select').forEach(sel => {
+      sel.addEventListener('change', () => form.submit());
+    });
+    // Range de datas personalizado: aplica assim que as duas pontas existirem.
+    const applyRange = () => {
+      if (!drFrom || !drTo || !drFrom.value || !drTo.value) return;
+      dateFrom.value = drFrom.value;
+      dateTo.value   = drTo.value;
+      presetIn.value = '';
+      form.submit();
+    };
+    if (drFrom) drFrom.addEventListener('change', applyRange);
+    if (drTo)   drTo.addEventListener('change', applyRange);
+  }
+  // Formulários de filtro próprios de um gráfico (ex.: conversão de funil).
+  document.querySelectorAll('form.auto-apply').forEach(f => {
+    f.querySelectorAll('select, input[type="date"]').forEach(el => {
+      el.addEventListener('change', () => f.submit());
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
