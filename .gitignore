@@ -1,0 +1,14 @@
+# Cache de parquet: 5 MB e crescendo, regenerado sozinho pelo BigQuery.
+cache/
+*.parquet
+
+# Zips de fonte baixados do Cloud Run em recuperações.
+*.zip
+
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# Token do HubSpot mora em ~/.config/hubspot/env, NUNCA no repo.
+.env
