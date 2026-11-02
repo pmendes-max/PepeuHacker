@@ -265,20 +265,34 @@ Q3_TEAM_REVENUE_META = Q3_TEAM_REVENUE_META_ARR_USD * USD_BRL_RATE / MONTHS_PER_
 
 
 def apply_q3_roster_curated(df: pd.DataFrame) -> pd.DataFrame:
-    """Nas linhas do quarter Q3, sobrescreve leader e quota_in_brl pelo Q3_ROSTER.
-    Quarter-scoped → preserva o histórico dos quarters anteriores. Requer coluna
-    `quarter` (date)."""
+    """Sobrescreve TIME (leader/region) e QUOTA pelo Q3_ROSTER, com escopos
+    diferentes de propósito:
+
+      • TIME  → quarters >= Q3_START. O roster é o time VIGENTE até a liderança
+        mandar um novo: ele não "expira" no fim do Q3. Antes era só Q3, e na virada
+        pro Q4 o líder voltava a ser o `leader` CRU do BQ — que para o player-coach
+        Arthur Tkotz é o gestor dele (Fernando). Resultado: a venda do Arthur no Q4
+        (Crown Embalagens, PO 26/10/2026) caía no Fernando e sumia do pod do
+        Arthur (filtro de líder, barra na visão de líderes, drill). Mesmo bug pro
+        Daniel Del Paschoa, cujo leader cru ainda é o Bernardo (ver Q3_ROSTER).
+      • QUOTA → só Q3. A quota declarada é a do Q3; Q4+ segue a da curated.
+
+    Quarters ANTERIORES ao Q3 não são tocados → histórico preservado. Requer
+    coluna `quarter` (date)."""
     if df is None or len(df) == 0 or "quarter" not in df.columns or not Q3_ROSTER:
         return df
     is_q3 = df["quarter"] == Q3_START
+    from_q3 = df["quarter"] >= Q3_START
     for ae, v in Q3_ROSTER.items():
-        m = is_q3 & (df["account_executive"] == ae)
+        is_ae = df["account_executive"] == ae
+        m = from_q3 & is_ae
         if m.any():
             df.loc[m, "leader"] = v["leader"]
             if "region" in df.columns:
                 df.loc[m, "region"] = Q3_ROSTER_REGION
-            if "quota_in_brl" in df.columns:
-                df.loc[m, "quota_in_brl"] = v["quota"]
+        mq = is_q3 & is_ae
+        if mq.any() and "quota_in_brl" in df.columns:
+            df.loc[mq, "quota_in_brl"] = v["quota"]
     return df
 
 
@@ -469,8 +483,9 @@ def _period_leader_map(force: bool = False) -> dict:
 
 def _attr_deal_leader(frame: pd.DataFrame, date_col: str, lmap: dict) -> list:
     """Líder de cada deal = líder do curated no quarter da data do deal (date_col).
-    Fallback: gestor→ele mesmo; senão roster Q3; senão o leader atual do frame.
-    Corrige atribuição histórica (Q2 fica no líder de Q2, Q3 no do roster)."""
+    Fallback: gestor→ele mesmo; senão roster (Q3 em diante — time vigente); senão
+    o leader atual do frame. Corrige atribuição histórica (Q2 fica no líder de Q2,
+    Q3+ no do roster)."""
     if not len(frame):
         return []
     out = []
@@ -480,8 +495,8 @@ def _attr_deal_leader(frame: pd.DataFrame, date_col: str, lmap: dict) -> list:
         if ld is None:
             if ae in NON_AE_USERS:
                 ld = ae                                   # venda direta do gestor
-            elif q == Q3_START and ae in Q3_ROSTER:
-                ld = Q3_ROSTER[ae]["leader"]              # AE novo do roster sem linha curated
+            elif q is not None and q >= Q3_START and ae in Q3_ROSTER:
+                ld = Q3_ROSTER[ae]["leader"]              # AE do roster sem linha curated no quarter
             else:
                 ld = cur                                  # fallback: leader do snapshot
         out.append(ld)
@@ -1558,7 +1573,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
     # Chave versionada: o mtime do parquet só detecta dado novo, não CÓDIGO novo —
     # o sufixo garante que nenhum frame montado por uma versão anterior da curada
     # (sem a linha sintética do roster) sobreviva a um reload a quente.
-    key = ("ae_perf_clean_v2", _parquet_mtime("ae_performance"))
+    key = ("ae_perf_clean_v3", _parquet_mtime("ae_performance"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1571,7 +1586,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
     # com o Q3_ROSTER, e a fusão evita a quota sair dobrada.
     df = merge_ae_quarter_dups(canon_ae_names(df))
     df = apply_leader_overrides(df)
-    df = apply_q3_roster_curated(df)        # time/quota Q3 autoritativos (só linhas Q3)
+    df = apply_q3_roster_curated(df)        # time do roster em Q3+ ; quota só no Q3
     # Depois do overwrite (a linha sintética já nasce com leader/region/quota do
     # roster, então passar por ele seria no-op) e ANTES dos três gates: a linha
     # sintética tem de enfrentar o MESMO gauntlet de visibilidade de uma real —
@@ -1619,7 +1634,7 @@ def _get_quota_history(force: bool = False) -> pd.DataFrame:
     `leader` é anexado só pra permitir o filtro opcional por líder; fica None pra
     quem não está na curated (não afeta o total)."""
     raw = bq.quota_history(force_refresh=force)
-    key = ("quota_history_v2", _parquet_mtime("quota_history_v2"))
+    key = ("quota_history_v3", _parquet_mtime("quota_history_v2"))  # v3: leader do roster vale Q3+
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1784,7 +1799,7 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     e on-hold dos AEs E das vendas diretas dos gestores. new_mrr do gestor é a
     venda direta dele (independe do time), então não duplica."""
     df_raw = bq.ae_performance(force_refresh=force)
-    key = ("ae_perf_mgrs_v2", _parquet_mtime("ae_performance"))  # ver nota da chave em _get_clean_ae_perf
+    key = ("ae_perf_mgrs_v3", _parquet_mtime("ae_performance"))  # ver nota da chave em _get_clean_ae_perf
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1797,7 +1812,7 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     # com o Q3_ROSTER, e a fusão evita a quota sair dobrada.
     df = merge_ae_quarter_dups(canon_ae_names(df))
     df = apply_leader_overrides(df)
-    df = apply_q3_roster_curated(df)        # time/quota Q3 autoritativos (só linhas Q3)
+    df = apply_q3_roster_curated(df)        # time do roster em Q3+ ; quota só no Q3
     # Mesma posição do outro loader, pelo mesmo motivo. Aqui o único gate é o
     # drop_departed_from (este loader não aplica ALLOWED_LEADERS/HIDDEN de
     # propósito, pra somar a venda direta dos gestores) — e a reatribuição de gestor
@@ -3617,11 +3632,18 @@ def _overview_page(ov_tab, grain="ae"):
     kpis["hold"] = float(sum(r["hold"] for r in by_ae))     # em aprovação financeira (MRR)
     kpis["attainment"] = (carrier_realized / meta_receita) if meta_receita else None
     kpis["gap"] = max(meta_receita - carrier_realized, 0.0)
-    # New logos (meta vs realizado) — só quando há meta (período Q3). Numerador
-    # restrito aos AEs com meta de new logos (mesma população da meta 87).
+    # New logos (meta vs realizado). No Q3 (há meta) o numerador é restrito aos AEs
+    # com meta de new logos (mesma população da meta 87). Fora do Q3 NÃO existe
+    # meta, logo não existe "carrier" pra recortar: o realizado é toda aquisição
+    # validada no escopo — antes o recorte por carrier zerava o card no Q4 mesmo
+    # com new logo ganho (ex.: Crown Embalagens, Arthur Tkotz, PO 26/10/2026).
+    # Mesma régua do drill (`_newlogo_goal_aes` devolve None fora do Q3).
     kpis["has_newlogos"] = period_is_q3 and bool(newlogos_goal)
     kpis["nl_goal"] = int(sum(v for v in newlogos_goal.values()))
-    kpis["nl_real"] = int(sum(r["nl_real"] for r in by_ae if r["nl_goal"] is not None))
+    if period_is_q3:
+        kpis["nl_real"] = int(sum(r["nl_real"] for r in by_ae if r["nl_goal"] is not None))
+    else:
+        kpis["nl_real"] = int(newlogos_actual.sum()) if len(newlogos_actual) else 0
     kpis["nl_att"] = (kpis["nl_real"] / kpis["nl_goal"]) if kpis["nl_goal"] else None
     # % da meta de receita no nível do time (receita total realizada ÷ meta distribuída).
     kpis["rev_att"] = (kpis["realized"] / meta_receita) if meta_receita else None
@@ -4290,12 +4312,13 @@ def forecast_deals():
 
 
 def _newlogo_goal_aes(from_d, to_d, region=None, leader=None, ae=None):
-    """AEs que CARREGAM meta de new logo no período (Q3_ROSTER). Fora do Q3 não
-    existe meta → conjunto vazio. Espelha `newlogos_goal` de _overview_page: o KPI
-    'Realizado de new logo' só soma esses AEs, então o drill-down precisa do mesmo
-    recorte pra a contagem bater com o card."""
+    """AEs que CARREGAM meta de new logo no período (Q3_ROSTER). Espelha
+    `newlogos_goal` de _overview_page: no Q3 o KPI 'Realizado de new logo' só soma
+    esses AEs, então o drill-down precisa do mesmo recorte pra a contagem bater com
+    o card. Fora do Q3 não existe meta → devolve None = SEM recorte (o card conta
+    toda aquisição validada do escopo). Devolver set() ali zerava o drill."""
     if not (from_d >= Q3_START and to_d <= Q3_END):
-        return set()
+        return None
     scope = expand_leader(leader) if leader else None
     out = set()
     for nm, v in Q3_ROSTER.items():
@@ -4414,7 +4437,8 @@ def overview_deals():
                                          region=request.args.get("region"),
                                          leader=request.args.get("leader"),
                                          ae=(name if grain == "ae" else None))
-            sel = sel[sel["account_executive"].isin(carriers)]
+            if carriers is not None:                # None = período sem meta (fora do Q3)
+                sel = sel[sel["account_executive"].isin(carriers)]
         rows = _mk(sel, "Validado")
         rows.sort(key=lambda x: x["data"], reverse=True)
         amount = float(sum(x["amount"] for x in rows))

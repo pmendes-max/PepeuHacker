@@ -114,6 +114,10 @@
   <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir os deals realizados (validado + hold)">
     <div class="kpi-l">Realizado de receita</div>
     <div class="kpi-v">{{ kpis.realized|brl }}</div>
+    {# Won em aprovação financeira (hold) NÃO entra no realizado — mas não pode
+       sumir da tela: sem esta linha, uma venda recém-fechada ficava invisível no
+       card e só aparecia no drill com o selo "em aprovação". #}
+    {% if kpis.hold %}<div class="kpi-s">+ {{ kpis.hold|brl }} em aprovação financeira</div>{% endif %}
   </div>
   <div class="kpi {% if kpis.rev_att and kpis.rev_att >= 1 %}grn{% else %}warn{% endif %}">
     <div class="kpi-l">% realizado de receita</div>
