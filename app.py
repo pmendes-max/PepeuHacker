@@ -4361,6 +4361,11 @@ def overview_deals():
     _region = request.args.get("region")
     if _region:
         dd = dd[dd["region"] == _region]
+    # Filtro global de AE da página (os cards de KPI mandam `ae`): sem ele o drill
+    # do card abria o time inteiro enquanto o card mostrava só o AE selecionado.
+    _ae = (request.args.get("ae") or "").strip()
+    if _ae:
+        dd = dd[dd["account_executive"] == _ae]
     in_win = dd["po_emission_date"].notna() & (dd["po_emission_date"] >= lo) & (dd["po_emission_date"] <= hi)
     if scope_all:
         won = dd[dd["is_won"] & in_win].copy()
@@ -4436,7 +4441,7 @@ def overview_deals():
             carriers = _newlogo_goal_aes(lo.date(), hi.date(),
                                          region=request.args.get("region"),
                                          leader=request.args.get("leader"),
-                                         ae=(name if grain == "ae" else None))
+                                         ae=((name if grain == "ae" else None) or _ae or None))
             if carriers is not None:                # None = período sem meta (fora do Q3)
                 sel = sel[sel["account_executive"].isin(carriers)]
         rows = _mk(sel, "Validado")

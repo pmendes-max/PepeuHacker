@@ -111,7 +111,7 @@
     <div class="kpi-l">Meta de receita</div>
     <div class="kpi-v">{{ kpis.quota|brl if kpis.quota else '—' }}</div>
   </div>
-  <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir os deals realizados (validado + hold)">
+  <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) }}" title="Explodir os deals realizados (validado + hold)">
     <div class="kpi-l">Realizado de receita</div>
     <div class="kpi-v">{{ kpis.realized|brl }}</div>
     {# Won em aprovação financeira (hold) NÃO entra no realizado — mas não pode
@@ -134,7 +134,7 @@
     <div class="kpi-l">Meta de new logo</div>
     <div class="kpi-v">{{ kpis.nl_goal if kpis.has_newlogos else '—' }}</div>
   </div>
-  {% set _nl_drill = url_for('overview_deals', kind='newlogo', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  {% set _nl_drill = url_for('overview_deals', kind='newlogo', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
   <div class="kpi grn" data-drill="{{ _nl_drill }}" title="Ver quais são as new logos">
     <div class="kpi-l">Realizado de new logo</div>
     <div class="kpi-v">{{ kpis.nl_real }}</div>
@@ -147,8 +147,8 @@
 
 {# ===== Aquisição × Expansão — valor total (macro) · deals · ticket médio ===== #}
 <div class="kpis-4" style="margin-top:16px">
-  {% set _acq_drill = url_for('overview_deals', kind='acq', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
-  {% set _exp_drill = url_for('overview_deals', kind='exp', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  {% set _acq_drill = url_for('overview_deals', kind='acq', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
+  {% set _exp_drill = url_for('overview_deals', kind='exp', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
   <div class="kpi acc" data-drill="{{ _acq_drill }}" title="Ver os deals de aquisição">
     <div class="kpi-l"><span class="leg-dot" style="background:#2563EB;display:inline-block;vertical-align:middle;margin-right:6px"></span>Total em aquisição</div>
     <div class="kpi-v">{{ acq.mrr|brl }}</div>
