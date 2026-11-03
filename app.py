@@ -3396,6 +3396,17 @@ def _overview_page(ov_tab, grain="ae"):
     hold_by_ae = (hld.groupby("account_executive")["amount"].sum().to_dict()
                   if len(hld) else {})
 
+    # REGRA DE REALIZADO (decisão do VP de Vendas, 03/nov/2026): venda fechada com
+    # PO emitido CONTA no realizado mesmo em aprovação financeira (hold). Antes o
+    # hold ficava fora e sumia da tela — foi o caso da Crown Embalagens (Arthur,
+    # R$ 80k, closedwon 29/10/2026). `val` guarda só o validado (selo "validado" no
+    # drill); `won` passa a ser validado + hold e alimenta TODO número de realizado
+    # (cards, barras, atingimento, new logo, ticket, ciclo). `hold_by_ae` /
+    # kpis.hold viram a parcela "dos quais em aprovação" — informativa, não somada
+    # de novo.
+    val = won
+    won = pd.concat([val, hld], ignore_index=True) if len(hld) else val.copy()
+
     # Ciclo de vendas (dias) = validação − criação, só nos won com created_date.
     won["cycle_days"] = (won["valid_date"] - won["created_date"]).dt.days
     cyc = won.loc[won["cycle_days"].notna() & (won["cycle_days"] >= 0), "cycle_days"]
@@ -3528,9 +3539,9 @@ def _overview_page(ov_tab, grain="ae"):
             "leader": leader,
             "region": region,
             "is_manager": ae in NON_AE_USERS,
-            "realized": realized,                       # Won validado (PO Won)
-            "hold": hold,                               # Won em aprovação financeira
-            "won_total": realized + hold,               # ranking = validado + hold
+            "realized": realized,                       # Won c/ PO (validado + hold)
+            "hold": hold,                               # dos quais em aprovação financeira
+            "won_total": realized,                      # = realized (hold já incluso)
             "deals": int(len(w)),
             "ticket": (realized / len(w)) if len(w) else 0.0,
             "cycle": float(c.mean()) if len(c) else None,
@@ -3703,7 +3714,7 @@ def _overview_page(ov_tab, grain="ae"):
                              if pd.notna(r["po_emission_date"]) else "—"),
                 })
             return out
-        deal_rows = _mk_deals(won, "validado") + _mk_deals(hld, "aprovação")
+        deal_rows = _mk_deals(val, "validado") + _mk_deals(hld, "aprovação")
         deal_rows.sort(key=lambda x: x["mrr"], reverse=True)
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
@@ -4405,7 +4416,9 @@ def overview_deals():
     if kind == "ticket":
         _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
         rows = []
-        for _, r in won.iterrows():
+        # Hold conta como venda (regra de realizado, ver _overview_page).
+        _tk_base = pd.concat([won, hld], ignore_index=True) if len(hld) else won
+        for _, r in _tk_base.iterrows():
             rows.append({
                 "deal_name": r.get("deal_name") or "—",
                 "deal_url": _hs_deal_url(r.get("deal_id")),
@@ -4432,19 +4445,22 @@ def overview_deals():
             "rows": rows,
         })
 
-    # Recorte do card clicado. acq/exp/newlogo saem SÓ do `won` (validado, sem
-    # hold) — mesma base de _stats()/newlogos_actual, pra bater com os cards.
+    # Recorte do card clicado. acq/exp/newlogo saem do validado + hold (hold conta
+    # como venda — regra de realizado em _overview_page), mesma base de
+    # _stats()/newlogos_actual, pra bater com os cards. O status diz qual é qual.
     if kind in ("acq", "exp", "newlogo"):
         _dtype = "Up & cross sell" if kind == "exp" else "Aquisition"
-        sel = won[won["deal_type"] == _dtype]
+        sel_v = won[won["deal_type"] == _dtype]
+        sel_h = hld[hld["deal_type"] == _dtype]
         if kind == "newlogo":
             carriers = _newlogo_goal_aes(lo.date(), hi.date(),
                                          region=request.args.get("region"),
                                          leader=request.args.get("leader"),
                                          ae=((name if grain == "ae" else None) or _ae or None))
             if carriers is not None:                # None = período sem meta (fora do Q3)
-                sel = sel[sel["account_executive"].isin(carriers)]
-        rows = _mk(sel, "Validado")
+                sel_v = sel_v[sel_v["account_executive"].isin(carriers)]
+                sel_h = sel_h[sel_h["account_executive"].isin(carriers)]
+        rows = _mk(sel_v, "Validado") + _mk(sel_h, "Em aprovação")
         rows.sort(key=lambda x: x["data"], reverse=True)
         amount = float(sum(x["amount"] for x in rows))
         _titles = {"acq": "Deals de aquisição", "exp": "Deals de expansão",
@@ -4452,6 +4468,7 @@ def overview_deals():
         cols = [{"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
                 {"key": "ae",        "label": "AE"},
                 {"key": "amount",    "label": "MRR",   "type": "money"},
+                {"key": "status",    "label": "Status"},
                 {"key": "data",      "label": "PO em", "type": "date"}]
         return jsonify({
             "title": _titles[kind] + (f" · {name}" if name else ""),
