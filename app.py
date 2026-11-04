@@ -1333,6 +1333,18 @@ ROSTER_CAPACITY_EXTRA = {
 }
 
 
+def _board_factor(q):
+    """Fator do Board Target no trimestre `q` = meta top-down do time ÷ capacity
+    (soma das quotas do roster + ROSTER_CAPACITY_EXTRA) — o MESMO fator que
+    `_comp_targets_from_roster` usa pros líderes. None sem roster ou sem meta."""
+    if q is None or _is_mx():
+        return None
+    roster, meta = ROSTERS_BR.get(q, {}), TEAM_REVENUE_META.get(q)
+    total = (sum(float(v["quota"]) for v in roster.values())
+             + sum(float(x) for x in ROSTER_CAPACITY_EXTRA.get(q, {}).values()))
+    return (float(meta) / total) if (roster and meta and total) else None
+
+
 def _comp_targets_from_roster(q) -> dict:
     """Comp. Target por líder DERIVADO do roster + meta top-down do trimestre —
     a mesma mecânica da planilha (ver acima): capacity(time) × meta / capacity
@@ -4954,6 +4966,7 @@ def _overview_page(ov_tab, grain="ae"):
         rows, key=lambda r: (r[key] is not None, r[key] if r[key] is not None else -1.0),
         reverse=True)
 
+    rank_board, board_factor = None, None   # Board Target Quota (só grain AE)
     if grain == "leader":
         # LÍDERES: cada barra = soma do time (expand_leader). Realizado × Quota (R$)
         # + % atingimento; drill por líder → deals de todos os AEs do time.
@@ -4995,6 +5008,22 @@ def _overview_page(ov_tab, grain="ae"):
                        "attainment": r["attainment"]} for r in _rev]
         rank = _build_rank_chart(_rev_items, _drill_base, axis_mode="currency",
                                  drill_path=_mx_path("/overview/ae"))
+
+        # Chart 1b — BOARD TARGET QUOTA (pedido do Pedro, 04/11/2026): igual ao de
+        # cima, mas a meta de cada vendedor é a quota × fator do board (meta do
+        # time ÷ soma das quotas, o mesmo fator dos Comp. Targets dos líderes).
+        # Assim a soma das metas fecha na meta do time. Só em trimestre com roster.
+        _bf = _board_factor(rq)
+        if _bf:
+            board_factor = _bf
+            _bt = []
+            for r in _sellers:
+                bq_ = float(r["quota"] or 0.0) * _bf
+                _bt.append({"name": r["account_executive"], "short": short_name(r["account_executive"]),
+                            "leader": r["leader"], "realized": r["realized"], "quota": bq_,
+                            "attainment": (r["realized"] / bq_) if bq_ else None})
+            rank_board = _build_rank_chart(_sort_att(_bt, "attainment"), _drill_base,
+                                           axis_mode="currency", drill_path=_mx_path("/overview/ae"))
 
         # Chart 2 — NEW LOGOS: mesma estrutura, mas Realizado × Meta (contagem) +
         # % atingimento de new logos. Só quando há meta de new logos (Q3). População
@@ -5110,7 +5139,7 @@ def _overview_page(ov_tab, grain="ae"):
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
     return render_template("overview.html", ctx=ctx, kpis=kpis, by_leader=by_leader,
-                           by_ae=by_ae, rank=rank, rank_nl=rank_nl,
+                           by_ae=by_ae, rank=rank, rank_nl=rank_nl, rank_board=rank_board, board_factor=board_factor,
                            insights=insights, acq=acq, exp=exp, range_label=range_label,
                            usd_rate=USD_BRL_RATE, deal_rows=deal_rows, deal_ae=deal_scope,
                            ov_tab=ov_tab, grain=grain)

@@ -30,6 +30,15 @@
               modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
               modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
 
+{# Chart 1b — Board Target Quota: igual ao de cima, meta = quota × fator do board #}
+{% if rank_board and not is_leader %}
+{{ rank_chart(rank_board, 'Board Target Quota', sub='realizado × quota × ' ~ ('%.4f'|format(board_factor)).replace('.', ',') ~ ' (meta do time ÷ soma das quotas) · % atingimento',
+              currency=true, legend_real='Realizado', legend_quota='Board Target',
+              tip_real='Vendido', tip_quota='Board Target', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+{% endif %}
+
 {# Chart 2 — new logos (contagem), MESMA estrutura, logo abaixo #}
 {{ rank_chart(rank_nl, ('New logos por líder' if is_leader else 'New logos por vendedor'), sub='aquisições realizadas × meta · % atingimento',
               currency=false, legend_real='Realizado', legend_quota='Meta',
@@ -37,7 +46,7 @@
               modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain, modal_kind='newlogo',
               modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
 
-{% if rank.rows or (rank_nl and rank_nl.rows) %}{{ rank_chart_script() }}{% endif %}
+{% if rank.rows or (rank_nl and rank_nl.rows) or (rank_board and rank_board.rows) %}{{ rank_chart_script() }}{% endif %}
 {% endif %}
 
 {# ===== Drill: deals fechados pelo AE selecionado (só quando 1 AE está filtrado) ===== #}
@@ -179,13 +188,22 @@
               modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
               modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
 
+{# Chart 1b — Board Target Quota: igual ao de cima, meta = quota × fator do board #}
+{% if rank_board and not is_leader %}
+{{ rank_chart(rank_board, 'Board Target Quota', sub='realizado × quota × ' ~ ('%.4f'|format(board_factor)).replace('.', ',') ~ ' (meta do time ÷ soma das quotas) · % atingimento',
+              currency=true, legend_real='Realizado', legend_quota='Board Target',
+              tip_real='Vendido', tip_quota='Board Target', tip_line='Atingimento', toggle=true,
+              modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain,
+              modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
+{% endif %}
+
 {{ rank_chart(rank_nl, ('New logos por líder' if is_leader else 'New logos por vendedor'), sub='aquisições realizadas × meta · % atingimento',
               currency=false, legend_real='Realizado', legend_quota='Meta',
               tip_real='Ganhos', tip_quota='Meta', tip_line='Atingimento', toggle=true,
               modal_endpoint=url_for('overview_deals'), modal_grain=_ov_grain, modal_kind='newlogo',
               modal_from=ctx.filters.date_from, modal_to=ctx.filters.date_to) }}
 
-{% if rank.rows or (rank_nl and rank_nl.rows) %}{{ rank_chart_script() }}{% endif %}
+{% if rank.rows or (rank_nl and rank_nl.rows) or (rank_board and rank_board.rows) %}{{ rank_chart_script() }}{% endif %}
 {% endif %}
 {% include "_drilldown.html" %}
 {% endblock %}
