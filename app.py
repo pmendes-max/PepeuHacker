@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 # ZoneInfo sem tzdata levanta exceção no import e derruba o app inteiro.
 import numpy as np
 import pandas as pd
-from flask import Flask, request, redirect, jsonify
+from flask import Flask, request, redirect, jsonify, g
 from flask import render_template as _flask_render_template
 from flask import url_for as _flask_url_for
 
@@ -2802,9 +2802,12 @@ def _derived(obj, name, build):
         return hit[1]
     val = build()
     def _drop(ref, k=k):
-        with _DERIVED_LOCK:
-            if _DERIVED.get(k, (None,))[0] is ref:
-                del _DERIVED[k]
+        # SEM lock de propósito: o callback do weakref pode rodar dentro do GC na
+        # mesma thread que já segura _DERIVED_LOCK (Lock não é reentrante) e
+        # travaria pra sempre. get/pop de dict são atômicos sob o GIL.
+        e = _DERIVED.get(k)
+        if e is not None and e[0] is ref:
+            _DERIVED.pop(k, None)
     try:
         ref = weakref.ref(obj, _drop)
     except TypeError:
@@ -14303,11 +14306,16 @@ def _gzip_static_file(disk_path):
 def _abre_escopo_force():
     if request.args.get("refresh") == "1":
         bq.begin_force_scope()
+        g._force_scope = True
 
 
 @app.teardown_request
 def _fecha_escopo_force(_exc=None):
-    bq.end_force_scope()
+    # Só fecha o escopo que ESTE request abriu: o warm do refresher usa um
+    # test_request_context pro MX, e o teardown dele não pode fechar o escopo
+    # que o _warm_all abriu.
+    if g.get("_force_scope"):
+        bq.end_force_scope()
 
 
 @app.after_request
@@ -14672,7 +14680,7 @@ def bi_freshness() -> dict:
         return {"ok": False}
     with _BI_FRESH_LOCK:
         if _BI_FRESH["sig"] == sig:
-            return _BI_FRESH["val"]
+            return _bi_age(_BI_FRESH["val"])
     try:
         cd = pd.to_datetime(pd.read_parquet(p, columns=["created_date"])["created_date"],
                             errors="coerce")
@@ -14680,17 +14688,27 @@ def bi_freshness() -> dict:
         if pd.isna(mx):
             val = {"ok": False}
         else:
-            d = mx.date()
-            dias = (_today() - d).days
-            # Deal novo entra todo dia útil; 4 dias cobre o fim de semana sem
-            # acender à toa.
-            val = {"ok": True, "newest": d, "age_days": dias, "stale": dias > 4}
+            val = {"ok": True, "newest": mx.date()}
     except Exception as e:  # noqa: BLE001 — selo nunca derruba tela
         print(f"pepeuhacker · selo da base do BI falhou ({e})", flush=True)
         val = {"ok": False}
     with _BI_FRESH_LOCK:
         _BI_FRESH["sig"], _BI_FRESH["val"] = sig, val
-    return val
+    return _bi_age(val)
+
+
+def _bi_age(val: dict) -> dict:
+    """Idade/cor da base do BI calculadas na hora (o memo guarda só a data): sem
+    isso o selo congelava a idade até o parquet ser regravado."""
+    if not val.get("ok"):
+        return val
+    dias = (_today() - val["newest"]).days
+    # Deal novo entra todo dia útil; 4 dias cobre o fim de semana sem acender à toa.
+    return {**val, "age_days": dias, "stale": dias > 4}
+
+
+_MIN_FORCED_WARM_GAP = 900          # s — piso entre warms forçados (ver _refresh_loop)
+_last_forced_warm = [time.time()]   # boot conta como warm (o _prewarm acabou de buscar tudo)
 
 
 def _refresh_loop(interval: int = 300, last_src: float = 0.0):
@@ -14729,8 +14747,14 @@ def _refresh_loop(interval: int = 300, last_src: float = 0.0):
             # 0 byte, pode ser generoso e reaquecer à toa; o SELO pergunta de
             # quando é o dado que está lá dentro, que é o que a tela promete.
             src = bq.hs_source_last_modified()
-            mudou = src > last_src
+            # Piso de 15 min entre warms FORÇADOS: o gate agora olha 5 tabelas
+            # (inclusive as curadas do dbt, que um run inteiro regrava em rajada)
+            # e é checado de 5 em 5 min — sem o piso, cada gravação viraria 11
+            # jobs no BigQuery. Mudança que chega dentro do piso fica pra próxima
+            # volta (last_src não avança).
+            mudou = src > last_src and (time.time() - _last_forced_warm[0]) >= _MIN_FORCED_WARM_GAP
             if mudou:
+                _last_forced_warm[0] = time.time()
                 _warm_all(force=True)
                 last_src = src
             dado = bq.hs_data_last_modified()

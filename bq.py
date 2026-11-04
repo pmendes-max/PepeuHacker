@@ -85,7 +85,7 @@ def _bq_mark(cache_key: str | None, ok: bool) -> None:
 # mtime novos), então (mtime, inode, tamanho) identifica a versão com folga.
 # Devolve CÓPIA: os callers mutam o frame (canon_ae_names, to_usd...). LRU com
 # teto de arquivos pra memória não crescer com as janelas datadas (pipe_wow_…).
-_PQ_MEMO_MAX = 32
+_PQ_MEMO_MAX = 16   # 2ª cópia residente do parquet cru; 16 cobre as telas quentes
 _PQ_MEMO: "OrderedDict[str, tuple]" = OrderedDict()
 _PQ_MEMO_LOCK = threading.Lock()
 
