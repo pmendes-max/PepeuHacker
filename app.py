@@ -300,6 +300,9 @@ DEPARTED_FROM = {
     "Raphael Boccaletti":  date(2026, 10, 1),
     "Rayssa Holanda":      date(2026, 10, 1),
     "Flavio Correa":       date(2026, 10, 1),
+    # 04/11/2026 — saem dos gráficos a partir do Q4 (mantêm o histórico):
+    "Luca Dalmazi":        date(2026, 10, 1),   # pediu desligamento
+    "Flávio Domingues":    date(2026, 10, 1),   # afastado pelo INSS
     # NÃO saiu: segue RSM do pod no Q4 (líder no roster e no ORG_CHART). Está
     # aqui porque, sem quota no Q4, o Pedro pediu em 19/10/2026 que ele suma de
     # todo dado em que aparece como VENDEDOR (dono do deal) dali em diante. O
@@ -616,7 +619,9 @@ _Q4_ROSTER_BR = {
     # João Tavares (RSM Commercial, sob o Bernardo)
     "Daniel Del Paschoa":                  {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
     "Douglas Barbosa":                     {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
-    "Luca Dalmazi":                        {"leader": "João Tavares",    "tier": "Commercial", "quota": 23666,  "new_logos": 2},
+    # Luca Dalmazi saiu (pediu desligamento, 04/11/2026): fora do roster e em
+    # DEPARTED_FROM. A capacity dele (R$ 23.666) FICA no time do João Tavares
+    # (gestor direto) → e portanto no do Bernardo — ver ROSTER_CAPACITY_EXTRA.
     "Pedro Capriotti":                     {"leader": "João Tavares",    "tier": "Commercial", "quota": 5000,   "new_logos": 1},
     "Rafael Avellar":                      {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
     "Diego Loures":                        {"leader": "João Tavares",    "tier": "Commercial", "quota": 27500,  "new_logos": 2},
@@ -625,7 +630,9 @@ _Q4_ROSTER_BR = {
     "Francisco Burns":                     {"leader": "Arthur Tkotz",    "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
     "Breno Smanio":                        {"leader": "Arthur Tkotz",    "tier": "Mid Market", "quota": 49500,  "new_logos": 3},
     # Fernando Barati (Mid Market)
-    "Flávio Domingues":                    {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 49500,  "new_logos": 3},
+    # Flávio Domingues afastado pelo INSS (04/11/2026): fora do roster e em
+    # DEPARTED_FROM. A capacity dele (R$ 49.500) sai da conta, então a meta do
+    # time é redistribuída PROPORCIONALMENTE entre todos os líderes.
     "Bruno Brunelli":                      {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
     "Julio Camargo":                       {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
     "Maria Eduarda Da Silva Pasqualinotto":{"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
@@ -1294,6 +1301,16 @@ _LEADER_BOARD_TARGET_Q3 = {
 }
 
 
+# Capacity que entra na distribuição do Comp. Target SEM ser um vendedor do
+# roster (não vira linha/barra nem quota de AE). Trimestre → {líder: R$}. O valor
+# conta no time desse líder e de quem está acima dele (expand_leader).
+ROSTER_CAPACITY_EXTRA = {
+    # Quota do Luca Dalmazi (saiu em 04/11/2026) mantida no time do João Tavares,
+    # gestor direto dele — e por consequência no do Bernardo. Pedido do Pedro.
+    Q4_START: {"João Tavares": 23666},
+}
+
+
 def _comp_targets_from_roster(q) -> dict:
     """Comp. Target por líder DERIVADO do roster + meta top-down do trimestre —
     a mesma mecânica da planilha (ver acima): capacity(time) × meta / capacity
@@ -1311,14 +1328,17 @@ def _comp_targets_from_roster(q) -> dict:
         cur = cur[pd.to_datetime(cur["quarter"]).dt.date == q]
         roster = {a: {"quota": float(v), "leader": ld} for (a, ld), v in
                   cur.groupby(["account_executive", "leader"])["quota_in_brl"].sum().items()}
-    total = sum(float(v["quota"]) for v in roster.values())
+    extra = ROSTER_CAPACITY_EXTRA.get(q, {})
+    total = (sum(float(v["quota"]) for v in roster.values())
+             + sum(float(x) for x in extra.values()))
     if not roster or not meta or not total:
         return {}
     fator = float(meta) / total
     out = {}
     for L in _ALLOWED_LEADERS_BR:
         team = _expand_leader_em(L, q)
-        cap = sum(float(v["quota"]) for v in roster.values() if v["leader"] in team)
+        cap = (sum(float(v["quota"]) for v in roster.values() if v["leader"] in team)
+               + sum(float(x) for ld, x in extra.items() if ld in team))
         if cap:
             out[L] = round(cap * fator, 2)
     return out
