@@ -3943,10 +3943,75 @@ def get_filter_options(df: pd.DataFrame, f: dict = None):
 _QUARTER_PERIOD_PATHS = {"/overview/overtime", "/leaders/overview/overtime"}
 
 
+# Overview (Sales Overview e AE Overview, visão AE e de líderes): filtro de
+# período em BOTÕES — Q1..Q4 do ano escolhido + FY (ano fiscal fev→jan). Pedido
+# do Pedro em 04/11/2026. Anos: desde o início dos dados até o ano seguinte ao
+# atual (o próximo ano entra sozinho na virada).
+_QCHIP_PERIOD_PATHS = {"/overview", "/overview/ae", "/leaders/overview", "/leaders/overview/team"}
+_QCHIP_FIRST_YEAR = 2024
+_FISCAL_START_MONTH = 2          # FY da Tractian: fevereiro → janeiro do ano seguinte
+
+
+def _fy_bounds(year: int) -> tuple:
+    """FY<year> = 01/02/<year> → 31/01/<year+1>."""
+    return (date(year, _FISCAL_START_MONTH, 1),
+            date(year + 1, _FISCAL_START_MONTH, 1) - timedelta(days=1))
+
+
+def _qchip_ctx() -> dict:
+    today = _today()
+    f_from = _parse_filter_date(request.args.get("date_from", ""))
+    f_to = _parse_filter_date(request.args.get("date_to", ""))
+    if not f_from and not f_to:                       # padrão da página: trimestre atual
+        f_from, f_to = _quarter_start_of(today), _quarter_end_of(today)
+    year = (f_from or f_to).year
+    base = {k: v for k, v in request.args.items()
+            if k not in ("date_from", "date_to", "preset", "refresh") and v}
+
+    def _url(a, b):
+        return request.path + "?" + urllib.parse.urlencode(
+            {**base, "date_from": a.isoformat(), "date_to": b.isoformat()})
+
+    def _chips(y):
+        out = []
+        for n in range(1, 5):
+            a = date(y, 3 * (n - 1) + 1, 1)
+            out.append({"key": f"Q{n}", "label": f"Q{n}/{str(y)[2:]}",
+                        "from": a, "to": _quarter_end_of(a)})
+        a, b = _fy_bounds(y)
+        out.append({"key": "FY", "label": f"FY{str(y)[2:]}", "from": a, "to": b})
+        return out
+
+    chips = _chips(year)
+    sel = next((c["key"] for c in chips if c["from"] == f_from and c["to"] == f_to), None)
+    if sel is None and f_from:                        # FY pode começar no ano anterior ao `to`
+        for c in _chips(year - 1):
+            if c["key"] == "FY" and c["from"] == f_from and c["to"] == f_to:
+                year, chips, sel = year - 1, _chips(year - 1), "FY"
+    for c in chips:
+        c["url"] = _url(c["from"], c["to"])
+        c["active"] = c["key"] == sel
+        c["range"] = f'{c["from"].strftime("%d/%m/%Y")} – {c["to"].strftime("%d/%m/%Y")}'
+    years = []
+    for y in range(today.year + 1, _QCHIP_FIRST_YEAR - 1, -1):
+        same = next(c for c in _chips(y) if c["key"] == (sel or "Q1"))
+        years.append({"year": y, "url": _url(same["from"], same["to"]), "selected": y == year})
+    active = next((c for c in chips if c["active"]), None)
+    return {
+        "period_mode": "qchips",
+        "qc_chips": chips, "qc_years": years,
+        "qc_label": (f'{active["label"]} · {active["range"]}' if active
+                     else f'{f_from.strftime("%d/%m/%Y")} – {f_to.strftime("%d/%m/%Y")}'),
+    }
+
+
 def _period_widget_ctx() -> dict:
     """Contexto do filtro de período conforme a aba. Em modo 'quarter' devolve os
     presets de N trimestres, a lista de trimestres disponíveis (pro intervalo
-    aberto) e o rótulo do que está selecionado."""
+    aberto) e o rótulo do que está selecionado. Em modo 'qchips' (Overview),
+    botões de trimestre + FY por ano."""
+    if request.path in _QCHIP_PERIOD_PATHS:
+        return _qchip_ctx()
     if request.path not in _QUARTER_PERIOD_PATHS:
         return {"period_mode": "date"}
     cur_q = _quarter_start_of(_today())
