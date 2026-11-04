@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import weakref
 from datetime import date, datetime, timedelta, timezone
 
 # FUSO DE BRASÍLIA, FIXO. O container do Cloud Run roda em UTC, e o código deste
@@ -23,7 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 # ZoneInfo sem tzdata levanta exceção no import e derruba o app inteiro.
 import numpy as np
 import pandas as pd
-from flask import Flask, request, redirect, jsonify
+from flask import Flask, request, redirect, jsonify, g
 from flask import render_template as _flask_render_template
 from flask import url_for as _flask_url_for
 
@@ -1223,9 +1224,16 @@ def _identify_hold_deal_ids(deals: pd.DataFrame, force: bool = False) -> set:
     if len(cw):   # só candidatos recentes (~2 quarters) — o hold é sempre recente
         _cut = cw["po_emission_date"].max() - pd.Timedelta(days=210)
         cw = cw[cw["po_emission_date"] >= _cut]
+    # Agrupa por AE numa passada só. Filtrar o frame inteiro por AE dentro do laço
+    # custava ~2-3 ms por filtro com as strings Arrow do pandas 3 (65 ms por
+    # chamada, e /overview e /pipeline chamam a cada request). Mesma ordem de
+    # linhas do filtro, então o casamento de 1 ou 2 deals escolhe os mesmos.
+    by_ae: dict = {}
+    for _ae, _did, _amt in zip(cw["account_executive"].tolist(), cw["deal_id"].tolist(),
+                               cw["amount"].tolist()):
+        by_ae.setdefault(_ae, []).append((_did, float(_amt)))
     for ae, H in onhold.items():
-        rows = [(r.deal_id, float(r.amount))
-                for r in cw[cw["account_executive"] == ae][["deal_id", "amount"]].itertuples(index=False)]
+        rows = by_ae.get(ae, [])
         match = None
         for did, amt in rows:                       # 1 deal
             if abs(amt - H) < 2:
@@ -2559,6 +2567,31 @@ def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 # Botão "↻ Refresh BQ" (?refresh=1) força rebuild propagando para o BQ.
 _DATA_CACHE_LOCK = threading.Lock()
 _DATA_CACHE: dict = {}
+# Teto de segurança. Na prática o cache fica em ~20 entradas: uma por
+# (país, dataset), porque `_cache_put` descarta a versão anterior.
+_DATA_CACHE_MAX = 64
+
+
+def _cache_put(key, value) -> None:
+    """Grava no _DATA_CACHE descartando as versões ANTERIORES do mesmo dataset.
+
+    As chaves são (país, nome, mtime do parquet...): cada parquet regravado — e o
+    stale-while-revalidate regrava a cada 10 min de uso — gerava uma chave nova, e
+    a velha nunca saía. Medido no harness: 8 entradas no boot, 92 depois de 12
+    ciclos do refresher, ~80-100 MB presos por ciclo com o volume real, até o OOM
+    do container. Agora entra a nova e sai quem tem o mesmo (país, nome) e outro
+    mtime. Chave que não é tupla (ou tupla curta) só entra, sem descarte por
+    família; o teto acima segura o total de qualquer jeito (sai a mais antiga)."""
+    with _DATA_CACHE_LOCK:
+        if isinstance(key, tuple) and len(key) >= 2:
+            fam = key[:2]
+            for k in [k for k in _DATA_CACHE
+                      if k != key and isinstance(k, tuple) and k[:2] == fam]:
+                del _DATA_CACHE[k]
+        _DATA_CACHE.pop(key, None)       # reinsere no fim (ordem = idade)
+        _DATA_CACHE[key] = value
+        while len(_DATA_CACHE) > _DATA_CACHE_MAX:
+            del _DATA_CACHE[next(iter(_DATA_CACHE))]
 
 
 def _parquet_mtime(name: str) -> float:
@@ -2606,8 +2639,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
         _mx = merge_ae_quarter_dups(canon_ae_names(df[df["region"] == "MX"].copy()))
         _mx["leader"] = MX_LEADER
         _mx = _mx.reset_index(drop=True)
-        with _DATA_CACHE_LOCK:
-            _DATA_CACHE[key] = _mx
+        _cache_put(key, _mx)
         return _mx
     # Nome canônico ANTES do roster: é o rename que faz a linha órfã do AE casar
     # com o roster, e a fusão evita a quota sair dobrada.
@@ -2623,8 +2655,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
     df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
     df = drop_departed_from(df, "quarter").reset_index(drop=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2643,8 +2674,7 @@ def _get_unit_price_events(force: bool = False) -> pd.DataFrame:
     df = df[df["event_date"].notna()]
     df["amount_brl"] = pd.to_numeric(df["amount_brl"], errors="coerce").fillna(0.0)
     df["devices"] = pd.to_numeric(df["devices"], errors="coerce").fillna(0).astype(int)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2688,8 +2718,7 @@ def _get_quota_history(force: bool = False) -> pd.DataFrame:
                 or cur_leader.get(ae))
     df["leader"] = df.apply(_ld, axis=1) if len(df) else None
     df = df.reset_index(drop=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2714,7 +2743,11 @@ def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     """Pivot deal × estágio → timestamp da 1ª entrada, uma coluna por número de
     estágio (s1..s7). Base das coortes de conversão do funil."""
     raw = bq.funnel_stage_entries(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "funnel_entries_v6", _parquet_mtime("funnel_stage_entries_v5"))
+    # mtime do parquet DO PAÍS (`_pk`): com o nome do BR, o frame do México só
+    # era invalidado quando o parquet do Brasil mudava (mesmo bug já corrigido
+    # no `_get_demand_deals`).
+    key = (_pl(), "funnel_entries_v6",
+           _parquet_mtime(bq._pk("funnel_stage_entries_v5", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -2748,9 +2781,40 @@ def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     piv["created_date"] = pd.to_datetime(piv["deal_id"].map(base["created_date"]), errors="coerce")
     piv["deal_name"] = piv["deal_id"].map(base["deal_name"])
     piv["amount"] = pd.to_numeric(piv["deal_id"].map(base["amount"]), errors="coerce").fillna(0.0)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = piv
+    _cache_put(key, piv)
     return piv
+
+
+# Memo de valores DERIVADOS de um frame (um set, uma série), preso ao OBJETO.
+# Não dá pra chavear só por id(frame): o id é reaproveitado depois que o frame
+# morre, e um frame novo herdaria o derivado do velho. Por isso a entrada guarda
+# um weakref e só vale se ele ainda aponta pro MESMO objeto; quando o frame é
+# coletado, o callback tira a entrada (memória acompanha a vida do frame).
+_DERIVED_LOCK = threading.Lock()
+_DERIVED: dict = {}
+
+
+def _derived(obj, name, build):
+    k = (id(obj), name)
+    with _DERIVED_LOCK:
+        hit = _DERIVED.get(k)
+    if hit is not None and hit[0]() is obj:
+        return hit[1]
+    val = build()
+    def _drop(ref, k=k):
+        # SEM lock de propósito: o callback do weakref pode rodar dentro do GC na
+        # mesma thread que já segura _DERIVED_LOCK (Lock não é reentrante) e
+        # travaria pra sempre. get/pop de dict são atômicos sob o GIL.
+        e = _DERIVED.get(k)
+        if e is not None and e[0] is ref:
+            _DERIVED.pop(k, None)
+    try:
+        ref = weakref.ref(obj, _drop)
+    except TypeError:
+        return val
+    with _DERIVED_LOCK:
+        _DERIVED[k] = (ref, val)
+    return val
 
 
 def _stage_active_mask(piv, num, lo, hi):
@@ -2761,9 +2825,14 @@ def _stage_active_mask(piv, num, lo, hi):
     ent = piv[f"s{num}"]
     if num == 7:
         return ((ent >= lo) & (ent < hi)).fillna(False)
-    stage_cols = [f"s{n}" for n in range(1, 8)] + ["s99"]
-    others = piv[stage_cols].drop(columns=[f"s{num}"])
-    exit_ts = others.where(others.gt(ent, axis=0)).min(axis=1)   # NaT = nunca saiu
+
+    def _exit_ts():
+        stage_cols = [f"s{n}" for n in range(1, 8)] + ["s99"]
+        others = piv[stage_cols].drop(columns=[f"s{num}"])
+        return others.where(others.gt(ent, axis=0)).min(axis=1)   # NaT = nunca saiu
+    # A saída só depende do frame e do estágio, não da janela: o Sales Overtime
+    # pede 8 trimestres × 2 estágios × 4 pares (~8 ms cada, 270 ms por página).
+    exit_ts = _derived(piv, f"exit_ts_{num}", _exit_ts)
     return ent.notna() & (ent < hi) & (exit_ts.isna() | (exit_ts >= lo))
 
 
@@ -2866,8 +2935,7 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     df = drop_departed_from(df, "quarter")
     if len(kept):
         df = pd.concat([df, kept], ignore_index=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3002,8 +3070,7 @@ def _get_demand_deals(force: bool = False) -> pd.DataFrame:
         df["leader"] = MX_LEADER
         df["region"] = "MX"
     df = drop_departed_from(df, "created_date")
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3012,7 +3079,11 @@ def _get_visits(force: bool = False) -> pd.DataFrame:
     MESMA atribuição de time do resto do app (snapshot ae_performance + roster Q3).
     Colunas: account_executive, start_date, category ('field'|'ia_center'), leader, region."""
     raw = bq.visits_raw(force_refresh=force)
-    key = (_pl(), "visits", _parquet_mtime("visits_raw_v2"))
+    # O nome do parquet sai de bq.VISITS_KEY: a chave apontava pra
+    # `visits_raw_v2` depois que a query passou a gravar `visits_raw_v3` — o
+    # arquivo não existia, o mtime era sempre 0 e o frame do 1º acesso ficava
+    # em memória até o processo reiniciar.
+    key = (_pl(), "visits", _parquet_mtime(bq.VISITS_KEY))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3029,8 +3100,7 @@ def _get_visits(force: bool = False) -> pd.DataFrame:
                [["account_executive", "leader", "region"]])
     df = df.merge(ae_meta, on="account_executive", how="left")
     df = apply_roster_leader(df)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3103,11 +3173,16 @@ def _lost_stage_of(deals: pd.DataFrame) -> pd.Series:
     try:
         piv = _get_funnel_entries()
         cols = [c for c in ("s2", "s3", "s4", "s5", "s6", "s7") if c in piv.columns]
-        hit2 = set(piv.loc[piv[cols].notna().any(axis=1), "deal_id"].astype(str))
+        # Preso ao frame do cache (mesmo objeto enquanto o parquet não muda).
+        hit2 = _derived(piv, "hit2", lambda: set(
+            piv.loc[piv[cols].notna().any(axis=1), "deal_id"].astype(str)))
     except Exception as e:  # noqa: BLE001 — sem histórico, cai no conservador
         print(f"pepeuhacker · lost-stage: histórico indisponível ({e})", flush=True)
         hit2 = set()
-    reached2 = deals["deal_id"].astype(str).isin(hit2) | scop
+    # Pertinência em Python puro: `Series.isin(set)` nas strings Arrow do pandas 3
+    # levava ~50 ms em 10 mil deals; a list comprehension, ~1,5 ms.
+    reached2 = pd.Series([x in hit2 for x in deals["deal_id"].astype(str).tolist()],
+                         index=deals.index, dtype=bool) | scop
     out = pd.Series(0, index=deals.index, dtype=int)
     out[lost & ~reached2] = 1
     out[lost & reached2 & ~scop] = 2
@@ -3718,7 +3793,8 @@ def _get_pipeline_deals(force: bool = False) -> pd.DataFrame:
     """Todos os deals do funil Sales BR com bucket (early/late/other), is_open,
     hs_closedate (close date do HubSpot raw) e leader/region. Memoizado por mtime."""
     raw = bq.pipeline_deals_raw(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "pipeline_deals", _parquet_mtime("pipeline_deals_raw_v6"))
+    key = (_pl(), "pipeline_deals",                  # `_pk`: ver _get_funnel_entries
+           _parquet_mtime(bq._pk("pipeline_deals_raw_v6", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3745,8 +3821,7 @@ def _get_pipeline_deals(force: bool = False) -> pd.DataFrame:
     _gone = {ae for ae, cut in DEPARTED_FROM.items() if cut <= _today()}
     if _gone:
         df = df[~df["account_executive"].isin(_gone)]
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3755,7 +3830,8 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     ponderado (amount × pct da categoria). leader/region do snapshot mais recente
     de ae_performance. Memoizado por mtime do parquet."""
     raw = bq.forecast_deals_raw(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "forecast_deals_v2", _parquet_mtime("forecast_deals_raw_v6"))
+    key = (_pl(), "forecast_deals_v2",               # `_pk`: ver _get_funnel_entries
+           _parquet_mtime(bq._pk("forecast_deals_raw_v6", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3832,8 +3908,7 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
         df.loc[_kw, "region"] = "BR"
         df.loc[_kw, "is_manager_sale"] = True
 
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -4348,6 +4423,8 @@ def base_context():
         # Selo de frescor: de QUANDO é o dado que está na tela. Ver
         # `source_freshness` — idade da fonte, nunca idade do cache.
         "freshness": source_freshness(),
+        # 2ª linha do selo: o que NÃO vem da fonte viva (valor, dono, data do PO).
+        "bi_freshness": bi_freshness(),
         # Filtro de PERÍODO mutável por aba: 'quarter' (Sales Overtime) troca o
         # date-range por presets de N trimestres + intervalo aberto quarter→quarter.
         **_period_widget_ctx(),
@@ -14219,6 +14296,28 @@ def _gzip_static_file(disk_path):
     return gzdata
 
 
+# "↻ Refresh BQ" (?refresh=1) força cada loader da tela, e vários pedem a mesma
+# chave: o /pipeline mandava ae_performance 6 vezes pro BigQuery, em série, no
+# mesmo request. O escopo faz o 1º pedido forçado de cada chave ir ao BQ e os
+# seguintes lerem o parquet recém-gravado (ver `bq._force_once`). Teardown e não
+# after_request: roda até quando a view estoura, e a thread do waitress é
+# reaproveitada no próximo request.
+@app.before_request
+def _abre_escopo_force():
+    if request.args.get("refresh") == "1":
+        bq.begin_force_scope()
+        g._force_scope = True
+
+
+@app.teardown_request
+def _fecha_escopo_force(_exc=None):
+    # Só fecha o escopo que ESTE request abriu: o warm do refresher usa um
+    # test_request_context pro MX, e o teardown dele não pode fechar o escopo
+    # que o _warm_all abriu.
+    if g.get("_force_scope"):
+        bq.end_force_scope()
+
+
 @app.after_request
 def perf_headers(response):
     """Gzip pra HTML/CSS/JS + cache forte pro /static + ETag/304 pra revisitas.
@@ -14296,15 +14395,34 @@ def on_error(e):
     return f"<pre style='padding:20px'>{traceback.format_exc()}</pre>", 500
 
 
-def _warm_all(force: bool = False):
+def _warm_all(force: bool = False, extras: bool = True):
     """Aquece os caches dos dois níveis (parquet + memória). force=True re-consulta
     o BQ e reaquece a memória (usado pelo refresher). Aquece cada dataset isolado
-    pra que uma falha não impeça os demais."""
-    def _try(fn, *a, **kw):
-        try:
-            fn(*a, **kw)
-        except Exception as e:  # noqa: BLE001 — best-effort por dataset
-            print(f"pepeuhacker · warm {getattr(fn,'__name__',fn)} falhou: {e}", flush=True)
+    pra que uma falha não impeça os demais.
+
+    Roda dentro de um escopo de force (`bq.begin_force_scope`): vários loaders
+    pedem `ae_performance` com force=True, e sem o escopo cada volta pagava 5
+    queries iguais no BigQuery. `extras=False` deixa de fora o estado vivo que
+    não é do núcleo (ver `_warm_extras`) — é o que o boot usa, com a porta ainda
+    fechada."""
+    bq.begin_force_scope()
+    try:
+        _warm_core(force)
+        if extras:
+            _warm_extras(force)
+    finally:
+        bq.end_force_scope()
+
+
+def _warm_try(fn, *a, **kw):
+    try:
+        fn(*a, **kw)
+    except Exception as e:  # noqa: BLE001 — best-effort por dataset
+        print(f"pepeuhacker · warm {getattr(fn,'__name__',fn)} falhou: {e}", flush=True)
+
+
+def _warm_core(force: bool) -> None:
+    _try = _warm_try
     _try(_get_clean_ae_perf, force=force)
     _try(_get_ae_perf_with_managers, force=force)
     _try(_get_demand_deals, force=force)
@@ -14316,19 +14434,47 @@ def _warm_all(force: bool = False):
     # que não muda de hora em hora. Ela popula sozinha no 1º acesso à aba, com
     # TTL de 6h (ver LEGAL_MAIL_TTL).
     _try(bq.legal_deals_raw, force_refresh=force)
-    # /confirm é live BQ (cache 5min) — aquece o range default da rota
-    _try(bq.confirm_totals,
-         _quarter_start_of(date(2025, 4, 1)).isoformat(),
-         _quarter_start_of(date(2026, 1, 31)).isoformat(),
-         force_refresh=force)
+    # `bq.confirm_totals` saiu daqui em 11/2026: não existe mais rota /confirm
+    # nem outro chamador — era uma query paga em todo boot e em toda volta do
+    # refresher pra aquecer um cache que ninguém lia.
+
+
+def _warm_extras(force: bool) -> None:
+    """O resto do ESTADO VIVO (estágio/close date) que as telas leem: Pipeline
+    Total, Inatividade/Stale, funil e visitas. Antes ficavam fora do warm, e o
+    1º usuário depois de cada mudança da fonte pagava o rebuild (e, com o parquet
+    vencido, via o dado velho do stale-while-revalidate).
+
+    México: SEM force, de propósito. Cada chave do MX é uma query a mais no
+    BigQuery a cada disparo do gate, pra um time que abre a tela poucas vezes;
+    sem force, o warm só remonta os frames em memória e, se o parquet já venceu,
+    dispara o refresh em background (o mesmo que a 1ª visita faria) — nenhuma
+    query síncrona, nenhum job se o parquet ainda está no TTL."""
+    _try = _warm_try
+    _try(bq.pipeline_total_raw, force_refresh=force)
+    _try(bq.pipeline_stalled, force_refresh=force)
+    _try(bq.pipeline_activity, force_refresh=force)
+    _try(_get_funnel_entries, force=force)
+    _try(_get_visits, force=force)
+    with app.test_request_context("/mx/pipeline"):
+        _try(bq.mx_deals_raw)
+        _try(_get_pipeline_deals)
+        _try(_get_forecast_deals)
 
 
 def _prewarm():
     """Carrega caches em memória ao subir. Sem isso, o primeiro request da
     sessão paga ~50-150ms (parquet read + overrides) ou ~6-11s (BQ se parquet
-    expirou). Pré-aquece silenciosamente — falha não impede subir."""
-    _warm_all(force=False)
+    expirou). Pré-aquece silenciosamente — falha não impede subir.
+
+    Só o núcleo roda antes de abrir a porta: o boot já leva ~3,5 min, perto do
+    probe de inicialização do Cloud Run (240 s), e cada query a mais aqui é
+    risco de crash loop. Os extras sobem numa thread logo depois."""
+    _warm_all(force=False, extras=False)
     print("pepeuhacker · cache pré-aquecido", flush=True)
+
+    threading.Thread(target=_warm_extras, args=(False,), name="warm-extras",
+                     daemon=True).start()
 
 
 def _access_urls():
@@ -14431,8 +14577,8 @@ def _snapshot_forecast_midnight() -> None:
 
 def _midnight_loop() -> None:
     """Dorme até a próxima 00:00 BRT e tira a foto. Laço próprio, e não o
-    `_refresh_loop`: aquele gira de 15 em 15 min e pula volta quando o
-    reaquecimento demora, então a foto sairia em qualquer ponto até 00h15+ — e o
+    `_refresh_loop`: aquele gira de 5 em 5 min e pula volta quando o
+    reaquecimento demora, então a foto sairia em qualquer ponto até 00h05+ — e o
     DoD promete meia-noite. A 1ª chamada, no boot, cobre um deploy que caia
     entre 00h e 02h."""
     _snapshot_forecast_midnight()
@@ -14508,9 +14654,67 @@ def source_freshness() -> dict:
     }
 
 
-def _refresh_loop(interval: int = 900):
-    """Reaquece os caches principais a cada `interval`s — 15 min desde
-    14/09/2026 (antes: 45), pedido do Pedro pra operar o fim de trimestre.
+_BI_FRESH_LOCK = threading.Lock()
+_BI_FRESH: dict = {"sig": None, "val": None}
+
+
+def bi_freshness() -> dict:
+    """2ª linha do selo: de quando é a base do BI.
+
+    O selo de cima mede `hs_lastmodifieddate` da view VIVA, que só manda estágio,
+    close date e forecast category. Valor, dono (AE) e data do PO — e a própria
+    existência do deal — vêm da curada `int_adding_names_to_deals`, que lê a sync
+    legada parada desde ~11/10/2026. Um deal tocado pela ingestão fazia o selo
+    dizer "dado de 5 min atrás" com valor, dono e PO de semanas: o selo mentia.
+
+    A idade sai de dado JÁ CARREGADO, sem query nova: o `created_date` mais
+    recente do parquet de pipeline_deals (todos os deals do funil BR, lidos da
+    curada). Base parada = nenhum deal novo, e a data para junto. Só a coluna,
+    e só quando o parquet muda (memo por mtime) — custa nada por request.
+    Sem parquet ou sem a coluna, cai no aviso fixo."""
+    p = bq.CACHE_DIR / "pipeline_deals_raw_v6.parquet"
+    try:
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {"ok": False}
+    with _BI_FRESH_LOCK:
+        if _BI_FRESH["sig"] == sig:
+            return _bi_age(_BI_FRESH["val"])
+    try:
+        cd = pd.to_datetime(pd.read_parquet(p, columns=["created_date"])["created_date"],
+                            errors="coerce")
+        mx = cd.max()
+        if pd.isna(mx):
+            val = {"ok": False}
+        else:
+            val = {"ok": True, "newest": mx.date()}
+    except Exception as e:  # noqa: BLE001 — selo nunca derruba tela
+        print(f"pepeuhacker · selo da base do BI falhou ({e})", flush=True)
+        val = {"ok": False}
+    with _BI_FRESH_LOCK:
+        _BI_FRESH["sig"], _BI_FRESH["val"] = sig, val
+    return _bi_age(val)
+
+
+def _bi_age(val: dict) -> dict:
+    """Idade/cor da base do BI calculadas na hora (o memo guarda só a data): sem
+    isso o selo congelava a idade até o parquet ser regravado."""
+    if not val.get("ok"):
+        return val
+    dias = (_today() - val["newest"]).days
+    # Deal novo entra todo dia útil; 4 dias cobre o fim de semana sem acender à toa.
+    return {**val, "age_days": dias, "stale": dias > 4}
+
+
+_MIN_FORCED_WARM_GAP = 900          # s — piso entre warms forçados (ver _refresh_loop)
+_last_forced_warm = [time.time()]   # boot conta como warm (o _prewarm acabou de buscar tudo)
+
+
+def _refresh_loop(interval: int = 300, last_src: float = 0.0):
+    """Reaquece os caches principais a cada `interval`s — 5 min desde 11/2026
+    (15 desde 14/09/2026; antes, 45). O gate é metadado, 0 byte, então olhar
+    mais vezes não custa nada; só reaquece de fato quando a fonte mudou.
 
     O laço é DISPARADO POR MUDANÇA, não por relógio: a cada volta pergunta ao
     BigQuery quando a tabela de deals do HubSpot foi gravada pela última vez
@@ -14518,7 +14722,13 @@ def _refresh_loop(interval: int = 900):
     queries caras se a fonte de fato mudou. Por que assim: a ingestão do HubSpot
     roda de ~2 em 2 horas, então um ciclo cego de 15 min pagaria 8 rodadas de
     BigQuery pra reescrever parquet idêntico. Com o gate, o dado novo chega à
-    tela em no máximo 15 min e o custo fica no mesmo patamar do ciclo de 45.
+    tela em no máximo 5 min (mais a duração do warm) e o custo fica no mesmo
+    patamar do ciclo de 45.
+
+    `last_src` vem do __main__, lido ANTES do `_prewarm`: começando em 0, a 1ª
+    volta sempre achava "fonte nova" e refazia o warm inteiro com force=True
+    logo depois do prewarm ter acabado de buscar tudo — 11 jobs no BigQuery a
+    mais em todo boot, concorrendo com os primeiros requests.
 
     Junto com o stale-while-revalidate do bq.query, nenhuma visita — nem a
     primeira do dia — paga o round-trip do BigQuery.
@@ -14527,7 +14737,9 @@ def _refresh_loop(interval: int = 900):
     sempre, então não precisa de um 2º agendador só pra isso, e a gravação é
     idempotente por domingo."""
     _snapshot_forecast_week()          # 1ª tentativa já no boot
-    last_src = 0.0
+    if last_src:
+        with _FRESH_LOCK:              # o prewarm acabou de aquecer tudo
+            _FRESH["warmed_epoch"] = time.time()
     while True:
         try:
             # Duas perguntas diferentes, de propósito (ver as docstrings das duas
@@ -14535,8 +14747,14 @@ def _refresh_loop(interval: int = 900):
             # 0 byte, pode ser generoso e reaquecer à toa; o SELO pergunta de
             # quando é o dado que está lá dentro, que é o que a tela promete.
             src = bq.hs_source_last_modified()
-            mudou = src > last_src
+            # Piso de 15 min entre warms FORÇADOS: o gate agora olha 5 tabelas
+            # (inclusive as curadas do dbt, que um run inteiro regrava em rajada)
+            # e é checado de 5 em 5 min — sem o piso, cada gravação viraria 11
+            # jobs no BigQuery. Mudança que chega dentro do piso fica pra próxima
+            # volta (last_src não avança).
+            mudou = src > last_src and (time.time() - _last_forced_warm[0]) >= _MIN_FORCED_WARM_GAP
             if mudou:
+                _last_forced_warm[0] = time.time()
                 _warm_all(force=True)
                 last_src = src
             dado = bq.hs_data_last_modified()
@@ -15346,8 +15564,12 @@ if __name__ == "__main__":
     # são eles que gravam as fotos do forecast no BigQuery, e quem grava é o
     # serviço principal — duas instâncias gravando a mesma foto não ajuda ninguém.
     if os.environ.get("PEPEU_PAPEL") != "api":
+        # Marca da fonte ANTES do prewarm (ver `_refresh_loop`): o refresher só
+        # reaquece se ela mudar daqui pra frente.
+        _src0 = bq.hs_source_last_modified()
         _prewarm()
-        threading.Thread(target=_refresh_loop, name="cache-refresher", daemon=True).start()
+        threading.Thread(target=_refresh_loop, kwargs={"last_src": _src0},
+                         name="cache-refresher", daemon=True).start()
         threading.Thread(target=_midnight_loop, name="forecast-midnight", daemon=True).start()
     from waitress import serve
     # HOST: 127.0.0.1 (padrão, só local) ou 0.0.0.0 (exposto na rede/VPN p/ o time

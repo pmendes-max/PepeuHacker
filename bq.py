@@ -11,6 +11,7 @@ if os.path.exists(_LOCAL_SA):
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _LOCAL_SA)
 
 from pathlib import Path
+from collections import OrderedDict
 import re
 import pandas as pd
 import db_dtypes  # noqa: F401 — registra dtypes dbdate/dbtime p/ ler parquet do cache
@@ -49,7 +50,98 @@ def _write_parquet_atomic(df: pd.DataFrame, cache_file: Path) -> None:
             tmp.unlink(missing_ok=True)
 
 
-_bq_down_until = 0.0
+# Circuit breaker POR CHAVE (era global até 11/2026). Global, uma query com
+# problema — uma view quebrada, um timeout numa janela pesada — suspendia por
+# BQ_COOLDOWN o refresh de TODAS as outras, inclusive das saudáveis: medido em
+# simulação, uma chave vencida e boa recebeu 0 refresh nos 120 s de pausa. A
+# família da chave é o prefixo antes do 1º token de data (mesma regra do
+# `_stale_fallback`), então as janelas de um mesmo dataset (pipe_wow_<datas>)
+# dividem o mesmo disjuntor — BQ fora pra uma janela é BQ fora pras irmãs.
+_bq_down: dict[str, float] = {}
+
+
+def _breaker_key(cache_key: str | None) -> str:
+    if not cache_key:
+        return ""
+    return re.split(r"_\d{4}-\d{2}-\d{2}", cache_key)[0] or cache_key
+
+
+def _bq_is_down(cache_key: str | None, now: float) -> bool:
+    return now < _bq_down.get(_breaker_key(cache_key), 0.0)
+
+
+def _bq_mark(cache_key: str | None, ok: bool) -> None:
+    k = _breaker_key(cache_key)
+    if ok:
+        _bq_down.pop(k, None)          # BQ respondeu — re-arma
+    else:
+        _bq_down[k] = time.time() + BQ_COOLDOWN
+
+
+# read_parquet memoizado por arquivo. Cada request "quente" ainda relia de 2 a 6
+# parquets do disco ANTES de olhar o cache em memória do app (14 ms só o de
+# pipeline_deals), porque o stale-while-revalidate mora na leitura. O parquet só
+# muda quando alguém o regrava via `_write_parquet_atomic` (os.replace → inode e
+# mtime novos), então (mtime, inode, tamanho) identifica a versão com folga.
+# Devolve CÓPIA: os callers mutam o frame (canon_ae_names, to_usd...). LRU com
+# teto de arquivos pra memória não crescer com as janelas datadas (pipe_wow_…).
+_PQ_MEMO_MAX = 16   # 2ª cópia residente do parquet cru; 16 cobre as telas quentes
+_PQ_MEMO: "OrderedDict[str, tuple]" = OrderedDict()
+_PQ_MEMO_LOCK = threading.Lock()
+
+
+def _read_parquet(path: Path) -> pd.DataFrame:
+    try:
+        st = path.stat()
+    except OSError:
+        return pd.read_parquet(path)
+    sig = (st.st_mtime_ns, st.st_ino, st.st_size)
+    k = str(path)
+    with _PQ_MEMO_LOCK:
+        hit = _PQ_MEMO.get(k)
+        if hit is not None and hit[0] == sig:
+            _PQ_MEMO.move_to_end(k)
+            df = hit[1]
+        else:
+            df = None
+    if df is None:
+        df = pd.read_parquet(path)
+        with _PQ_MEMO_LOCK:
+            _PQ_MEMO[k] = (sig, df)
+            _PQ_MEMO.move_to_end(k)
+            while len(_PQ_MEMO) > _PQ_MEMO_MAX:
+                _PQ_MEMO.popitem(last=False)
+    return df.copy()
+
+
+# "↻ Refresh BQ" sem query repetida. O botão passa force=True pra TODO loader da
+# tela, e vários deles pedem a mesma chave (o /pipeline forçava ae_performance 6
+# vezes no mesmo request; o ciclo do refresher, 5). Dentro de um ESCOPO — um
+# request, ou uma volta do `_warm_all` — só o 1º pedido forçado de cada chave vai
+# ao BigQuery; os seguintes leem o parquet que ele acabou de gravar. Thread-local
+# porque o waitress atende um request por thread; fora de escopo nada muda.
+_force_scope = threading.local()
+
+
+def begin_force_scope() -> None:
+    _force_scope.keys = set()
+
+
+def end_force_scope() -> None:
+    _force_scope.keys = None
+
+
+def _force_once(cache_key: str | None, force_refresh: bool) -> bool:
+    if not force_refresh or not cache_key:
+        return force_refresh
+    keys = getattr(_force_scope, "keys", None)
+    if keys is None:
+        return True
+    if cache_key in keys:
+        return False
+    keys.add(cache_key)
+    return True
+
 
 # Stale-while-revalidate: quando o parquet vence, servimos o dado velho na hora
 # e disparamos UM refresh em background (dedup por chave). Nenhum request de
@@ -70,7 +162,6 @@ def _query_raw(sql: str, cache_key: str | None = None, ttl: int = CACHE_TTL,
     """Run SQL and return DataFrame. Caches result as parquet when cache_key given.
     Se o BQ falhar (ex: view upstream quebrada), serve o cache mais próximo em
     disco em vez de derrubar o site — melhor dado velho que página 500."""
-    global _bq_down_until
     cache_file = CACHE_DIR / f"{cache_key}.parquet" if cache_key else None
     now = time.time()
 
@@ -78,15 +169,15 @@ def _query_raw(sql: str, cache_key: str | None = None, ttl: int = CACHE_TTL,
     if cache_file and cache_file.exists() and not force_refresh:
         age = now - cache_file.stat().st_mtime
         if age < ttl:
-            return pd.read_parquet(cache_file)          # fresco
+            return _read_parquet(cache_file)          # fresco
         # Vencido → stale-while-revalidate: devolve o velho AGORA e atualiza em
         # background (se o BQ não estiver em cooldown). Usuário nunca espera.
-        if now >= _bq_down_until:
+        if not _bq_is_down(cache_key, now):
             _spawn_refresh(sql, cache_key)
-        return pd.read_parquet(cache_file)
+        return _read_parquet(cache_file)
 
     # Sem cache em disco. BQ caiu há pouco? tenta um irmão stale antes de falhar.
-    if not force_refresh and now < _bq_down_until:
+    if not force_refresh and _bq_is_down(cache_key, now):
         stale = _stale_fallback(cache_key) if cache_key else None
         if stale is not None:
             return pd.read_parquet(stale)
@@ -94,9 +185,9 @@ def _query_raw(sql: str, cache_key: str | None = None, ttl: int = CACHE_TTL,
     # 1ª população da chave OU force_refresh (botão ↻): consulta síncrona.
     try:
         df = client().query(sql).to_dataframe()
-        _bq_down_until = 0.0  # BQ respondeu — re-arma
+        _bq_mark(cache_key, True)
     except Exception as e:  # noqa: BLE001 — qualquer falha de BQ
-        _bq_down_until = time.time() + BQ_COOLDOWN
+        _bq_mark(cache_key, False)
         stale = _stale_fallback(cache_key) if cache_key else None
         if stale is not None:
             print(f"bq · {cache_key}: BQ falhou ({e}); servindo {stale.name}", flush=True)
@@ -201,9 +292,20 @@ HS_DEALS_VIEW = "tractian-bi.pepeuhacker.hubspot_deals_live"
 # `pepeuhacker.hubspot_deals_live`). Isto aqui serve SÓ ao gate do reaquecimento,
 # que pergunta de metadado — 0 byte — se alguma delas foi gravada desde a última
 # volta. O selo das telas não sai daqui: ver `hs_data_last_modified`.
+#
+# 11/2026: entram a `hubspot_deals_mcp` — desde 13/10 é a ÚNICA fonte viva da view
+# (legada e nekt pararam em ~11/10), e sem ela o gate nunca disparava: em
+# simulação, 8 voltas (2 h) com só a mcp mudando deram 0 reaquecimento depois do
+# boot — e as duas tabelas curadas do BI, pra que um `dbt run` (valor, dono, PO,
+# realizado) também reaqueça a tela sem esperar visita. Tudo no mesmo projeto e
+# na mesma região (as queries do app já juntam esses datasets), então o UNION
+# de `__TABLES__` continua sendo UMA consulta de metadado, 0 byte.
 HS_SOURCE_TABLES = (
     "tractian-bi.hubspot.hubspot_deals",
     "tractian-bi.hubspot_nekt.hubspot_deals_transformed",
+    "tractian-bi.pepeuhacker.hubspot_deals_mcp",
+    "tractian-bi.dbt_analytics_dev.int_adding_names_to_deals",
+    "tractian-bi.dbt_analytics_dev.account_executives_performance",
 )
 
 
@@ -246,8 +348,8 @@ def hs_data_last_modified() -> float:
     tabela. Metadado de gravação não sabe fazer isso (ver acima).
 
     Custa ~1,5 MB por chamada (uma coluna, ~40 mil linhas) — abaixo do mínimo de
-    cobrança do BigQuery. É chamado no máximo de 15 em 15 min, pelo refresher e
-    pela sonda de dev; não chame dentro de um request.
+    cobrança do BigQuery. É chamado no máximo de 5 em 5 min, pelo refresher, e de
+    15 em 15 pela sonda de dev; não chame dentro de um request.
 
     Devolve 0.0 se falhar, pelo mesmo motivo de `hs_source_last_modified`."""
     sql = f"SELECT UNIX_SECONDS(MAX(hs_lastmodifieddate)) FROM `{HS_DEALS_VIEW}`"
@@ -412,6 +514,7 @@ def query(sql: str, cache_key: str | None = None, ttl: int = CACHE_TTL,
     """`_query_raw` + canonização de nome de AE. Wrapper (e não edição dos 6
     pontos de return de `_query_raw`) pra cobrir também os caminhos de cache
     stale e de fallback quando o BQ está fora."""
+    force_refresh = _force_once(cache_key, force_refresh)
     return normalize_stages(
         to_usd(canon_ae_names(_query_raw(sql, cache_key=cache_key, ttl=ttl,
                                          force_refresh=force_refresh)), pipeline),
@@ -429,13 +532,12 @@ def _spawn_refresh(sql: str, cache_key: str | None) -> None:
         _refreshing.add(cache_key)
 
     def _work():
-        global _bq_down_until
         try:
             df = client().query(sql).to_dataframe()
-            _bq_down_until = 0.0
+            _bq_mark(cache_key, True)
             _write_parquet_atomic(df, CACHE_DIR / f"{cache_key}.parquet")
         except Exception as e:  # noqa: BLE001 — best-effort; mantém o cache velho
-            _bq_down_until = time.time() + BQ_COOLDOWN
+            _bq_mark(cache_key, False)
             print(f"bq · refresh bg {cache_key} falhou ({e}); mantém cache velho", flush=True)
         finally:
             with _refresh_lock:
@@ -809,6 +911,12 @@ MOTION_HIST_SUFFIX_FROM = "0260416"
 MOTION_HIST_FROM = "2026-04-16"
 
 
+# Nome do parquet de visits num lugar só: o app monta a chave do cache em memória
+# com o mtime DESTE arquivo, e um bump de versão aqui que não chegasse lá
+# desligava a invalidação em silêncio (foi o que aconteceu no v2 → v3).
+VISITS_KEY = "visits_raw_v3"
+
+
 def visits_raw(force_refresh: bool = False) -> pd.DataFrame:
     """Visitas (objeto HubSpot `hubspot_visits`) por vendedor, nível-visita.
     Categoria por LOCAL da visita:
@@ -881,7 +989,7 @@ def visits_raw(force_refresh: bool = False) -> pd.DataFrame:
       FROM (SELECT * FROM by_owner UNION ALL SELECT * FROM by_participant)
     )
     """
-    return query(sql, cache_key="visits_raw_v3", force_refresh=force_refresh)
+    return query(sql, cache_key=VISITS_KEY, force_refresh=force_refresh)
 
 
 def pipeline_total_raw(pipeline: str = SALES_BR, force_refresh: bool = False) -> pd.DataFrame:
@@ -1830,8 +1938,9 @@ def forecast_daily_snapshots(pipeline: str = SALES_BR,
     WHERE pipeline = '{pipeline}'
     GROUP BY 1
     """
-    return _query_raw(sql, cache_key=_pk("fc_daily_snapshots_v2", pipeline), ttl=600,
-                      force_refresh=force_refresh)
+    key = _pk("fc_daily_snapshots_v2", pipeline)
+    return _query_raw(sql, cache_key=key, ttl=600,
+                      force_refresh=_force_once(key, force_refresh))
 
 
 def forecast_daily_series(dias: list[str], lost_from: str | None = None,
