@@ -640,7 +640,9 @@ _Q4_ROSTER_BR = {
     # Leonardo Scopel (Enterprise, direto ao Pedro)
     "Caio Mesquita":                       {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
     "Lucas Allgayer":                      {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
-    "Thomas Talarico":                     {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 0,      "new_logos": 0},
+    # Grafia do HubSpot/BQ é "Thomaz" (com z) — com "Thomas" os deals dele não
+    # casavam com o roster e ficavam fora do time do Leonardo (corrigido 04/11/2026).
+    "Thomaz Talarico":                     {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 0,      "new_logos": 0},
 }
 
 # Trimestre → roster do BRASIL. A ordem não importa; o vigente é o mais recente
@@ -761,10 +763,14 @@ Q3_TEAM_REVENUE_META_ARR_USD = 5_950_000
 # definido mais abaixo) porque isto roda no import.
 Q3_TEAM_REVENUE_META = Q3_TEAM_REVENUE_META_ARR_USD * USD_BRL_RATE / MONTHS_PER_YEAR
 
-# Q4/2026: US$ 6.765.000 ARR — planilha "BP Q4 2026" (aba AE Capacity, abaixo do
-# total da quota Q4: capacity US$ 4.422.263,72 → meta 152,98% dela). Mesma
-# convenção do Q3: ancorada em ARR USD, MRR BRL derivado pelo câmbio.
-Q4_TEAM_REVENUE_META_ARR_USD = 6_765_000
+# Q4/2026: US$ 6.450.000 ARR — corrigida pelo Pedro em 04/11/2026 (antes
+# US$ 6.765.000, da planilha "BP Q4 2026"). Mesma convenção do Q3: ancorada em
+# ARR USD; MRR BRL = ARR × USD_BRL_RATE ÷ 12 = 6.450.000 × 5,05 ÷ 12 =
+# R$ 2.714.375,00. Os Comp. Targets dos líderes saem daqui proporcionais à
+# capacity de cada time (`_comp_targets_from_roster`), e TODAS as telas — inclusive
+# a cobertura histórica (PoP Histórico Q) — leem a meta em tempo de execução: não
+# há meta gravada em snapshot, então o histórico se recalcula sozinho.
+Q4_TEAM_REVENUE_META_ARR_USD = 6_450_000
 
 # Q2/2026: US$ 5.905.000 ARR — passada pelo Pedro em 13/10/2026 ("a quota do Q2
 # era 5905"). O Q2 não tem roster no app: o Comp. Target de cada líder sai da
@@ -1318,7 +1324,11 @@ def _comp_targets_from_roster(q) -> dict:
     return out
 
 
-# Q4/2026 (capacity R$ 1.858.094 · meta US$ 6,765 mi = R$ 2.846.937,50 · fator 1,532181),
+# Q4/2026 — meta corrigida em 04/11/2026 para US$ 6,45 mi ARR = R$ 2.714.375,00 MRR
+# (capacity R$ 1.858.094 · fator 1,460838):
+#   Bernardo 648.368,27 (⊃ João 301.175,20) · Fernando 815.147,81 (⊃ Arthur 335.262,40)
+#   Gustavo 885.649,33 · Leonardo 365.209,59  → topo soma R$ 2.714.375,00.
+# Histórico (meta antiga US$ 6,765 mi = R$ 2.846.937,50 · fator 1,532181),
 # conferido em 08/10/2026:
 #   Bernardo 680.032,77 (⊃ João 197.139,68) · Fernando 854.957,35 (⊃ Arthur 351.635,68)
 #   Gustavo 928.901,97 · Leonardo 383.045,41  → topo soma R$ 2.846.937,50.

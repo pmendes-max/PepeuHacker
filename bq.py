@@ -131,6 +131,8 @@ AE_NAME_ALIASES = {
     # os deals reais caíam fora (leader NULL na curada, fora do ALLOWED_LEADERS):
     # ele aparecia com R$ 0 no Overview tendo R$ 7.482 ganhos no Q3.
     "Diego Peter": "Diego Loures",
+    # Grafia antiga do roster ("Thomas") → nome real no HubSpot ("Thomaz").
+    "Thomas Talarico": "Thomaz Talarico",
     # México — a curada guarda a MESMA pessoa com duas grafias, e as duas têm
     # histórico. Verificado em 24/08/2026 na account_executives_performance:
     # "Viri Garza" (1 trimestre, US$ 2.880) e "Viridiana Garza" (3 trimestres);
