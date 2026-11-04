@@ -317,6 +317,22 @@ DEPARTED_FROM = {
 DEPARTED_FROM_KEEP_WON = {"Arthur Tkotz"}
 
 
+def _keep_won_rows(df: pd.DataFrame) -> pd.Series:
+    """True nas linhas de VENDA FECHADA de quem está em DEPARTED_FROM_KEEP_WON —
+    as que o corte de DEPARTED_FROM tem de poupar. Frame sem indicação de ganho
+    (pipeline/snapshot sem `is_won`/`dealstage`) → nada é poupado."""
+    if df is None or not len(df) or "account_executive" not in df.columns:
+        return pd.Series(False, index=getattr(df, "index", None))
+    m = df["account_executive"].isin(DEPARTED_FROM_KEEP_WON)
+    if "is_won" in df.columns:
+        won = df["is_won"].fillna(False).astype(bool)
+    elif "dealstage" in df.columns:
+        won = df["dealstage"] == "closedwon"
+    else:
+        return pd.Series(False, index=df.index)
+    return m & won
+
+
 def drop_departed_from(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
     """Remove linhas de AEs em DEPARTED_FROM cujo `date_col` >= o cutoff deles,
     preservando o histórico anterior. Linhas sem data (NaT) são mantidas."""
@@ -1118,7 +1134,7 @@ def _apply_roster_current(df: pd.DataFrame, cut_from: date | None = None) -> pd.
     _ref = cut_from or _today()
     _gone = {ae for ae, cut in DEPARTED_FROM.items() if cut <= _ref}
     if _gone:
-        df = df[~df["account_executive"].isin(_gone)]
+        df = df[~df["account_executive"].isin(_gone) | _keep_won_rows(df)]
     return df
 
 
@@ -2768,7 +2784,24 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     df = inject_roster_missing_curated(df)
     mgr = df["account_executive"].isin(NON_AE_USERS)
     df.loc[mgr, "leader"] = df.loc[mgr, "account_executive"]
+    # Quem está em DEPARTED_FROM_KEEP_WON mantém a linha a partir do corte: é nela
+    # que mora o `total_mrr_on_hold_brl` que identifica a venda dele em validação
+    # financeira (sem ela a Crown aparecia como "validado"). Entra como GESTOR
+    # (líder = ele mesmo) e com quota zerada — a quota da curada não vale pra ele.
+    _kw = pd.Series(False, index=df.index)
+    for ae in DEPARTED_FROM_KEEP_WON:
+        cut = DEPARTED_FROM.get(ae)
+        if cut is not None:
+            _kw |= (df["account_executive"] == ae) & (df["quarter"] >= cut)
+    kept = df[_kw].copy()
+    if len(kept):
+        kept["leader"] = kept["account_executive"]
+        for c in ("quota_in_brl", "new_logos_quota"):
+            if c in kept.columns:
+                kept[c] = 0
     df = drop_departed_from(df, "quarter")
+    if len(kept):
+        df = pd.concat([df, kept], ignore_index=True)
     with _DATA_CACHE_LOCK:
         _DATA_CACHE[key] = df
     return df
@@ -3693,7 +3726,13 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     # líder = ele mesmo (sem isso o leader vinha do snapshot cru e o deal caía
     # fora do ALLOWED_LEADERS / do pod dele).
     if DEPARTED_FROM_KEEP_WON:
-        _kw = df["is_won"] & df["account_executive"].isin(DEPARTED_FROM_KEEP_WON)
+        _eff = pd.to_datetime(df["rev_date"], errors="coerce").dt.date
+        _kw = pd.Series(False, index=df.index)
+        for _ae in DEPARTED_FROM_KEEP_WON:
+            _cut = DEPARTED_FROM.get(_ae)
+            if _cut is not None:
+                _kw |= (df["is_won"] & (df["account_executive"] == _ae)
+                        & _eff.notna() & (_eff >= _cut))
         df.loc[_kw, "leader"] = df.loc[_kw, "account_executive"]
         df.loc[_kw, "region"] = "BR"
         df.loc[_kw, "is_manager_sale"] = True
@@ -4686,7 +4725,8 @@ def _overview_page(ov_tab, grain="ae"):
         "pipe_weighted": float(pipe["weighted"].sum()),
         "pipe_deals": int(len(pipe)),
         "projection": float(won["amount"].sum()) + float(pipe["weighted"].sum()),
-        "n_ae": int(won_cal.loc[~won_cal["account_executive"].isin(NON_AE_USERS),
+        "n_ae": int(won_cal.loc[~won_cal["account_executive"].isin(
+                                    _managers_in(_roster_window(from_d, to_d))),
                                 "account_executive"].nunique()),
     }
 
@@ -10293,6 +10333,8 @@ def _wq_realizado(fr, f, force=False) -> pd.DataFrame:
     w = w[~w["account_executive"].isin(DEPARTED_AES)]
     # Quem saiu: o won dele só conta antes do corte (regra de `_get_forecast_deals`).
     for ae, corte in DEPARTED_FROM.items():
+        if ae in DEPARTED_FROM_KEEP_WON:
+            continue                            # venda fechada dele conta (ver a constante)
         w = w[~((w["account_executive"] == ae) & (w["rev_po"] >= pd.Timestamp(corte)))]
     w = w.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
     w["leader"] = _attr_deal_leader(w, "rev_po", _period_leader_map(force=force))
