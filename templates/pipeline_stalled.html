@@ -27,6 +27,7 @@
       </div>
     {% endfor %}
     <div class="stl-summary-cell stl-summary-total" id="stl-total-cell"
+         {% for s in summary_by_stage %} data-tot-{{ s.key }}="{{ s.n_deals }}"{% endfor %}
          data-drill="{{ url_for('pipeline_stalled_deals', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region) }}"
          title="Explodir todos os deals parados">
       <div>
@@ -43,7 +44,7 @@
    selecionado explode. #}
 <div class="panel">
   <h2>Deals parados por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
-  <div class="dchart" data-chart="stl-stack">
+  <div class="dchart" data-chart="stl-stack" data-drill-chips="stages">
     <div class="legend legend-toggle">
       {% for s in summary_by_stage %}
         <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}" style="--c:{{ s.color }};--ci:{{ s.ink or s.color }}">
@@ -61,9 +62,7 @@
                data-name="{{ r.account_executive }}"
                data-drill="{{ url_for('pipeline_stalled_deals', name=r.account_executive, grain=grain) }}"
                data-total="{{ r.total }}"
-               data-qual="{{ r.n_qual }}" data-proj="{{ r.n_proj }}"
-               data-nego="{{ r.n_nego }}" data-cons="{{ r.n_cons }}"
-               data-proc="{{ r.n_proc }}">
+               {% for s in summary_by_stage %} data-{{ s.key }}="{{ r['n_' + s.key] }}"{% endfor %}>
             {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
             <div class="vbar-track" style="--h:{{ h_pct }}%">
               <div class="vbar-val">{{ r.total }}</div>
@@ -103,7 +102,7 @@
       {% endfor %}
     </div>
 
-    <div class="stl-wow-tot">
+    <div class="stl-wow-tot"{% for k, v in (wow_stage_totals or {}).items() %} data-saiu-tot-{{ k }}="{{ v.saiu }}" data-entrou-tot-{{ k }}="{{ v.entrou }}"{% endfor %}>
       <div class="stl-wow-tot-cell stl-wow-pos" style="cursor:pointer"
            data-drill="{{ url_for('pipeline_stalled_wow_deals', grain=grain, dir='saiu', leader=ctx.filters.leader, region=ctx.filters.region) }}"
            title="Explodir os deals que saíram da inatividade">
@@ -135,12 +134,7 @@
           {% set h_pos = (r.saiu   / wow_y_max * 100) if wow_y_max else 0 %}
           {% set h_neg = (r.entrou / wow_y_max * 100) if wow_y_max else 0 %}
           <div class="wow-col" data-net="{{ r.net }}"
-               data-saiu-qual="{{ r.saiu_qual }}" data-saiu-proj="{{ r.saiu_proj }}"
-               data-saiu-nego="{{ r.saiu_nego }}" data-saiu-cons="{{ r.saiu_cons }}"
-               data-saiu-proc="{{ r.saiu_proc }}"
-               data-entrou-qual="{{ r.entrou_qual }}" data-entrou-proj="{{ r.entrou_proj }}"
-               data-entrou-nego="{{ r.entrou_nego }}" data-entrou-cons="{{ r.entrou_cons }}"
-               data-entrou-proc="{{ r.entrou_proc }}">
+               {% for s in summary_by_stage %} data-saiu-{{ s.key }}="{{ r['saiu_' + s.key] }}" data-entrou-{{ s.key }}="{{ r['entrou_' + s.key] }}"{% endfor %}>
             {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
             <div class="wow-pos-area">
               <div class="wow-seg stl-wow-seg-saiu" style="height:{{ h_pos }}%"
@@ -212,7 +206,7 @@
 <script>
 (function(){
   "use strict";
-  const KEYS = ['qual','proj','nego','cons','proc'];
+  const KEYS = {{ summary_by_stage|map(attribute='key')|list|tojson }};
   const fmt = n => Number(n||0).toLocaleString('pt-BR');
 
   // Injeta/atualiza `stages=` na URL do drill conforme a seleção dos chips —
@@ -247,7 +241,11 @@
       b.classList.toggle('is-empty', t <= 0);
       setDrill(b, active, all);
     });
-    const sum = totals.reduce((a,b) => a+b, 0);
+    // Total por ESTÁGIO (contagem de deals do servidor), não soma das barras: em
+    // Líderes o diretor engloba o gerente, e na Inatividade o deal de gestor
+    // está no total sem ter barra.
+    const totCell = document.getElementById('stl-total-cell');
+    const sum = active.reduce((s,k) => s + (+(totCell && totCell.getAttribute('data-tot-'+k)) || 0), 0);
     const numEl = document.getElementById('stl-total-num'); if (numEl) numEl.textContent = fmt(sum);
     setDrill(document.getElementById('stl-total-cell'), active, all);
   }
@@ -278,7 +276,9 @@
                nn.classList.toggle('is-pos', net >= 0); nn.classList.toggle('is-neg', net < 0); }
       c.dataset.net = net;
     });
-    const tSaiu = data.reduce((s,d) => s+d.saiu, 0), tEnt = data.reduce((s,d) => s+d.entrou, 0);
+    const tw = wow.querySelector('.stl-wow-tot');
+    const tSaiu = active.reduce((s,k) => s + (+(tw && tw.getAttribute('data-saiu-tot-'+k)) || 0), 0);
+    const tEnt  = active.reduce((s,k) => s + (+(tw && tw.getAttribute('data-entrou-tot-'+k)) || 0), 0);
     const net = tSaiu - tEnt;
     const eS = document.getElementById('stl-wow-saiu');   if (eS) eS.textContent = '+' + fmt(tSaiu);
     const eE = document.getElementById('stl-wow-entrou'); if (eE) eE.textContent = '−' + fmt(tEnt);

@@ -124,6 +124,8 @@
     elRows.innerHTML = rs.map(r => '<tr>' + cols.map(c => {
       const cls = (isNum(c.type)||c.align==='right') ? 'dd-num' : (c.wrap ? 'dd-wrap' : '');
       let inner = fmtCell(r[c.key], c.type);
+      // Nome de deal/pessoa não se traduz (o tradutor de idioma pula data-no-i18n).
+      const _ni = (c.link || ['ae', 'leader', 'deal_name', 'name', 'qual_owner'].includes(c.key)) ? ' data-no-i18n' : '';
       if (c.link && r[c.link]) {
         inner = `<a href="${esc(r[c.link])}" target="_blank" rel="noopener" class="dd-link">${inner}</a>`;
       }
@@ -132,7 +134,7 @@
       if (c.drill && r[c.drill]) {
         inner = `<span class="dd-link" data-drill="${esc(r[c.drill])}">${inner}</span>`;
       }
-      return `<td class="${cls}">${inner}</td>`;
+      return `<td class="${cls}"${_ni}>${inner}</td>`;
     }).join('') + '</tr>').join('');
     elEmpty.hidden = rs.length > 0;
   }
@@ -160,18 +162,61 @@
   }
   function close(){ modal.hidden = true; document.body.style.overflow=''; }
 
+  // Chips de legenda (filtro da página). Um gráfico cujos chips também devem
+  // recortar a explosão declara no contêiner `data-drill-chips="<parâmetro>"`:
+  // com algum chip desligado, o drill leva só os valores dos chips LIGADOS
+  // (cruzados com o que o próprio link já pedia). Cada chip diz o seu valor em
+  // `data-drill-val` (vírgula = vários); sem ele, vale o `data-ch`. Chip que
+  // não é série de dado (linha de meta) leva `data-drill-skip`. Nada ligado →
+  // valor impossível, e a rota devolve lista vazia em vez de "tudo".
+  // Clicar num segmento (filho com `data-ch`, sem drill próprio) explode só ele.
+  // O Pipeline Total tem mecânica própria (cada segmento já tem drill).
+  function chipVals(btn){
+    return (btn.dataset.drillVal || btn.dataset.ch || '').split(',').map(x => x.trim()).filter(Boolean);
+  }
+  function withChips(el, url, target){
+    const box = el.closest('[data-drill-chips]');
+    if (!box) return url;
+    const chips = Array.from(box.querySelectorAll('.leg-toggle[data-ch]'))
+                       .filter(b => !('drillSkip' in b.dataset));
+    const param = box.dataset.drillChips;
+    let vals = null;
+    // Clique num SEGMENTO sem drill próprio (o pedaço Decision de uma barra
+    // empilhada): a explosão é só a série dele, não a barra inteira.
+    const seg = target && target.closest ? target.closest('[data-ch]') : null;
+    if (seg && seg !== el && el.contains(seg) && !seg.classList.contains('leg-toggle')) {
+      const chip = chips.find(b => b.dataset.ch === seg.dataset.ch);
+      if (chip) vals = chipVals(chip);
+    }
+    if (vals === null) {
+      const on = chips.filter(b => b.classList.contains('is-on'));
+      if (!chips.length || on.length === chips.length) return url;
+      vals = [].concat(...on.map(chipVals));
+    }
+    const u = new URL(url, location.origin);
+    const cur = u.searchParams.get(param);
+    if (cur) {
+      const pedido = new Set(cur.split(',').map(x => x.trim()));
+      vals = vals.filter(v => pedido.has(v));
+    }
+    u.searchParams.set(param, vals.length ? Array.from(new Set(vals)).join(',') : '__nenhum__');
+    return u.pathname + u.search;
+  }
+  window.__drillWithChips = withChips;
+
   // Delegação: qualquer elemento com data-drill abre o modal (sobrevive a re-render).
   document.addEventListener('click', e => {
     const el = e.target.closest('[data-drill]');
     if (el && el.getAttribute('data-drill')) {
       e.preventDefault();
-      open(el.getAttribute('data-drill'), el.getAttribute('data-drill-title'));
+      open(withChips(el, el.getAttribute('data-drill'), e.target), el.getAttribute('data-drill-title'));
     }
   });
   function exportCsv(){
     if (!cols.length) return;
     const linkCol = cols.find(c => c.link);
-    const headers = cols.map(c => c.label).concat(linkCol ? ['Link HubSpot'] : []);
+    const _tr = window.__t || (x => x);   // CSV no idioma da tela
+    const headers = cols.map(c => _tr(c.label)).concat(linkCol ? ['Link HubSpot'] : []);
     const arr = window.__MONEY__ && window.__MONEY__.mode === 'arr';
     const conv = v => arr ? Number(v||0) * window.__MONEY__.months / window.__MONEY__.rate : Number(v||0);
     const raw = (v,t) => (t==='money'||t==='money_signed') ? (v==null?'':Math.round(conv(v)))

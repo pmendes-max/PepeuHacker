@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block title %}Histórico do Forecast · {{ q_label }} · pepeuhacker{% endblock %}
+
+{% set pessoa = 'Líder' if grain == 'leader' else 'AE' %}
+
+{% block content %}
+{% from "_fc_series.html" import fc_series %}
+<h1>Histórico do Forecast · {{ q_label }}</h1>
+<div class="page-sub">
+  <b>{{ n_pontos }} domingo{{ 's' if n_pontos != 1 else '' }} medido{{ 's' if n_pontos != 1 else '' }}</b>
+  · {{ first_label }} → {{ last_label }} ·
+  o forecast com close date em {{ q_range }}, como ele era em cada domingo, nos
+  <b>dois modelos</b> · cada ponto é a cópia que o BI guardou daquele dia
+  (fechamento por volta das 17h BRT)
+</div>
+
+{% if weeks < 1 %}
+<div class="empty-state">
+  O quarter começou agora — ainda não há nenhum domingo fechado pra comparar.
+  A série aparece a partir do 1º domingo do trimestre.
+</div>
+{% else %}
+
+{# ---- Qualidade do dado: o que é foto e o que falta. Substituiu as duas
+   caixas de desculpa (bruto-não-ponderado + close date congelado): a fonte
+   agora é a cópia diária que o BI guarda da curated, então cada domingo tem o
+   estágio, o amount, o close date E a forecast category que valiam NO DIA. ---- #}
+{% if faltando %}
+<div class="fc-warn">
+  <b>{{ faltando|length }} domingo{{ 's' if faltando|length != 1 else '' }} sem foto:</b>
+  {{ faltando|join(' · ') }}. A linha pula esses pontos em vez de emendar por cima —
+  as cópias diárias do BI começam em <b>23/03/2026</b>.
+</div>
+{% endif %}
+
+{% if sem_serie %}
+{# Nenhum domingo da janela tem foto: sem série, sem gráfico. Melhor dizer isso
+   do que desenhar quatro painéis de R$ 0 — que é o que a tela fazia antes de
+   existir a checagem. #}
+<div class="empty-state">
+  Não há foto de nenhum domingo deste trimestre, então a série não existe.
+  As cópias diárias do BI cobrem de <b>23/03/2026</b> em diante — escolha um
+  trimestre dentro dessa janela.
+</div>
+{% else %}
+{% include "_chart_toggles.html" %}
+
+{# ---- KPIs: os dois modelos contra a meta, e o realizado ---- #}
+<div class="kpis-4">
+  <div class="kpi acc">
+    <div class="kpi-l">Projeção · Modelo Analytics <span class="kpi-q">· {{ pt_fim_label }}</span></div>
+    <div class="kpi-v">{{ proj_model_now|brl }}</div>
+    <div class="kpi-s">
+      {% if meta_ok and att_model is not none %}<b>{{ (att_model*100)|round|int }}%</b> da meta ·{% endif %}
+      de {{ proj_model_ini|brl }} em {{ pt_ini_label }}
+      {% set _d = proj_model_now - proj_model_ini %}
+      · {{ '+' if _d >= 0 else '−' }}{{ (_d if _d >= 0 else -_d)|brl }} no quarter
+      {% if wow_model is not none %}· <b>{{ '+' if wow_model >= 0 else '−' }}{{ (wow_model if wow_model >= 0 else -wow_model)|brl }}</b> na última semana{% endif %}
+    </div>
+  </div>
+  <div class="kpi" style="--c:#7C3AED">
+    <div class="kpi-l">Projeção · Modelo dos diretores <span class="kpi-q">· {{ pt_fim_label }}</span></div>
+    <div class="kpi-v">{{ proj_dir_now|brl }}</div>
+    <div class="kpi-s">
+      {% if meta_ok and att_dir is not none %}<b>{{ (att_dir*100)|round|int }}%</b> da meta ·{% endif %}
+      de {{ proj_dir_ini|brl }} em {{ pt_ini_label }}
+      {% set _dd = proj_dir_now - proj_dir_ini %}
+      · {{ '+' if _dd >= 0 else '−' }}{{ (_dd if _dd >= 0 else -_dd)|brl }} no quarter
+      {% if wow_dir is not none %}· <b>{{ '+' if wow_dir >= 0 else '−' }}{{ (wow_dir if wow_dir >= 0 else -wow_dir)|brl }}</b> na última semana{% endif %}
+    </div>
+  </div>
+  <div class="kpi warn">
+    <div class="kpi-l">Meta do período</div>
+    <div class="kpi-v">{% if meta_ok %}{{ meta_team|brl }}{% else %}—{% endif %}</div>
+    <div class="kpi-s">
+      {% if meta_ok %}Comp. Target dos diretores no recorte
+      {% else %}o Comp. Target é do trimestre corrente — não vale como meta de um
+        trimestre passado, então as séries aparecem sem linha de meta{% endif %}
+    </div>
+  </div>
+  <div class="kpi grn">
+    <div class="kpi-l">Realizado · PO Won</div>
+    <div class="kpi-v">{{ done_now|brl }}</div>
+    <div class="kpi-s">acumulado no quarter · por data de validação{% if rev_note %} · {{ rev_note }}{% endif %}</div>
+  </div>
+</div>
+
+{# ============ 1) MODELO ANALYTICS ============ #}
+{{ fc_series(chart_model, small_model,
+     'Modelo Analytics ao longo do quarter',
+     'Done + Forecast ponderado pela conversão histórica (segmento × estágio × tipo)',
+     '#2563EB',
+     nota='<b>Não depende de ninguém preencher nada:</b> o peso sai da matriz de conversão
+            histórica, então esta série mede movimento de pipeline — deal que entrou, avançou
+            de estágio, cresceu de valor ou escorregou de trimestre.',
+     pessoa='líder') }}
+
+{# ============ 2) MODELO DOS DIRETORES (25% → 100%) ============ #}
+{{ fc_series(chart_dir, small_dir,
+     'Modelo dos diretores (25% → 100%) ao longo do quarter',
+     'Done + Forecast ponderado pela forecast category do HubSpot, já com fator de correção de '
+     ~ ((1-dir_factor)*100)|round|int ~ '%',
+     '#7C3AED',
+     nota=nota_dir,
+     pessoa='líder') }}
+
+{# ============ 3) O que mexeu o forecast, semana a semana ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>O que mexeu o forecast <span class="h2-sub">· movimento semanal no peso do Modelo Analytics</span></h2>
+    <span class="ph" style="margin:0">clique num segmento pra explodir os deals</span>
+  </div>
+  {% if ponte_ok %}
+  <div class="hist-bridge">
+    <span class="hb-lbl">Do 1º ao último domingo:</span>
+    {{ level0|brl }}
+    <span>{{ '+' if bridge.net >= 0 else '−' }} saldo {{ (bridge.net if bridge.net >= 0 else -bridge.net)|brl }}</span>
+    {% if bridge.won %}<span>− saiu ganho {{ (-bridge.won)|brl }}</span>{% endif %}
+    {% if bridge.residuo|round(0) != 0 %}
+      <span class="hb-res" title="Nesta tela a ponte fecha por construção. Resíduo diferente de zero é bug — não dado.">
+        {{ '+' if bridge.residuo >= 0 else '−' }} resíduo {{ (bridge.residuo if bridge.residuo >= 0 else -bridge.residuo)|brl }}
+      </span>
+    {% endif %}
+    <b>= {{ level_end|brl }}</b>
+    <span style="opacity:.75">(forecast aberto do modelo, sem o Done)</span>
+  </div>
+  {% endif %}
+  <div class="dchart" data-chart="hist-forecast" data-drill-chips="cat">
+    <div class="legend legend-toggle">
+      {% for key, label, cor, ink in [
+        ('novo',     'Entrou no forecast', '#15803d', '#15803d'),
+        ('cresceu',  'Ganhou peso/valor',  '#86efac', '#047857'),
+        ('encolheu', 'Perdeu peso/valor',  '#fdba74', '#B45309'),
+        ('lost',     'Saiu do forecast',   '#dc2626', '#B91C1C'),
+      ] %}
+        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}" style="--c:{{ cor }};--ci:{{ ink }}">
+          <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
+        </button>
+      {% endfor %}
+      <span class="hist-leg-net"><span class="hist-leg-tick"></span>saldo da semana</span>
+    </div>
+
+    {% if wk_rows %}
+    <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
+      <svg viewBox="0 0 {{ bars.w }} {{ bars.h }}" width="{{ bars.w }}" height="{{ bars.h }}"
+           style="min-width:100%;display:block" font-family="inherit">
+        {% for t in bars.yL %}
+          <line x1="{{ bars.left }}" y1="{{ t.y }}" x2="{{ bars.right_x }}" y2="{{ t.y }}"
+                stroke="var(--border-soft)" stroke-width="1"/>
+          <text x="{{ bars.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
+                fill="var(--muted)">{{ t.label }}</text>
+        {% endfor %}
+        <line x1="{{ bars.left }}" y1="{{ bars.zero_y }}" x2="{{ bars.right_x }}" y2="{{ bars.zero_y }}"
+              stroke="var(--fg)" stroke-width="1.5"/>
+        {% for c in bars.cols %}
+          <g class="hist-col">
+            <rect x="{{ c.zx }}" y="{{ bars.top }}" width="{{ bars.step }}"
+                  height="{{ bars.plot_h }}" fill="#2563EB" fill-opacity="0"
+                  pointer-events="all" style="cursor:pointer" data-drill="{{ c.url }}">
+              <title>{{ c.label }} — saldo {{ '+' if c.net >= 0 else '−' }}{{ c.net_label }}</title>
+            </rect>
+            {% for s in c.segs %}
+              <rect class="hist-seg" data-ch="{{ s.ch }}" x="{{ s.x }}" y="{{ s.y }}"
+                    width="{{ s.w }}" height="{{ s.h }}" fill="{{ s.fill }}"
+                    style="cursor:pointer" data-drill="{{ s.url }}">
+                <title>{{ c.label }} · {{ s.amt }} ({{ s.deals }} deals)</title>
+              </rect>
+            {% endfor %}
+            <line class="hist-net" x1="{{ c.cx - bars.bw / 2 - 3 }}" y1="{{ c.net_y }}"
+                  x2="{{ c.cx + bars.bw / 2 + 3 }}" y2="{{ c.net_y }}"
+                  stroke="var(--fg)" stroke-width="2.5" stroke-linecap="round"/>
+            <text x="{{ c.cx }}" y="{{ (c.top_y - 7) if c.net >= 0 else (c.bot_y + 15) }}"
+                  text-anchor="middle" font-size="11" font-weight="800"
+                  fill="{{ '#15803d' if c.net >= 0 else '#B91C1C' }}" paint-order="stroke"
+                  stroke="var(--surface)" stroke-width="3.5"
+                  >{{ '+' if c.net >= 0 else '−' }}{{ c.net_label }}</text>
+            <text x="{{ c.cx }}" y="{{ bars.base_y + 22 }}" text-anchor="end" font-size="11"
+                  fill="var(--fg-soft)"
+                  transform="rotate(-40 {{ c.cx }} {{ bars.base_y + 22 }})">{{ c.label }}</text>
+          </g>
+        {% endfor %}
+      </svg>
+    </div>
+    <div class="hm-note">
+      <b>Saiu ganho</b> não é o mesmo número do <b>Realizado</b> do card acima: aqui o deal sai
+      pelo <i>peso</i> que tinha no modelo (ex.: 75% do amount) e entra no Done pelo amount
+      <i>cheio</i>. É por isso que a projeção sobe quando um deal fecha — o modelo o estava
+      descontando.
+    </div>
+    {% else %}
+    <div class="empty-state">Sem movimento no forecast deste quarter.</div>
+    {% endif %}
+  </div>
+</div>
+
+{# ============ 4) Matriz semana × pessoa ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Matriz semana × {{ pessoa }} <span class="h2-sub">· saldo de cada célula, no peso do modelo</span></h2>
+    <span class="ph" style="margin:0">cor = intensidade do saldo · clique numa célula pra explodir</span>
+  </div>
+  {% if people %}
+  <div class="rank-wrap" style="overflow-x:auto">
+    <table class="hm">
+      <thead>
+        <tr>
+          <th class="hm-name">{{ pessoa }}</th>
+          {% for r in wk_rows %}<th class="hm-wk" title="{{ r.from_label }} → {{ r.label }}">{{ r.label }}</th>{% endfor %}
+          <th class="hm-tot">Acumulado</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in people %}
+        <tr>
+          <td class="hm-name" title="{{ p.name }}">{{ p.short }}</td>
+          {# A coluna k da matriz é a semana wk_rows[k], e não `loop.index`: com
+             semana não medível recortada, os dois deixaram de coincidir. #}
+          {% for v in p.weekly %}
+            {% set a = (v / hm_span) if hm_span else 0 %}
+            {% set sem = wk_rows[loop.index0] %}
+            <td class="hm-c {% if v > 0 %}is-pos{% elif v < 0 %}is-neg{% endif %}"
+                style="--a:{{ '%.3f'|format((a if a >= 0 else -a)) }}"
+                data-drill="{{ drill(sem.idx, 'novo,cresceu,encolheu,lost', p.name) }}"
+                title="{{ p.name }} · semana que fechou em {{ sem.label }}">
+              {% if v %}{{ '+' if v > 0 else '−' }}{{ (v if v > 0 else -v)|brl }}{% else %}·{% endif %}
+            </td>
+          {% endfor %}
+          <td class="hm-tot {% if p.total >= 0 %}is-pos{% else %}is-neg{% endif %}">
+            {{ '+' if p.total >= 0 else '−' }}{{ (p.total if p.total >= 0 else -p.total)|brl }}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if grain == 'leader' %}
+  <div class="hm-note">
+    A soma da coluna não fecha com o total do time de propósito: no grão de líder
+    cada deal conta no gerente <b>e</b> no diretor dele, a mesma convenção das
+    outras telas de Leaders.
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+
+<style>
+  .fc-warn{margin:0 0 16px;padding:11px 15px;border-radius:10px;
+    font-size:12.5px;line-height:1.65;border:1px solid #F59E0B55;
+    background:color-mix(in srgb,#F59E0B 7%,transparent);color:var(--muted)}
+  .fc-warn b{color:var(--fg)}
+  /* Swatch da meta: tracejado laranja, o mesmo código visual do rank_chart. */
+  .fc-sw-goal{background:repeating-linear-gradient(90deg,#B45309 0 5px,transparent 5px 9px);
+    height:3px;border-radius:0}
+  .fc-sm-head{margin:22px 0 12px;padding-top:16px;border-top:1px solid var(--border);
+    font-size:12.5px;color:var(--muted)}
+  .fc-sm-head b{color:var(--fg)}
+  .sm-foot .is-pos{color:#15803d;font-weight:700}
+  .sm-foot .is-neg{color:#dc2626;font-weight:700}
+</style>
+{% endif %}{# sem_serie #}
+{% endif %}{# weeks < 1 #}
+{% include "_hist_panels.html" %}
+{% endblock %}

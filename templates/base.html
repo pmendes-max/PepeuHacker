@@ -1,9 +1,19 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+{% set _lang = ui_lang() %}
+<html lang="{{ IDIOMA_HTML[_lang] }}"{% if _lang != 'pt' %} class="i18n-pend"{% endif %}>
 <head>
 <meta charset="UTF-8">
 <title>{% block title %}pepeuhacker{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_v('style.css') }}">
+{# Idioma ≠ PT: o dicionário carrega antes do corpo e o tradutor roda assim que
+   o HTML termina de chegar; até lá o corpo fica invisível (sem piscar português).
+   i18n.js libera sozinho em 1,5 s se algo falhar. #}
+{% if _lang != 'pt' %}
+<style>html.i18n-pend body{visibility:hidden}</style>
+<script>window.__I18N_NOMES__ = {{ i18n_nomes()|tojson }};</script>
+<script src="{{ url_for('static', filename='i18n/' ~ _lang ~ '.js') }}?v={{ asset_v('i18n/' ~ _lang ~ '.js') }}"></script>
+<script src="{{ url_for('static', filename='i18n.js') }}?v={{ asset_v('i18n.js') }}" defer></script>
+{% endif %}
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><rect width=%2224%22 height=%2224%22 rx=%226%22 fill=%22%232563EB%22/><path d=%22M5 8h14v3h-5.5v8h-3v-8H5z%22 fill=%22white%22/></svg>">
 </head>
 <body>
@@ -29,9 +39,28 @@
       <a href="{{ ctx.view_url_sdr }}" class="dash-tab dash-sdr {% if ctx.view == 'sdr' %}active{% endif %}">
         <div class="dash-name">Pré Sales BR</div>
       </a>
+      <a href="{{ ctx.view_url_mx }}" class="dash-tab dash-mx {% if ctx.view == 'mx' %}active{% endif %}">
+        <div class="dash-name">Sales MX</div>
+      </a>
+    </div>
+    {# Idioma da interface — vale pro site inteiro (cookie de 1 ano). #}
+    <div class="lang-switch" data-no-i18n role="group" aria-label="Idioma">
+      {% for code, lbl in IDIOMAS %}
+        <button type="button" class="lang-opt{% if _lang == code %} is-on{% endif %}" data-lang="{{ code }}"
+                title="{{ {'pt': 'Português (Brasil)', 'es': 'Español', 'en': 'English'}[code] }}">{{ lbl }}</button>
+      {% endfor %}
     </div>
   </div>
 </div>
+<script>
+  document.querySelectorAll('.lang-switch .lang-opt').forEach(function (b) {
+    b.addEventListener('click', function () {
+      if (b.classList.contains('is-on')) return;
+      document.cookie = 'lang=' + b.dataset.lang + '; path=/; max-age=31536000; SameSite=Lax';
+      location.reload();
+    });
+  });
+</script>
 
 {# TIER 2 — páginas dentro do dashboard #}
 <div class="subnav">
@@ -45,6 +74,14 @@
       {% elif ctx.view == 'sdr' %}
         <a href="{{ url_for('sdr_effort', **ctx.filters) }}" class="{% if ctx.current_path == '/sdr/effort' %}active{% endif %}">Esforço</a>
         <span class="nav-coming">+ outras telas em breve</span>
+      {% elif ctx.view == 'mx' %}
+        {# Espelho do AE BR (12/10/2026): as MESMAS abas e sub-abas, servidas sob
+           /mx/. As telas antigas próprias do México (Resumo MX etc.) seguem no ar
+           por endereço, mas saíram do menu. #}
+        <a href="{{ url_for('mx_overview_sales', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/mx/overview') %}active{% endif %}">Overview</a>
+        <a href="{{ url_for('mx_demand', **ctx.filters) }}" class="{% if ctx.current_path == '/mx/demand' %}active{% endif %}">Geração de Demanda</a>
+        <a href="{{ url_for('mx_pipeline_cob', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/mx/pipeline') %}active{% endif %}">Pipeline</a>
+        <a href="{{ url_for('mx_forecast_full', **ctx.filters) }}" class="{% if ctx.current_path.startswith('/mx/forecast') %}active{% endif %}">Forecast</a>
       {% else %}
         <a href="{{ url_for('overview', **ctx.filters) }}"   class="{% if ctx.current_path.startswith('/overview') %}active{% endif %}">Overview</a>
         <a href="{{ url_for('demand', **ctx.filters) }}"     class="{% if ctx.current_path == '/demand' %}active{% endif %}">Geração de Demanda</a>
@@ -55,8 +92,49 @@
   </div>
 </div>
 
+{# Sub-tabs do México — as mesmas do AE BR, menos Sales Overtime (pedido do
+   Pedro) e mais DoD/WoW, que no BR moram no Leaders (o México tem uma visão só). #}
+{% if ctx.view == 'mx' %}
+{% set p = ctx.current_path %}
+{% if p.startswith('/mx/overview') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('mx_overview_sales', **ctx.filters) }}" class="{% if p == '/mx/overview/sales' %}active{% endif %}">Sales Overview</a>
+    <a href="{{ url_for('mx_overview_ae', **ctx.filters) }}" class="{% if p == '/mx/overview/ae' %}active{% endif %}">AE Overview</a>
+  </div>
+</div>
+{% elif p.startswith('/mx/pipeline') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('mx_pipeline_cob', **ctx.filters) }}"      class="{% if p == '/mx/pipeline/cobertura' %}active{% endif %}">Cobertura</a>
+    <a href="{{ url_for('mx_pipeline_total', **ctx.filters) }}"    class="{% if p == '/mx/pipeline/total' %}active{% endif %}">Pipeline Total</a>
+    <a href="{{ url_for('mx_wow_early', **ctx.filters) }}"         class="{% if p == '/mx/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
+    <a href="{{ url_for('mx_wow_late', **ctx.filters) }}"          class="{% if p == '/mx/pipeline/wow/late' %}active{% endif %}">PoP Late</a>
+    <a href="{{ url_for('mx_wow_history', **ctx.filters) }}"       class="{% if p == '/mx/pipeline/wow/history' %}active{% endif %}">PoP Histórico</a>
+    <a href="{{ url_for('mx_pipeline_dod', **ctx.filters) }}"      class="{% if p == '/mx/pipeline/dod' %}active{% endif %}" title="Day over day: para onde foi o pipe de cada estágio entre duas meias-noites">DoD</a>
+    <a href="{{ url_for('mx_pipeline_wow', **ctx.filters) }}"      class="{% if p == '/mx/pipeline/wow' %}active{% endif %}" title="Week over week: para onde foi o pipe de cada estágio entre duas segundas-feiras 00h">WoW</a>
+    <a href="{{ url_for('mx_pipeline_stalled', **ctx.filters) }}"  class="{% if p == '/mx/pipeline/stalled' %}active{% endif %}">Stale</a>
+    <a href="{{ url_for('mx_pipeline_activity', **ctx.filters) }}" class="{% if p == '/mx/pipeline/stalled-activity' %}active{% endif %}">Inatividade</a>
+    <a href="{{ url_for('mx_pipeline_legal', **ctx.filters) }}"    class="{% if p == '/mx/pipeline/legal' %}active{% endif %}">Legal</a>
+    <a href="{{ url_for('mx_pipeline_funnel', **ctx.filters) }}"   class="{% if p == '/mx/pipeline/funnel' %}active{% endif %}">Funil</a>
+    <a href="{{ url_for('mx_pipeline_funnel2', **ctx.filters) }}"  class="{% if p == '/mx/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('mx_pipeline_visits', **ctx.filters) }}"   class="{% if p == '/mx/pipeline/visits' %}active{% endif %}">Visitas</a>
+  </div>
+</div>
+{% elif p.startswith('/mx/forecast') %}
+<div class="pipe-subtabs">
+  <div class="pipe-subtabs-inner">
+    <a href="{{ url_for('mx_forecast_full', **ctx.filters) }}"    class="{% if p == '/mx/forecast/full' %}active{% endif %}">Forecast</a>
+    <a href="{{ url_for('mx_forecast_model', **ctx.filters) }}"   class="{% if p == '/mx/forecast/model' %}active{% endif %}">Modelo Analytics</a>
+    <a href="{{ url_for('mx_forecast_wow', **ctx.filters) }}"     class="{% if p == '/mx/forecast/wow' %}active{% endif %}">WoW</a>
+    <a href="{{ url_for('mx_forecast_dod', **ctx.filters) }}"     class="{% if p == '/mx/forecast/dod' %}active{% endif %}" title="Day over day: meia-noite de hoje contra a de ontem">DoD</a>
+    <a href="{{ url_for('mx_forecast_history', **ctx.filters) }}" class="{% if p == '/mx/forecast/history' %}active{% endif %}">Histórico</a>
+  </div>
+</div>
+{% endif %}
+
 {# Sub-tabs da Overview — AE (Sales · AE) e Leaders (Sales · Leaders) #}
-{% if ctx.current_path and ctx.current_path.startswith('/overview') %}
+{% elif ctx.current_path and ctx.current_path.startswith('/overview') %}
 <div class="pipe-subtabs">
   <div class="pipe-subtabs-inner">
     <a href="{{ url_for('overview', **ctx.filters) }}"    class="{% if ctx.current_path == '/overview' %}active{% endif %}">Sales Overview</a>
@@ -82,8 +160,11 @@
     <a href="{{ url_for('pipeline_total', **ctx.filters) }}"       class="{% if ctx.current_path == '/pipeline/total' %}active{% endif %}">Pipeline Total</a>
     <a href="{{ url_for('pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
     <a href="{{ url_for('pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
+    <a href="{{ url_for('pipeline_wow_history', **ctx.filters) }}" class="{% if ctx.current_path == '/pipeline/wow/history' %}active{% endif %}">PoP Histórico</a>
+    <a href="{{ url_for('pipeline_wow_quarter', **ctx.filters) }}" class="{% if ctx.current_path == '/pipeline/wow/quarter' %}active{% endif %}" title="PoP Histórico só com o pipe do trimestre vigente: close date dentro do trimestre de cada semana">PoP Histórico Q</a>
     <a href="{{ url_for('pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled'   %}active{% endif %}">Stale</a>
     <a href="{{ url_for('pipeline_activity',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled-activity'   %}active{% endif %}">Inatividade</a>
+    <a href="{{ url_for('pipeline_legal',     **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/legal'     %}active{% endif %}">Legal</a>
     <a href="{{ url_for('pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel'    %}active{% endif %}">Funil</a>
     <a href="{{ url_for('pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
     <a href="{{ url_for('pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/visits'    %}active{% endif %}">Visitas</a>
@@ -96,8 +177,13 @@
     <a href="{{ url_for('leaders_pipeline_total', **ctx.filters) }}"       class="{% if ctx.current_path == '/leaders/pipeline/total' %}active{% endif %}">Pipeline Total</a>
     <a href="{{ url_for('leaders_pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
     <a href="{{ url_for('leaders_pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
+    <a href="{{ url_for('leaders_pipeline_wow_history', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow/history' %}active{% endif %}">PoP Histórico</a>
+    <a href="{{ url_for('leaders_pipeline_wow_quarter', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow/quarter' %}active{% endif %}" title="PoP Histórico só com o pipe do trimestre vigente: close date dentro do trimestre de cada semana">PoP Histórico Q</a>
+    <a href="{{ url_for('leaders_pipeline_dod', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/dod' %}active{% endif %}" title="Day over day: para onde foi o pipe de cada estágio entre duas meias-noites">DoD</a>
+    <a href="{{ url_for('leaders_pipeline_wow', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow' %}active{% endif %}" title="Week over week: para onde foi o pipe de cada estágio entre duas segundas-feiras 00h">WoW</a>
     <a href="{{ url_for('leaders_pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/stalled'   %}active{% endif %}">Stale</a>
     <a href="{{ url_for('leaders_pipeline_activity',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/stalled-activity'   %}active{% endif %}">Inatividade</a>
+    <a href="{{ url_for('leaders_pipeline_legal',     **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/legal'     %}active{% endif %}">Legal</a>
     <a href="{{ url_for('leaders_pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel'    %}active{% endif %}">Funil</a>
     <a href="{{ url_for('leaders_pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
     <a href="{{ url_for('leaders_pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/visits'    %}active{% endif %}">Visitas</a>
@@ -105,12 +191,14 @@
 </div>
 {% endif %}
 
-{# Sub-tabs do Forecast (Forecast · Modelo Analytics) — AE e Leaders #}
+{# Sub-tabs do Forecast (Forecast · Modelo Analytics · WoW · Histórico) — AE e Leaders #}
 {% if ctx.current_path and ctx.current_path.startswith('/forecast') %}
 <div class="pipe-subtabs">
   <div class="pipe-subtabs-inner">
     <a href="{{ url_for('forecast', **ctx.filters) }}"       class="{% if ctx.current_path == '/forecast' %}active{% endif %}">Forecast</a>
     <a href="{{ url_for('forecast_model', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/model' %}active{% endif %}">Modelo Analytics</a>
+    <a href="{{ url_for('forecast_wow', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/wow' %}active{% endif %}">WoW</a>
+    <a href="{{ url_for('forecast_history', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/history' %}active{% endif %}">Histórico</a>
   </div>
 </div>
 {% elif ctx.current_path and ctx.current_path.startswith('/leaders/forecast') %}
@@ -118,6 +206,9 @@
   <div class="pipe-subtabs-inner">
     <a href="{{ url_for('leaders_forecast', **ctx.filters) }}"       class="{% if ctx.current_path == '/leaders/forecast' %}active{% endif %}">Forecast</a>
     <a href="{{ url_for('leaders_forecast_model', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/forecast/model' %}active{% endif %}">Modelo Analytics</a>
+    <a href="{{ url_for('leaders_forecast_wow', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/forecast/wow' %}active{% endif %}">WoW</a>
+    <a href="{{ url_for('leaders_forecast_dod', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/forecast/dod' %}active{% endif %}" title="Day over day: meia-noite de hoje contra a de ontem">DoD</a>
+    <a href="{{ url_for('leaders_forecast_history', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/forecast/history' %}active{% endif %}">Histórico</a>
   </div>
 </div>
 {% endif %}
@@ -132,10 +223,18 @@
       <input type="hidden" name="money" value="{{ ctx.filters.money }}">
       {# Carrega adiante os parâmetros que pertencem aos GRÁFICOS (janela de
          trimestres, pares de conversão, etc.). Sem isso, mexer em Líder/AE
-         zeraria o recorte do gráfico — some agora que tudo auto-aplica. #}
+         zeraria o recorte do gráfico — some agora que tudo auto-aplica.
+         `_own` = o que o FORM já emite por conta própria. Chave que está nos
+         dois lugares é enviada DUAS vezes no submit (`?prod=antigo&prod=novo`) e
+         o Flask lê a primeira: o filtro congela no primeiro valor escolhido e
+         nem o "todos" limpa. Os selects por aba saem de `ctx.extra_filters` em
+         vez de lista fixa justamente pra dimensão nova não reabrir esse bug —
+         foi o que aconteceu com Product. Só o que o form NÃO renderiza (cdate,
+         by, env, coh…) passa como hidden, senão o recorte se perde calado ao
+         mexer em qualquer outro filtro. #}
       {% set _own = ['preset','date_from','date_to','money','q_from','q_to',
-                     'leader','ae','region','role','refresh',
-                     'dtype','source','fcat'] %}
+                     'leader','ae','region','role','refresh']
+                    + (ctx.extra_filters|map(attribute='key')|list) %}
       {% for k, v in request.args.items() %}
         {% if k not in _own %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}
       {% endfor %}
@@ -241,8 +340,8 @@
           {% endfor %}
         </select>
       </div>
-      {# Filtros extra da aba (hoje: Deal Type · Source · Forecast Category do
-         Pipeline Total). Vazio nas outras abas. #}
+      {# Filtros extra da aba (hoje: Deal Type · Source · Product · Forecast
+         Category do Pipeline Total). Vazio nas outras abas. #}
       {% for ef in ctx.extra_filters %}
       <div class="f-group">
         <label>{{ ef.label }}</label>
@@ -256,7 +355,26 @@
       {% endfor %}
       <a href="{{ ctx.current_path }}" class="f-btn secondary">Limpar</a>
       <a href="{{ ctx.current_path }}?{{ ctx.querystring }}{% if ctx.querystring %}&{% endif %}refresh=1" class="f-btn refresh" title="Re-query BigQuery agora">↻ Refresh BQ</a>
-      <span class="money-toggle" title="Moeda de exibição — vale em todas as abas">
+      {# Selo de frescor: a idade do DADO, não a do cache. Existe desde 14/09/2026,
+         quando descobrimos que a fonte do HubSpot tinha parado havia 3 dias e o
+         dashboard servia o funil de sexta sem nenhum aviso na tela. Fica em
+         vermelho (.is-stale) quando a fonte passa de 3h sem gravar. #}
+      {% if ctx.freshness and ctx.freshness.ok %}
+      <span class="fresh-seal {% if ctx.freshness.stale %}is-stale{% endif %}"
+            title="Deal mais recente que o HubSpot mandou: {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 15 em 15 min.">
+        {% if ctx.freshness.source_age_min < 60 %}
+          dado de {{ ctx.freshness.source_age_min }} min atrás
+        {% else %}
+          dado de {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }}
+        {% endif %}
+      </span>
+      {% endif %}
+      {# No Sales MX não há toggle: o time é medido em dólar e um deal em peso não
+         tem leitura em real. A moeda é fixa e a página diz isso no subtítulo. #}
+      {# `display:none` inline e não `hidden`: .money-toggle tem display:flex no
+         CSS, que ganha do atributo hidden e deixava o toggle visível. #}
+      <span class="money-toggle" title="Moeda de exibição — vale em todas as abas"
+            {% if ctx.view == 'mx' %}style="display:none"{% endif %}>
         <a href="{{ ctx.money_url_mrr }}" class="money-opt {% if ctx.money_mode != 'arr' %}is-on{% endif %}">MRR R$</a>
         <a href="{{ ctx.money_url_arr }}" class="money-opt {% if ctx.money_mode == 'arr' %}is-on{% endif %}">ARR US$</a>
       </span>
@@ -334,8 +452,12 @@
   const SCROLL_KEY = 'pepeuhacker:scrollY:' + location.pathname;
 
   // Salva scrollY antes de qualquer navegação same-path (form submit ou link interno)
-  const saveScroll = () => sessionStorage.setItem(SCROLL_KEY, window.scrollY);
+  const saveScroll = () => { try { sessionStorage.setItem(SCROLL_KEY, window.scrollY); } catch (_) {} };
   document.addEventListener('submit', saveScroll, true);
+  // `form.submit()` chamado por código NÃO dispara o evento 'submit' — e é assim
+  // que todo filtro desta página aplica (auto-aplicar). Sem isto o saveScroll
+  // acima nunca rodava e a tela voltava pro topo a cada troca de filtro.
+  const submitKeepingScroll = (f) => { saveScroll(); f.submit(); };
   document.addEventListener('click', (e) => {
     const a = e.target.closest('a[href]');
     if (!a) return;
@@ -345,14 +467,23 @@
     } catch (_) {}
   }, true);
 
-  // Restaura ao carregar
-  window.addEventListener('load', () => {
-    const y = sessionStorage.getItem(SCROLL_KEY);
-    if (y !== null) {
-      window.scrollTo(0, parseInt(y, 10) || 0);
-      sessionStorage.removeItem(SCROLL_KEY);
-    }
-  });
+  // Restaura ao carregar. Primeiro já no DOMContentLoaded (o conteúdo é todo
+  // renderizado no servidor), pra não aparecer o topo piscando; de novo no
+  // 'load', caso fonte/imagem tenha mudado a altura nesse meio-tempo.
+  let savedY = null;
+  try { savedY = sessionStorage.getItem(SCROLL_KEY); sessionStorage.removeItem(SCROLL_KEY); } catch (_) {}
+  if (savedY !== null) {
+    const y = parseInt(savedY, 10) || 0;
+    let firstY = null;
+    const restore = () => { window.scrollTo(0, y); firstY = window.scrollY; };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', restore);
+    else restore();
+    // No 'load' só corrige se a página ainda estava curta (o scroll parou antes
+    // do alvo) e a pessoa não mexeu desde então.
+    window.addEventListener('load', () => {
+      if (firstY !== null && window.scrollY === firstY && firstY < y) window.scrollTo(0, y);
+    });
+  }
 
   // ---- Date-range picker (filtro unificado de período)
   const drTrigger = document.getElementById('dr-trigger');
@@ -393,7 +524,7 @@
       dateFrom.value = btn.dataset.from;
       dateTo.value   = btn.dataset.to;
       presetIn.value = btn.dataset.preset;
-      document.getElementById('filter-form').submit();
+      submitKeepingScroll(document.getElementById('filter-form'));
     });
   });
 
@@ -402,7 +533,7 @@
   const form = document.getElementById('filter-form');
   if (form) {
     form.querySelectorAll('select').forEach(sel => {
-      sel.addEventListener('change', () => form.submit());
+      sel.addEventListener('change', () => submitKeepingScroll(form));
     });
     // Range de datas personalizado: aplica assim que as duas pontas existirem.
     const applyRange = () => {
@@ -410,7 +541,7 @@
       dateFrom.value = drFrom.value;
       dateTo.value   = drTo.value;
       presetIn.value = '';
-      form.submit();
+      submitKeepingScroll(form);
     };
     if (drFrom) drFrom.addEventListener('change', applyRange);
     if (drTo)   drTo.addEventListener('change', applyRange);
@@ -418,7 +549,7 @@
   // Formulários de filtro próprios de um gráfico (ex.: conversão de funil).
   document.querySelectorAll('form.auto-apply').forEach(f => {
     f.querySelectorAll('select, input[type="date"]').forEach(el => {
-      el.addEventListener('change', () => f.submit());
+      el.addEventListener('change', () => submitKeepingScroll(f));
     });
   });
 })();

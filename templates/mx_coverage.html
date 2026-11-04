@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Cobertura · pepeuhacker{% endblock %}
+{% from "_mx_head.html" import usd %}
+{% block content %}
+<h1>Sales MX · Cobertura</h1>
+<div class="page-sub">
+  <b>{{ range_label }}</b> · time de <b>{{ leader }}</b> · quanto de pipeline existe
+  para cada dólar que <b>falta</b> da meta · ARR US$
+</div>
+
+<div class="stats-strip">
+  <div class="stat c-slate">
+    <div class="stat-l">Meta do trimestre</div>
+    <div class="stat-v">{% if total_quota %}{{ usd(total_quota) }}{% else %}—{% endif %}</div>
+  </div>
+  <div class="stat c-green">
+    <div class="stat-l">Realizado <span class="stat-q">· fonte BI</span></div>
+    <div class="stat-v">{{ usd(total_real) }}</div>
+  </div>
+  <div class="stat c-slate">
+    <div class="stat-l">Falta</div>
+    <div class="stat-v">{{ usd(total_falta) }}</div>
+  </div>
+  <div class="stat is-total">
+    <div class="stat-l">Cobertura <span class="stat-q">· pipe ÷ falta</span></div>
+    <div class="stat-v">{% if total_cob is not none %}{{ total_cob|round(1) }}x{% else %}—{% endif %}</div>
+    <div class="stat-s">{{ usd(total_pipe) }} em pipeline</div>
+  </div>
+</div>
+
+{% if sem_quota %}
+<p class="ph" style="margin:14px 2px 0">
+  Sem meta cadastrada no BI: <b>{{ sem_quota|join(' · ') }}</b>. Entram no pipeline
+  do time, mas não têm cobertura calculável — é ausência de cadastro, não meta zero.
+</p>
+{% endif %}
+
+<div class="panel">
+  <h2>Cobertura por vendedor</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Vendedor</th><th>Segmento</th><th class="n">Meta</th>
+        <th class="n">Realizado</th><th class="n">Falta</th>
+        <th class="n grp">Pipeline</th><th class="n">Cobertura</th>
+      </tr></thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td class="first"><b>{{ r.display }}</b></td>
+          <td>{{ r.tier }}</td>
+          <td class="n">{% if r.has_quota %}{{ usd(r.quota) }}{% else %}—{% endif %}</td>
+          <td class="n">{{ usd(r.realizado) }}</td>
+          <td class="n">{% if r.bateu %}<b style="color:#047857">bateu</b>{% else %}{{ usd(r.falta) }}{% endif %}</td>
+          <td class="n grp">{{ usd(r.pipe) }}</td>
+          <td class="n"><b>{% if r.cob is not none %}{{ r.cob|round(1) }}x{% else %}—{% endif %}</b></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td><td></td>
+          <td class="n"><b>{% if total_quota %}{{ usd(total_quota) }}{% else %}—{% endif %}</b></td>
+          <td class="n"><b>{{ usd(total_real) }}</b></td>
+          <td class="n"><b>{{ usd(total_falta) }}</b></td>
+          <td class="n grp"><b>{{ usd(total_pipe) }}</b></td>
+          <td class="n"><b>{% if total_cob is not none %}{{ total_cob|round(1) }}x{% else %}—{% endif %}</b></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

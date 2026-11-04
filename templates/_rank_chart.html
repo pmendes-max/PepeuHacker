@@ -7,7 +7,9 @@
    Usado por /overview (receita, new logos) e /pipeline (cobertura early/late).
    Chame rank_chart(...) por chart e rank_chart_script() UMA vez no fim da página.
    ========================================================================== #}
-{% macro rank_chart(rk, title, sub='', currency=true,
+{# `usd=true`: os valores JÁ estão em dólar e não passam pelo filtro `brl`
+   (que converteria de novo). Usado pelo Sales MX. #}
+{% macro rank_chart(rk, title, sub='', currency=true, usd=false,
                     legend_real='Realizado', legend_quota='Quota',
                     legend_line='% atingimento',
                     tip_real='Realizado', tip_quota='Quota', tip_line='Atingimento',
@@ -52,16 +54,16 @@
       {% for r in rk.rows %}
         {% if r.qh > 0 %}
           <rect class="rk-quota" x="{{ r.qx }}" y="{{ r.qy }}" width="{{ r.qw }}" height="{{ r.qh }}" rx="3" fill="#94A3B8"/>
-          <text class="rk-quota" x="{{ r.qx + r.qw/2 }}" y="{{ r.qy - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#64748B" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{{ r.quota|brl|replace('R$ ','') }}{% else %}{{ r.quota|intg }}{% endif %}</text>
+          <text class="rk-quota" x="{{ r.qx + r.qw/2 }}" y="{{ r.qy - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#64748B" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{% if usd %}{{ r.quota|usd|replace('US$ ','') }}{% else %}{{ r.quota|brl|replace('R$ ','') }}{% endif %}{% else %}{{ r.quota|intg }}{% endif %}</text>
         {% endif %}
         {% if r.rh > 0 %}
           <rect class="rk-real" x="{{ r.rx }}" y="{{ r.ry }}" width="{{ r.rw }}" height="{{ r.rh }}" rx="3" fill="#0F6E56"/>
-          <text class="rk-real" x="{{ r.rx + r.rw/2 }}" y="{{ r.ry - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#0F6E56" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{{ r.realized|brl|replace('R$ ','') }}{% else %}{{ r.realized|intg }}{% endif %}</text>
+          <text class="rk-real" x="{{ r.rx + r.rw/2 }}" y="{{ r.ry - 5 }}" text-anchor="middle" font-size="12" font-weight="700" fill="#0F6E56" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{% if currency %}{% if usd %}{{ r.realized|usd|replace('US$ ','') }}{% else %}{{ r.realized|brl|replace('R$ ','') }}{% endif %}{% else %}{{ r.realized|intg }}{% endif %}</text>
         {% endif %}
         {% if modal_endpoint %}
           <text x="{{ r.cx }}" y="{{ rk.base_y + 18 }}" text-anchor="end" font-size="13" fill="var(--fg-soft)"
                 transform="rotate(-35 {{ r.cx }} {{ rk.base_y + 18 }})" style="cursor:pointer"
-                data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}?name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}">{{ r.short }}</text>
+                data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}{{ '&' if '?' in modal_endpoint else '?' }}name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}">{{ r.short }}</text>
         {% else %}
           <a href="{{ r.drill_url }}">
             <text x="{{ r.cx }}" y="{{ rk.base_y + 18 }}" text-anchor="end" font-size="13" fill="var(--fg-soft)"
@@ -93,9 +95,9 @@
         {% set _hz %}<rect class="rank-hz" x="{{ r.zx }}" y="{{ rk.top }}" width="{{ rk.step }}" height="{{ rk.base_y - rk.top }}"
               fill="#2563EB" fill-opacity="0" pointer-events="all"
               data-name="{{ r.name }}" data-leader="{{ r.leader or '' }}"
-              {% if modal_endpoint %}data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}?name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}"{% endif %}
-              data-realized="{% if currency %}{{ r.realized|brl }}{% else %}{{ r.realized|intg }}{% endif %}"
-              data-quota="{% if currency %}{{ r.quota|brl }}{% else %}{{ r.quota|intg }}{% endif %}"
+              {% if modal_endpoint %}data-drill="{% if r.modal_url %}{{ r.modal_url }}{% else %}{{ modal_endpoint }}{{ '&' if '?' in modal_endpoint else '?' }}name={{ r.name|urlencode }}{{ _dd_extra }}{% endif %}"{% endif %}
+              data-realized="{% if currency %}{% if usd %}{{ r.realized|usd }}{% else %}{{ r.realized|brl }}{% endif %}{% else %}{{ r.realized|intg }}{% endif %}"
+              data-quota="{% if currency %}{% if usd %}{{ r.quota|usd }}{% else %}{{ r.quota|brl }}{% endif %}{% else %}{{ r.quota|intg }}{% endif %}"
               data-att="{{ r.line_label }}"></rect>{% endset %}
         {% if modal_endpoint %}{{ _hz|safe }}{% else %}<a href="{{ r.drill_url }}">{{ _hz|safe }}</a>{% endif %}
       {% endfor %}

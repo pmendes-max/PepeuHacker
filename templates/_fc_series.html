@@ -1,0 +1,123 @@
+{# ============================================================================
+   Um MODELO de forecast ao longo das semanas: a linha do time (com a meta) e,
+   embaixo, um mini-gráfico por diretor. É o par que responde as duas perguntas
+   da tela na ordem em que se pergunta — "o time está indo pra meta?" e "quem
+   está puxando pra cima ou pra baixo?".
+
+   `lc`    = geometria de _build_fc_line   (linha do time + meta)
+   `sm`    = geometria de _build_fc_small  (um card por líder, escala comum)
+   `nota`  = texto opcional embaixo do gráfico (ex.: cobertura da categoria)
+   ========================================================================== #}
+{% macro fc_series(lc, sm, title, sub, cor, nota='', pessoa='diretor') %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>{{ title }} <span class="h2-sub">· {{ sub }}</span></h2>
+    <span class="ph" style="margin:0">eixo desde o zero{% if lc.goal %} · tracejada = meta (Comp. Target){% endif %}</span>
+  </div>
+
+  {# ---- legenda das séries ---- #}
+  <div class="rank-legend">
+    {% for s in lc.series %}
+      <span class="rl-item"><span class="rl-sw" style="background:{{ s.color }}
+        {%- if s.dash %};background-image:linear-gradient(90deg,{{ s.color }} 60%,transparent 60%){% endif %}"></span>{{ s.name }}</span>
+    {% endfor %}
+    {% if lc.goal %}
+      <span class="rl-item"><span class="rl-sw fc-sw-goal"></span>Meta · {{ lc.goal.value }}</span>
+    {% endif %}
+  </div>
+
+  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
+    <svg viewBox="0 0 {{ lc.w }} {{ lc.h }}" width="{{ lc.w }}" height="{{ lc.h }}"
+         style="min-width:100%;display:block" font-family="inherit">
+      {% for t in lc.yL %}
+        <line x1="{{ lc.left }}" y1="{{ t.y }}" x2="{{ lc.right_x }}" y2="{{ t.y }}"
+              stroke="var(--border-soft)" stroke-width="1"/>
+        <text x="{{ lc.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
+              fill="var(--muted)">{{ t.label }}</text>
+      {% endfor %}
+      <line x1="{{ lc.left }}" y1="{{ lc.base_y }}" x2="{{ lc.right_x }}" y2="{{ lc.base_y }}"
+            stroke="var(--border)" stroke-width="1.5"/>
+
+      {# ---- meta: a referência que faz a série significar algo ---- #}
+      {% if lc.goal %}
+        <line x1="{{ lc.left }}" y1="{{ lc.goal.y }}" x2="{{ lc.right_x }}" y2="{{ lc.goal.y }}"
+              stroke="#B45309" stroke-width="2" stroke-dasharray="7 5"/>
+        <text x="{{ lc.right_x + 6 }}" y="{{ lc.goal.y + 4 }}" font-size="11" font-weight="700"
+              fill="#B45309">{{ lc.goal.label }}</text>
+      {% endif %}
+
+      {# ---- séries ---- #}
+      {% for s in lc.series %}
+        {% for seg in s.segs %}
+          <polyline points="{{ seg }}" fill="none" stroke="{{ s.color }}" stroke-width="2.5"
+                    stroke-linejoin="round" stroke-linecap="round"
+                    {% if s.dash %}stroke-dasharray="{{ s.dash }}"{% endif %}/>
+        {% endfor %}
+        {% for p in s.points %}
+          <circle cx="{{ p.cx }}" cy="{{ p.cy }}" r="{{ 4 if p.big else 3 }}"
+                  fill="var(--surface)" stroke="{{ s.color }}" stroke-width="2.5"/>
+          {% if p.label %}
+            <text x="{{ p.cx }}" y="{{ p.ly }}" text-anchor="middle" font-size="11"
+                  font-weight="700" fill="{{ s.color }}" paint-order="stroke"
+                  stroke="var(--surface)" stroke-width="3.5">{{ p.label }}</text>
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+
+      {# ---- datas ---- #}
+      {% for x in lc.xs %}
+        <text x="{{ x.cx }}" y="{{ lc.base_y + 18 }}" text-anchor="end" font-size="11"
+              fill="var(--fg-soft)"
+              transform="rotate(-40 {{ x.cx }} {{ lc.base_y + 18 }})">{{ x.label }}</text>
+      {% endfor %}
+    </svg>
+  </div>
+  {% if nota %}<div class="hm-note">{{ nota|safe }}</div>{% endif %}
+
+  {# ---- e agora um por um: os diretores ---- #}
+  {% if sm and sm.rows %}
+  <div class="fc-sm-head">
+    <b>Por {{ pessoa }}</b> · mesma escala em todos (topo = {{ sm.span_label }}) ·
+    {% if sm.rows[0].goal %}tracejada = a meta de cada um · o % é o atingimento da
+    projeção no último domingo · {% endif %}ordem do organograma (a mesma nos dois
+    modelos, pra comparar card a card).
+    <br>Somar os cards <b>não</b> dá o total do time: no grão de líder cada deal
+    conta no gerente <b>e</b> no diretor dele (a mesma convenção das outras telas
+    de Leaders), então a soma sai ~20% acima.
+  </div>
+  <div class="sm-grid">
+    {% for p in sm.rows %}
+    <div class="sm-card">
+      <div class="sm-head">
+        <span class="sm-name" title="{{ p.name }}">{{ p.short }}</span>
+        <span class="sm-total {% if p.att and p.att >= 1 %}is-pos{% else %}is-neg{% endif %}">
+          {% if p.att is not none %}{{ (p.att*100)|round|int }}%{% else %}—{% endif %}
+        </span>
+      </div>
+      <svg class="sm-svg" viewBox="0 0 {{ sm.w }} {{ sm.h }}" preserveAspectRatio="none"
+           width="100%" height="{{ sm.h }}">
+        {% if p.goal_y is not none %}
+          <line x1="0" y1="{{ p.goal_y }}" x2="{{ sm.w }}" y2="{{ p.goal_y }}"
+                stroke="#B45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+        {% endif %}
+        {% for seg in p.segs %}
+          <polyline points="{{ seg }}" fill="none" stroke="{{ cor }}" stroke-width="2"
+                    stroke-linejoin="round" stroke-linecap="round"
+                    vector-effect="non-scaling-stroke"/>
+        {% endfor %}
+        {% for pt in p.points %}
+          <circle cx="{{ pt.cx }}" cy="{{ pt.cy }}" r="1.8" fill="{{ cor }}"/>
+        {% endfor %}
+      </svg>
+      <div class="sm-foot">
+        <span title="começo → fim da janela">{{ p.start|brl }} → <b>{{ p.end|brl }}</b></span>
+        <span class="{% if p.delta >= 0 %}is-pos{% else %}is-neg{% endif %}">
+          {{ '+' if p.delta >= 0 else '−' }}{{ (p.delta if p.delta >= 0 else -p.delta)|brl }}
+        </span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endmacro %}

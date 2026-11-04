@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Inatividade · pepeuhacker{% endblock %}
+{% from "_mx_head.html" import usd %}
+{% block content %}
+<h1>Sales MX · Inatividade</h1>
+<div class="page-sub">
+  Pipeline <b>aberto</b> por tempo sem atividade registrada no HubSpot ·
+  time de <b>{{ leader }}</b> · ARR US$
+</div>
+
+{% if sem_data_deals %}
+{# Nunca ter registrado atividade não é o mesmo que ter parado: um é buraco de
+   CRM, o outro é deal esfriando. Misturar os dois esconderia os dois. #}
+<div class="mx-note">
+  <b>{{ sem_data_deals }} deal{{ 's' if sem_data_deals != 1 }}</b>
+  ({{ usd(sem_data_arr) }} ARR) <b>nunca</b> registraram atividade e ficam fora das
+  faixas abaixo. Não é o mesmo que estar parado há muito tempo — é ausência de
+  registro no CRM, e some da conta em vez de virar "infinitamente parado".
+</div>
+{% endif %}
+
+<div class="stats-strip">
+  <div class="stat c-slate">
+    <div class="stat-l">Pipeline aberto</div>
+    <div class="stat-v">{{ usd(total_arr) }}</div>
+    <div class="stat-s">{{ total_deals|intg }} deals</div>
+  </div>
+  {% set parado = buckets[3].arr + buckets[4].arr %}
+  {% set parado_n = buckets[3].deals + buckets[4].deals %}
+  <div class="stat c-red">
+    <div class="stat-l">Parado há mais de 30d</div>
+    <div class="stat-v">{{ usd(parado) }}</div>
+    <div class="stat-s">{{ parado_n|intg }} deals · {{ (parado/total_arr*100)|round|int if total_arr else 0 }}% do pipe</div>
+  </div>
+  <div class="stat c-green">
+    <div class="stat-l">Ativo (até 15d)</div>
+    <div class="stat-v">{{ usd(buckets[0].arr + buckets[1].arr) }}</div>
+    <div class="stat-s">{{ (buckets[0].deals + buckets[1].deals)|intg }} deals</div>
+  </div>
+  <div class="stat is-total">
+    <div class="stat-l">Sem registro</div>
+    <div class="stat-v">{{ sem_data_deals|intg }}</div>
+    <div class="stat-s">deals sem atividade nenhuma</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>ARR por faixa de inatividade</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Faixa</th><th class="n">Deals</th><th class="n">ARR US$</th>
+        <th class="n">% do pipe</th><th style="width:34%">Peso</th></tr></thead>
+      <tbody>
+      {% for b in buckets %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ b.color }}"></span>{{ b.label }}</td>
+          <td class="n">{{ b.deals|intg }}</td>
+          <td class="n"><b>{{ usd(b.arr) }}</b></td>
+          <td class="n">{{ (b.arr/total_arr*100)|round|int if total_arr else 0 }}%</td>
+          <td><div style="height:11px;border-radius:6px;background:{{ b.color }};min-width:2px;
+                     width:{{ (b.arr/max_arr*100)|round(1) if max_arr else 0 }}%"></div></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Por vendedor</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Vendedor</th><th class="n">Deals abertos</th><th class="n">ARR</th>
+        <th class="n">Mediana sem atividade</th>
+        <th class="n grp">Parados +30d</th><th class="n">ARR parado</th></tr></thead>
+      <tbody>
+      {% for r in por_ae %}
+        <tr>
+          <td class="first"><b>{{ r.display }}</b></td>
+          <td class="n">{{ r.deals|intg }}</td>
+          <td class="n">{{ usd(r.arr) }}</td>
+          <td class="n">{% if r.mediana is not none %}{{ r.mediana|round|int }}d{% else %}—{% endif %}</td>
+          <td class="n grp">{{ r.parados_deals|intg }}</td>
+          <td class="n"><b>{{ usd(r.parados_arr) }}</b></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<style>
+  .mx-note{margin:0 0 18px;padding:11px 15px;border-radius:10px;font-size:12.5px;
+    line-height:1.6;border:1px solid #F59E0B55;color:var(--muted);
+    background:color-mix(in srgb,#F59E0B 7%,transparent)}
+  .mx-note b{color:var(--fg)}
+</style>
+{% endblock %}

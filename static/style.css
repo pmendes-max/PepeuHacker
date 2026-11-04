@@ -152,6 +152,10 @@ nav a.active{
 .dashbar-ae{ box-shadow: inset 0 -3px 0 var(--blue); }
 .dashbar-leaders{ box-shadow: inset 0 -3px 0 var(--green); }
 .dashbar-sdr{ box-shadow: inset 0 -3px 0 var(--orange); }
+/* Sales MX — cor própria (roxo) pelo mesmo motivo das outras três: a faixa e o
+   realce do tab são o único sinal de QUAL dashboard está aberto, e dois
+   dashboards com a mesma cor fariam o leitor confiar no número errado. */
+.dashbar-mx{ box-shadow: inset 0 -3px 0 #7C3AED; }
 
 .dash-switch{
   display:flex; gap:10px;
@@ -200,6 +204,12 @@ nav a.active{
   box-shadow: 0 0 0 4px rgba(245,158,11,.14), var(--shadow-sm);
 }
 .dash-tab.dash-sdr.active .dash-name{ color:var(--orange-ink); }
+.dash-tab.dash-mx.active{
+  border-color:#7C3AED;
+  background:linear-gradient(180deg, color-mix(in srgb,#7C3AED 12%,transparent) 0%, #fff 90%);
+  box-shadow: 0 0 0 4px rgba(124,58,237,.13), var(--shadow-sm);
+}
+.dash-tab.dash-mx.active .dash-name{ color:#6D28D9; }
 /* Inactive sutil */
 .dash-tab:not(.active){
   opacity: .85;
@@ -428,6 +438,22 @@ nav a.active{
 .f-btn.secondary:hover{background:var(--surface-2)}
 .f-btn.refresh{background:var(--surface);color:var(--blue);border:1px solid var(--border)}
 .f-btn.refresh:hover{background:var(--blue-soft);border-color:var(--blue)}
+
+/* Selo de frescor — a idade do DADO ao lado do botão de refresh. Discreto
+   enquanto a fonte está em dia; vermelho quando passa de 3h sem gravar, que é
+   o sinal de que a ingestão do HubSpot travou e o número na tela envelheceu. */
+.fresh-seal{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:8px 12px;border-radius:var(--radius-sm);
+  font-size:12px;font-weight:600;color:var(--muted);
+  background:var(--surface-2);border:1px solid var(--border);
+  white-space:nowrap;cursor:default;
+}
+.fresh-seal::before{
+  content:"";width:6px;height:6px;border-radius:50%;background:var(--green,#10B981);
+}
+.fresh-seal.is-stale{color:var(--red);border-color:var(--red);background:transparent}
+.fresh-seal.is-stale::before{background:var(--red)}
 
 /* ---------- LAYOUT ---------- */
 .wrap{max-width:1720px;margin:0 auto;padding:32px 28px 80px}
@@ -2738,3 +2764,15 @@ tbody tr:last-child td{border-bottom:none}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
 ::-webkit-scrollbar-thumb:hover{background:var(--muted-2)}
+
+/* Aviso de carga atrasada no subtítulo (Inatividade · WhatsApp). */
+.page-sub .warn{ color: #B45309; font-weight: 600; }
+
+/* ---- Seletor de idioma (cabeçalho, 3ª coluna do dashbar) ----
+   Mesmo desenho do toggle de moeda: pílula com as opções lado a lado. */
+.lang-switch{display:inline-flex;border:1px solid var(--border,#d7dde5);border-radius:8px;overflow:hidden}
+.lang-switch .lang-opt{padding:6px 11px;font-size:12px;font-weight:600;color:var(--muted,#64748b);
+  background:#fff;border:0;cursor:pointer;font-family:inherit;letter-spacing:.2px}
+.lang-switch .lang-opt+.lang-opt{border-left:1px solid var(--border,#d7dde5)}
+.lang-switch .lang-opt:hover{color:var(--fg,#0f172a)}
+.lang-switch .lang-opt.is-on{background:var(--blue,#2563EB);color:#fff;cursor:default}

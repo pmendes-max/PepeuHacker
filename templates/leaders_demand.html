@@ -7,19 +7,19 @@
 {# ------- Chart 1: Geradas pelo time do líder (auto) ------- #}
 <div class="panel">
   <h2>Geradas pelo time do líder</h2>
-  <div class="dchart" data-channels="acq exp goal" data-chart="auto"
+  <div class="dchart" data-drill-chips="bucket" data-channels="acq exp goal" data-chart="auto"
        data-color-acq="#2563EB" data-color-exp="#1E3A8A"
        data-goal-mode="per-bar"
        data-goal-per-ae="{{ weekly_goal_per_ae }}">
     <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="acq" style="--c:#2563EB">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq" style="--c:#2563EB">
         <span class="leg-dot" style="background:#2563EB"></span>Aquisição
       </button>
-      <button type="button" class="leg-toggle is-on" data-ch="exp" style="--c:#1E3A8A">
+      <button type="button" class="leg-toggle is-on" data-ch="exp" data-drill-val="auto_exp" style="--c:#1E3A8A">
         <span class="leg-dot" style="background:#1E3A8A"></span>Expansão
       </button>
       {% if weekly_goal_per_ae %}
-      <button type="button" class="leg-toggle is-on leg-goal" data-ch="goal" style="--c:var(--blue)">
+      <button type="button" class="leg-toggle is-on leg-goal" data-ch="goal" data-drill-skip style="--c:var(--blue)">
         <span class="leg-dot" style="background:var(--blue);border:1.5px dashed #fff;box-shadow:0 0 0 1px var(--blue)"></span>Meta · {{ weekly_goal_per_ae }}/AE
       </button>
       {% endif %}
@@ -61,15 +61,23 @@
 {# ------- Chart 2: Recebidas pelo time — split Inbound/Outbound/Expansão ------- #}
 <div class="panel">
   <h2>Recebidas pelo time do líder</h2>
-  <div class="dchart" data-channels="inbound outbound exp" data-chart="rcv">
+  <div class="dchart" data-drill-chips="bucket" data-channels="inbound outbound moved_out moved_in exp" data-chart="rcv">
     <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="inbound" style="--c:#10B981;--ci:#047857">
+      <button type="button" class="leg-toggle is-on" data-ch="inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857">
         <span class="leg-dot" style="background:#10B981"></span>Inbound
       </button>
-      <button type="button" class="leg-toggle is-on" data-ch="outbound" style="--c:#6366F1">
+      <button type="button" class="leg-toggle is-on" data-ch="outbound" data-drill-val="rcv_outbound" style="--c:#6366F1">
         <span class="leg-dot" style="background:#6366F1"></span>Outbound
       </button>
-      <button type="button" class="leg-toggle is-on" data-ch="exp" style="--c:#047857">
+      <button type="button" class="leg-toggle is-on" data-ch="moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B"
+              title="a propriedade motion do deal era Inbound e foi alterada para Outbound">
+        <span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777"
+              title="a propriedade motion do deal era Outbound e foi alterada para Inbound">
+        <span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="exp" data-drill-val="rcv_exp" style="--c:#047857">
         <span class="leg-dot" style="background:#047857"></span>Expansão
       </button>
     </div>
@@ -78,20 +86,26 @@
       {% for r in ae_rcv %}
         {% set rin  = r.rcv_inbound|int %}
         {% set rout = r.rcv_outbound|int %}
+        {% set rmo  = r.rcv_moved_out|int %}
+        {% set rmi  = r.rcv_moved_in|int %}
         {% set re   = r.rcv_exp|int %}
-        {% set total_init = rin + rout + re %}
+        {% set total_init = rin + rout + rmo + rmi + re %}
         {% set h_pct = (total_init / max_rcv * 100) if max_rcv else 0 %}
         <div class="vbar{% if total_init <= 0 %} is-empty{% endif %}"
-             data-inbound="{{ rin }}" data-outbound="{{ rout }}" data-exp="{{ re }}"
+             data-inbound="{{ rin }}" data-outbound="{{ rout }}"
+             data-moved_out="{{ rmo }}" data-moved_in="{{ rmi }}" data-exp="{{ re }}"
              data-name="{{ r.account_executive }}"
              {% if total_init > 0 %}data-drill="{{ url_for('demand_deals', name=r.account_executive, grain='leader', date_from=range_from, date_to=range_to, source='received') }}"{% endif %}>
           <div class="vbar-tip"></div>
           <div class="vbar-track" style="--h:{{ h_pct }}%">
             <div class="vbar-val">{{ total_init|intg }}</div>
             <div class="vbar-col">
-              {% if rin  > 0 %}<div class="vbar-seg" data-ch="inbound"  style="background:#10B981;flex:{{ rin }}"></div>{% endif %}
-              {% if rout > 0 %}<div class="vbar-seg" data-ch="outbound" style="background:#6366F1;flex:{{ rout }}"></div>{% endif %}
-              {% if re   > 0 %}<div class="vbar-seg" data-ch="exp"      style="background:#047857;flex:{{ re }}"></div>{% endif %}
+              {% set seg_url = url_for('demand_deals', name=r.account_executive, grain='leader', date_from=range_from, date_to=range_to, source='received') %}
+              {% if rin  > 0 %}<div class="vbar-seg" data-ch="inbound"  style="background:#10B981;flex:{{ rin }}"  data-drill="{{ seg_url }}&bucket=rcv_inbound"   data-drill-title="{{ r.account_executive }} · Inbound"></div>{% endif %}
+              {% if rout > 0 %}<div class="vbar-seg" data-ch="outbound" style="background:#6366F1;flex:{{ rout }}" data-drill="{{ seg_url }}&bucket=rcv_outbound"  data-drill-title="{{ r.account_executive }} · Outbound"></div>{% endif %}
+              {% if rmo  > 0 %}<div class="vbar-seg" data-ch="moved_out" style="background:#F59E0B;flex:{{ rmo }}" data-drill="{{ seg_url }}&bucket=rcv_moved_out" data-drill-title="{{ r.account_executive }} · Motion virou Outbound"></div>{% endif %}
+              {% if rmi  > 0 %}<div class="vbar-seg" data-ch="moved_in"  style="background:#DB2777;flex:{{ rmi }}" data-drill="{{ seg_url }}&bucket=rcv_moved_in"  data-drill-title="{{ r.account_executive }} · Motion virou Inbound"></div>{% endif %}
+              {% if re   > 0 %}<div class="vbar-seg" data-ch="exp"      style="background:#047857;flex:{{ re }}"   data-drill="{{ seg_url }}&bucket=rcv_exp"       data-drill-title="{{ r.account_executive }} · Expansão"></div>{% endif %}
             </div>
           </div>
           <div class="vbar-name">{{ r.account_executive }}</div>
@@ -104,12 +118,12 @@
 {# ------- Distribuição da demanda ------- #}
 <div class="panel">
   <h2>Distribuição da demanda</h2>
-  <div class="dchart" data-channels="acq rcv" data-chart="dist" data-keep-order="1" data-val-mode="pct">
+  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="dist" data-keep-order="1" data-val-mode="pct">
     <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="acq" style="--c:#2563EB">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq,auto_exp" style="--c:#2563EB">
         <span class="leg-dot" style="background:#2563EB"></span>Próprio do time
       </button>
-      <button type="button" class="leg-toggle is-on" data-ch="rcv" style="--c:#10B981;--ci:#047857">
+      <button type="button" class="leg-toggle is-on" data-ch="rcv" data-drill-val="rcv_exp,rcv_outbound,rcv_inbound,rcv_moved_out,rcv_moved_in" style="--c:#10B981;--ci:#047857">
         <span class="leg-dot" style="background:#10B981"></span>Recebidas pelo time
       </button>
     </div>
@@ -150,13 +164,15 @@
       <a href="{{ grain_urls.quarter }}" class="grain-btn {% if grain=='quarter' %}active{% endif %}">Trimestral</a>
     </div>
   </div>
-  <div class="dchart" data-channels="auto_acq auto_exp received_inbound received_outbound received_exp" data-chart="trend" data-keep-order="1">
+  <div class="dchart" data-drill-chips="bucket" data-channels="auto_acq auto_exp received_inbound received_outbound received_moved_out received_moved_in received_exp" data-chart="trend" data-keep-order="1">
     <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="auto_acq" style="--c:#2563EB"><span class="leg-dot" style="background:#2563EB"></span>Próprio · Aquisição</button>
-      <button type="button" class="leg-toggle is-on" data-ch="auto_exp" style="--c:#1E3A8A"><span class="leg-dot" style="background:#1E3A8A"></span>Próprio · Expansão</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_inbound" style="--c:#10B981;--ci:#047857"><span class="leg-dot" style="background:#10B981"></span>Recebidas · Inbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_outbound" style="--c:#6366F1"><span class="leg-dot" style="background:#6366F1"></span>Recebidas · Outbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_exp" style="--c:#047857"><span class="leg-dot" style="background:#047857"></span>Recebidas · Expansão</button>
+      <button type="button" class="leg-toggle is-on" data-ch="auto_acq" data-drill-val="auto_acq" style="--c:#2563EB"><span class="leg-dot" style="background:#2563EB"></span>Próprio · Aquisição</button>
+      <button type="button" class="leg-toggle is-on" data-ch="auto_exp" data-drill-val="auto_exp" style="--c:#1E3A8A"><span class="leg-dot" style="background:#1E3A8A"></span>Próprio · Expansão</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857"><span class="leg-dot" style="background:#10B981"></span>Recebidas · Inbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_outbound" data-drill-val="rcv_outbound" style="--c:#6366F1"><span class="leg-dot" style="background:#6366F1"></span>Recebidas · Outbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B" title="a propriedade motion do deal era Inbound e foi alterada para Outbound"><span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777" title="a propriedade motion do deal era Outbound e foi alterada para Inbound"><span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound</button>
+      <button type="button" class="leg-toggle is-on" data-ch="received_exp" data-drill-val="rcv_exp" style="--c:#047857"><span class="leg-dot" style="background:#047857"></span>Recebidas · Expansão</button>
     </div>
     {% set t_max = trend|map(attribute='total')|max or 1 %}
     <div class="tchart">
@@ -164,12 +180,15 @@
         {% for t in trend %}
           {% set total = t.total|int %}
           {% set h_pct = (total / t_max * 100) if t_max else 0 %}
+          {% set tseg_url = url_for('demand_deals', date_from=t.period_from, date_to=t.period_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
           <div class="tchart-bar"
                {% if total > 0 %}data-drill="{{ url_for('demand_deals', date_from=t.period_from, date_to=t.period_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" data-drill-title="Demanda · {{ t.label }}"{% endif %}
                data-auto_acq="{{ t.auto_acq|int }}"
                data-auto_exp="{{ t.auto_exp|int }}"
                data-received_inbound="{{ t.received_inbound|int }}"
                data-received_outbound="{{ t.received_outbound|int }}"
+               data-received_moved_out="{{ t.received_moved_out|int }}"
+               data-received_moved_in="{{ t.received_moved_in|int }}"
                data-received_exp="{{ t.received_exp|int }}">
             <div class="tchart-tip"></div>
             <div class="tchart-track" style="--h:{{ h_pct }}%">
@@ -177,9 +196,11 @@
               <div class="tchart-col">
                 {% if t.auto_acq          > 0 %}<div class="tchart-seg" data-ch="auto_acq"          style="background:#2563EB;flex:{{ t.auto_acq|int }}"></div>{% endif %}
                 {% if t.auto_exp          > 0 %}<div class="tchart-seg" data-ch="auto_exp"          style="background:#1E3A8A;flex:{{ t.auto_exp|int }}"></div>{% endif %}
-                {% if t.received_inbound  > 0 %}<div class="tchart-seg" data-ch="received_inbound"  style="background:#10B981;flex:{{ t.received_inbound|int }}"></div>{% endif %}
-                {% if t.received_outbound > 0 %}<div class="tchart-seg" data-ch="received_outbound" style="background:#6366F1;flex:{{ t.received_outbound|int }}"></div>{% endif %}
-                {% if t.received_exp      > 0 %}<div class="tchart-seg" data-ch="received_exp"      style="background:#047857;flex:{{ t.received_exp|int }}"></div>{% endif %}
+                {% if t.received_inbound  > 0 %}<div class="tchart-seg" data-ch="received_inbound"  style="background:#10B981;flex:{{ t.received_inbound|int }}" data-drill="{{ tseg_url }}&bucket=rcv_inbound" data-drill-title="{{ t.label }} · Inbound"></div>{% endif %}
+                {% if t.received_outbound > 0 %}<div class="tchart-seg" data-ch="received_outbound" style="background:#6366F1;flex:{{ t.received_outbound|int }}" data-drill="{{ tseg_url }}&bucket=rcv_outbound" data-drill-title="{{ t.label }} · Outbound"></div>{% endif %}
+                {% if t.received_moved_out > 0 %}<div class="tchart-seg" data-ch="received_moved_out" style="background:#F59E0B;flex:{{ t.received_moved_out|int }}" data-drill="{{ tseg_url }}&bucket=rcv_moved_out" data-drill-title="{{ t.label }} · Motion virou Outbound"></div>{% endif %}
+                {% if t.received_moved_in  > 0 %}<div class="tchart-seg" data-ch="received_moved_in"  style="background:#DB2777;flex:{{ t.received_moved_in|int }}"  data-drill="{{ tseg_url }}&bucket=rcv_moved_in"  data-drill-title="{{ t.label }} · Motion virou Inbound"></div>{% endif %}
+                {% if t.received_exp      > 0 %}<div class="tchart-seg" data-ch="received_exp"      style="background:#047857;flex:{{ t.received_exp|int }}" data-drill="{{ tseg_url }}&bucket=rcv_exp" data-drill-title="{{ t.label }} · Expansão"></div>{% endif %}
               </div>
             </div>
             <div class="tchart-x">{{ t.label }}</div>

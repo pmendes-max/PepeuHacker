@@ -1,0 +1,418 @@
+{% extends "base.html" %}
+{% block title %}Legal · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Legal</h1>
+<div class="page-sub">
+  Deals <b>fechados</b> do {{ ctx.pipeline_label }} · ticket médio e conversão com o jurídico envolvido vs sem
+  {%- if ctx.filters.date_from or ctx.filters.date_to %} · fechamento em <b>{{ ctx.period_text }}</b>{% endif %}
+</div>
+
+{% if tickets_parados %}
+<div class="lg-warn lg-warn-hot">
+  <b>Tickets sem dado novo desde {{ tickets_parados }}.</b> O sync de tickets do
+  HubSpot para o BigQuery está parado: deal que acionou o jurídico depois disso
+  aparece como "sem jurídico".
+</div>
+{% endif %}
+
+{# ---------- O aviso que sustenta a leitura da aba ----------
+   O jurídico é acionado no fim do funil. Sem dizer isso, a comparação é lida
+   como "chamar o jurídico faz o deal fechar", quando boa parte do efeito é o
+   contrário: o deal estar fechando é o que faz alguém chamar o jurídico. O
+   aviso muda de texto com a coorte porque na coorte ampla ele é um alerta e na
+   restrita é a explicação do recorte. #}
+{% if coh == 'all' %}
+<div class="lg-warn lg-warn-hot">
+  <b>Cuidado com este número.</b> A coorte é a base inteira de deals fechados, e o
+  jurídico só entra quando o contrato entra — ou seja, quase todo deal "sem
+  jurídico" aqui é um deal que morreu <i>antes</i> de o jurídico ser uma
+  possibilidade. A diferença de conversão que você vê abaixo mede sobretudo a
+  <b>ordem dos eventos</b>, não o efeito do jurídico.
+  Para a comparação defensável, volte pra <b>{{ cohs[0].label }}</b>.
+</div>
+{% else %}
+<div class="lg-warn">
+  <b>Por que só Negociação+.</b> O jurídico é acionado quando o contrato entra em
+  cena, então comparar contra a base inteira mediria a ordem dos eventos (quem
+  está fechando chama o jurídico) e não o efeito do jurídico. A coorte aqui são
+  os deals que <b>pisaram em Negociação, Decision ou Procurement</b> — onde
+  acionar o jurídico era uma escolha de verdade.
+  {%- if n_fora_coorte %} {{ n_fora_coorte|intg }} deals fechados ficaram fora por não terem chegado lá.{% endif %}
+</div>
+{% endif %}
+
+{% if nominal and not mail_ok %}
+<div class="lg-warn lg-warn-hot">
+  <b>Sinal de interação nominal indisponível.</b> A consulta de e-mails do
+  jurídico não respondeu, então as colunas de Ana / Luiza / juridico@ estão
+  vazias por falta de dado — não por ausência de interação. A definição por
+  <b>ticket</b> continua correta.
+</div>
+{% endif %}
+
+{# ---------- Os dois eixos de escolha da página ----------
+   Em linha própria, acima de tudo: são eles que definem o que os números abaixo
+   querem dizer, então esconder num select seria esconder a premissa. #}
+<div class="panel lg-controls">
+  <div class="lg-ctl">
+    <span class="lg-ctl-lbl">Jurídico envolvido =</span>
+    <div class="grain-switch">
+      {% for e in envs %}
+        <a class="grain-btn {% if e.active %}active{% endif %}" href="{{ e.url }}" title="{{ e.hint }}">{{ e.label }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="lg-ctl">
+    <span class="lg-ctl-lbl">Coorte</span>
+    <div class="grain-switch">
+      {% for c in cohs %}
+        <a class="grain-btn {% if c.active %}active{% endif %}" href="{{ c.url }}" title="{{ c.hint }}">{{ c.label }}</a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ---------- 1. O comparativo ----------
+   Métricas em LINHAS e grupos em COLUNAS (e não dois blocos de cards lado a
+   lado): é a disposição que deixa comparar sem procurar o par de cada número.
+   A coluna de delta fecha a leitura — conversão em pontos percentuais, porque a
+   diferença entre duas taxas não é uma taxa, e ticket em % porque variação de
+   preço se lê assim. #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Com jurídico vs sem</h2>
+    <span class="ph" style="margin:0">
+      {{ total.deals|intg }} deals fechados na coorte · clique num número pra explodir a lista
+    </span>
+  </div>
+
+  <div class="lg-vs">
+    <div class="lg-vs-head">
+      <div class="lg-vs-metric"></div>
+      <div class="lg-vs-col lg-vs-com" data-drill="{{ drill_com }}" title="Explodir os deals com jurídico envolvido">
+        <div class="lg-vs-title">Com jurídico</div>
+        <div class="lg-vs-sub">{{ com.deals|intg }} deals · {{ (envs|selectattr('active')|map(attribute='label')|first) }}</div>
+      </div>
+      <div class="lg-vs-col lg-vs-sem" data-drill="{{ drill_sem }}" title="Explodir os deals sem jurídico envolvido">
+        <div class="lg-vs-title">Sem jurídico</div>
+        <div class="lg-vs-sub">{{ sem.deals|intg }} deals</div>
+      </div>
+      <div class="lg-vs-col lg-vs-d"><div class="lg-vs-title">Diferença</div></div>
+    </div>
+
+    {# --- Conversão --- #}
+    <div class="lg-vs-row">
+      <div class="lg-vs-metric">
+        <b>Conversão</b>
+        <span>won ÷ fechados</span>
+      </div>
+      <div class="lg-vs-col lg-vs-com">
+        <span class="lg-big">{% if com.conv is not none %}{{ com.conv|pctraw }}{% else %}—{% endif %}</span>
+        <span class="lg-den" data-drill="{{ drill_com }}">{{ com.won|intg }} de {{ com.deals|intg }}</span>
+      </div>
+      <div class="lg-vs-col lg-vs-sem">
+        <span class="lg-big">{% if sem.conv is not none %}{{ sem.conv|pctraw }}{% else %}—{% endif %}</span>
+        <span class="lg-den" data-drill="{{ drill_sem }}">{{ sem.won|intg }} de {{ sem.deals|intg }}</span>
+      </div>
+      <div class="lg-vs-col lg-vs-d">
+        {% if delta.conv_pp is not none %}
+          <span class="lg-delta {% if delta.conv_pp >= 0 %}up{% else %}down{% endif %}">
+            {# Decimal com vírgula na mão: `round` do Jinja devolve float e
+               renderiza com ponto, que discordaria do `|pctraw` da coluna ao lado. #}
+            {{ '+' if delta.conv_pp >= 0 else '−' }}{{ ('%.1f' % (delta.conv_pp|abs))|replace('.', ',') }} p.p.
+          </span>
+        {% else %}<span class="lg-na">—</span>{% endif %}
+      </div>
+    </div>
+
+    {# --- Ticket médio --- #}
+    <div class="lg-vs-row">
+      <div class="lg-vs-metric">
+        <b>Ticket médio</b>
+        <span>média dos deals ganhos com valor preenchido</span>
+      </div>
+      <div class="lg-vs-col lg-vs-com">
+        <span class="lg-big">{% if com.ticket %}{{ com.ticket|money }}{% else %}—{% endif %}</span>
+        <span class="lg-den">de {{ com.ticket_cov|intg }} won</span>
+      </div>
+      <div class="lg-vs-col lg-vs-sem">
+        <span class="lg-big">{% if sem.ticket %}{{ sem.ticket|money }}{% else %}—{% endif %}</span>
+        <span class="lg-den">de {{ sem.ticket_cov|intg }} won</span>
+      </div>
+      <div class="lg-vs-col lg-vs-d">
+        {% if delta.ticket_pct is not none %}
+          <span class="lg-delta {% if delta.ticket_pct >= 0 %}up{% else %}down{% endif %}">
+            {{ '+' if delta.ticket_pct >= 0 else '−' }}{{ (delta.ticket_pct|abs)|pctraw }}
+          </span>
+        {% else %}<span class="lg-na">—</span>{% endif %}
+      </div>
+    </div>
+
+    {# --- Volume ganho --- #}
+    <div class="lg-vs-row">
+      <div class="lg-vs-metric">
+        <b>Valor ganho</b>
+        <span>soma dos deals won</span>
+      </div>
+      <div class="lg-vs-col lg-vs-com"><span class="lg-big">{{ com.mrr|brl }}</span></div>
+      <div class="lg-vs-col lg-vs-sem"><span class="lg-big">{{ sem.mrr|brl }}</span></div>
+      <div class="lg-vs-col lg-vs-d">
+        {% set _tot = com.mrr + sem.mrr %}
+        {% if _tot %}<span class="lg-share">{{ (com.mrr / _tot * 100)|pctraw }} do ganho</span>
+        {% else %}<span class="lg-na">—</span>{% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if nominal %}
+{# ---------- 2. Matriz ticket × interação nominal ----------
+   Os dois sinais CRUZADOS, não somados. A célula que justifica o painel é "só
+   interação nominal": jurídico na conversa sem ticket aberto. Ela não existe
+   na visão por ticket e é a única forma de ver processo acontecendo por fora. #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Onde o jurídico aparece</h2>
+    <span class="ph" style="margin:0">ticket formal × interação nominal · os dois sinais são independentes</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Sinal</th>
+          <th class="n">Deals</th>
+          <th class="n">% da coorte</th>
+          <th class="n grp">Won</th>
+          <th class="n">Conversão</th>
+          <th class="n grp">Ticket médio</th>
+          <th class="n">Valor ganho</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in matrix %}
+        <tr>
+          <td class="first">
+            <span class="lg-dot lg-t-{{ r.tone }}"></span>{{ r.label }}
+            <div class="lg-hint">{{ r.hint }}</div>
+          </td>
+          <td class="n"><b><span class="lg-cell" data-drill="{{ r.drill }}">{{ r.deals|intg }}</span></b></td>
+          <td class="n">
+            <div class="lg-share-bar"><i style="width:{{ (r.share * 100)|round(1) }}%"></i></div>
+            <span class="lg-share-num">{{ (r.share * 100)|pctraw }}</span>
+          </td>
+          <td class="n grp">{{ r.won|intg }}</td>
+          <td class="n"><b class="lg-conv">{% if r.conv is not none %}{{ r.conv|pctraw }}{% else %}—{% endif %}</b></td>
+          <td class="n grp">{% if r.ticket %}{{ r.ticket|money }}{% else %}—{% endif %}</td>
+          <td class="n">{{ r.mrr|brl }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ---------- 3. A sinalização nominal ----------
+   Ana · Luiza · juridico@. As linhas NÃO somam de propósito: o mesmo deal
+   costuma ter mais de uma das três, e apresentá-las como partes de um todo
+   mentiria. A coluna de canal existe porque Luiza e juridico@ não movem estágio
+   de ticket no HubSpot — sem dizer isso, o e-mail parece participação menor. #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Interação do time jurídico</h2>
+    <span class="ph" style="margin:0">um deal pode ter mais de uma pessoa · as linhas não somam</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Quem</th>
+          <th>Sinal observável</th>
+          <th class="n grp">Deals fechados</th>
+          <th class="n">Won</th>
+          <th class="n">Conversão</th>
+          <th class="n grp">Ticket médio</th>
+          <th class="n">Valor ganho</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for p in people %}
+        <tr>
+          <td class="first"><b>{{ p.label }}</b><div class="lg-hint">{{ p.email }}</div></td>
+          <td><span class="lg-chan">{{ p.channels }}</span></td>
+          <td class="n grp"><b><span class="lg-cell" data-drill="{{ p.drill }}">{{ p.deals|intg }}</span></b></td>
+          <td class="n">{{ p.won|intg }}</td>
+          <td class="n"><b class="lg-conv">{% if p.conv is not none %}{{ p.conv|pctraw }}{% else %}—{% endif %}</b></td>
+          <td class="n grp">{% if p.ticket %}{{ p.ticket|money }}{% else %}—{% endif %}</td>
+          <td class="n">{{ p.mrr|brl }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ---------- 4. Desfecho no jurídico ----------
+   Onde a minuta parou, contra o desfecho comercial. Responde a pergunta que o
+   comparativo não responde: "ter chamado o jurídico" e "o contrato ter saído"
+   são coisas diferentes, e a linha de perdido-no-jurídico é a que mostra isso. #}
+{% endif %}{# nominal #}
+
+{% if status_rows %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Desfecho no jurídico</h2>
+    <span class="ph" style="margin:0">estágio do ticket no pipeline Legal × desfecho comercial do deal</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Situação da minuta</th>
+          <th class="n grp">Deals fechados</th>
+          <th class="n">Won</th>
+          <th class="n">Conversão</th>
+          <th class="n grp">Ticket médio</th>
+          <th class="n">Valor ganho</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in status_rows %}
+        <tr>
+          <td class="first">{{ r.label }}
+            {%- if r.stages %}<div class="lg-hint">parou em: {{ r.stages }}</div>{% endif %}</td>
+          <td class="n grp"><b><span class="lg-cell" data-drill="{{ r.drill }}">{{ r.deals|intg }}</span></b></td>
+          <td class="n">{{ r.won|intg }}</td>
+          <td class="n"><b class="lg-conv">{% if r.conv is not none %}{{ r.conv|pctraw }}{% else %}—{% endif %}</b></td>
+          <td class="n grp">{% if r.ticket %}{{ r.ticket|money }}{% else %}—{% endif %}</td>
+          <td class="n">{{ r.mrr|brl }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<style>
+  /* Avisos de método. Não são "erro": são a premissa que faz o número da tela
+     querer dizer alguma coisa, então ficam ANTES dos painéis e não num tooltip. */
+  .lg-warn{
+    border: 1px solid color-mix(in srgb, #2563EB 28%, transparent);
+    background: color-mix(in srgb, #2563EB 7%, transparent);
+    border-left: 3px solid #2563EB;
+    border-radius: 8px;
+    padding: 11px 14px;
+    margin: 0 0 16px;
+    font-size: 12.5px; line-height: 1.55; color: var(--fg);
+  }
+  .lg-warn-hot{
+    border-color: color-mix(in srgb, #B45309 32%, transparent);
+    background: color-mix(in srgb, #B45309 8%, transparent);
+    border-left-color: #B45309;
+  }
+  .lg-warn i{ font-style: italic; }
+
+  .lg-controls{ display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: center; }
+  .lg-ctl{ display: flex; align-items: center; gap: 10px; }
+  .lg-ctl-lbl{
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--muted); white-space: nowrap;
+  }
+
+  /* O comparativo. Grid no CONTAINER (linhas são display:contents) pra as 4
+     colunas alinharem entre métricas — é o alinhamento que faz o par de cada
+     número ser encontrado sem procurar. */
+  .lg-vs{
+    display: grid;
+    grid-template-columns: minmax(160px, 1.4fr) repeat(2, minmax(120px, 1fr)) minmax(110px, .9fr);
+    align-items: stretch;
+    gap: 0;
+  }
+  .lg-vs-head, .lg-vs-row{ display: contents; }
+
+  .lg-vs-head > *{
+    padding: 0 14px 10px;
+    border-bottom: 1px solid var(--border, #E2E8F0);
+  }
+  .lg-vs-title{ font-size: 13px; font-weight: 700; }
+  .lg-vs-sub{ font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .lg-vs-row > *{
+    padding: 13px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border, #E2E8F0) 60%, transparent);
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .lg-vs-row:last-child > *{ border-bottom: 0; }
+
+  .lg-vs-metric{ }
+  .lg-vs-metric b{ font-size: 13px; }
+  .lg-vs-metric span{ font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  /* Fundo tênue nas duas colunas comparadas: separa os grupos sem linha
+     vertical, que competiria com as linhas horizontais das métricas. */
+  .lg-vs-com{ background: color-mix(in srgb, #0F6E56 6%, transparent); }
+  .lg-vs-sem{ background: color-mix(in srgb, #64748B 6%, transparent); }
+  .lg-vs-head .lg-vs-com, .lg-vs-head .lg-vs-sem{ cursor: pointer; }
+  .lg-vs-head .lg-vs-com:hover, .lg-vs-head .lg-vs-sem:hover{ filter: brightness(.97); }
+
+  .lg-big{
+    font-size: 21px; font-weight: 700;
+    font-variant-numeric: tabular-nums; line-height: 1.15;
+  }
+  .lg-vs-com .lg-big{ color: #0F6E56; }
+  .lg-den{
+    font-size: 11px; color: var(--muted); margin-top: 3px;
+    font-variant-numeric: tabular-nums;
+  }
+  .lg-den[data-drill]{ cursor: pointer; border-bottom: 1px dotted var(--muted-2); align-self: start; }
+  .lg-den[data-drill]:hover{ color: #2563EB; }
+
+  .lg-delta{
+    font-size: 15px; font-weight: 700;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .lg-delta.up{ color: #15803D; }
+  .lg-delta.down{ color: #B91C1C; }
+  .lg-share{ font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .lg-na{ color: var(--muted); }
+
+  /* Tabelas: número clicável sem parecer link solto (mesmo idioma do Funil II). */
+  .lg-cell{ cursor: pointer; border-bottom: 1px dotted var(--muted-2); }
+  .lg-cell:hover{ color: #2563EB; }
+  .lg-conv{ font-variant-numeric: tabular-nums; }
+  .lg-hint{ font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 2px; line-height: 1.4; }
+  .lg-chan{
+    font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: color-mix(in srgb, #2563EB 10%, transparent);
+    color: #1D4ED8; white-space: nowrap;
+  }
+  .lg-dot{
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 7px; vertical-align: 1px; background: var(--c);
+  }
+  .lg-t-green{ --c: #0F6E56; }
+  .lg-t-teal { --c: #0E7490; }
+  .lg-t-amber{ --c: #B45309; }
+  .lg-t-slate{ --c: #94A3B8; }
+
+  /* Barra de participação DENTRO da célula: a proporção entra pelo olho antes
+     do número, que fica embaixo pra quem precisa do valor exato. */
+  .lg-share-bar{
+    height: 4px; border-radius: 2px; margin: 0 0 3px auto;
+    width: 100%; max-width: 90px;
+    background: color-mix(in srgb, var(--muted) 18%, transparent);
+    overflow: hidden;
+  }
+  .lg-share-bar i{ display: block; height: 100%; background: #2563EB; }
+  .lg-share-num{ font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 780px){
+    .lg-vs{ grid-template-columns: 1fr 1fr; }
+    .lg-vs-metric{ grid-column: 1 / -1; padding-bottom: 2px; }
+    .lg-vs-d{ grid-column: 1 / -1; }
+  }
+</style>
+{% endblock %}
