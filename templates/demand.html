@@ -153,7 +153,7 @@
   <h2>Perdidos no Stage 1 e no Stage 2
     <span style="font-size:13px;font-weight:400;color:var(--muted)">· S1 = Scheduled · S2 = Qualifying · criados no período</span>
   </h2>
-  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="lost-s12" data-keep-order="1">
+  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="lost-s12" data-keep-order="1" data-grouped="1">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq,auto_exp" style="--c:#2563EB">
         <span class="leg-dot" style="background:#2563EB"></span>Gerados pelo próprio AE
@@ -163,8 +163,9 @@
       </button>
     </div>
     {% set ae_lost = by_ae|sort(attribute='lost_total', reverse=true)|list %}
-    <div class="vbars" style="--count:{{ (ae_lost|length) * 2 }}">
+    <div class="vbars vbars-grouped" style="--count:{{ ae_lost|length }}">
       {% for r in ae_lost %}
+        <div class="vbar-group">
         {% for k in (1, 2) %}
           {% set lo = r['lost%d_own'|format(k)]|int %}
           {% set lr = r['lost%d_rcv'|format(k)]|int %}
@@ -172,9 +173,8 @@
           {% set h_pct = (tot / max_lost * 100) if max_lost else 0 %}
           {% set seg_url = url_for('demand_deals', name=r.account_executive, grain='ae', date_from=range_from, date_to=range_to, lost_stage=k) %}
           <div class="vbar{% if tot <= 0 %} is-empty{% endif %}"
-               data-acq="{{ lo }}" data-rcv="{{ lr }}" data-name="{{ r.account_executive }} · S{{ k }}"
-               {% if tot > 0 %}data-drill="{{ seg_url }}" data-drill-title="{{ r.account_executive }} · perdidos no Stage {{ k }}"{% endif %}
-               {% if k == 2 %}style="margin-right:10px"{% endif %}>
+               data-acq="{{ lo }}" data-rcv="{{ lr }}" data-name="{{ r.account_executive }} · S{{ k }} ({{ 'Scheduled' if k == 1 else 'Qualifying' }})"
+               {% if tot > 0 %}data-drill="{{ seg_url }}" data-drill-title="{{ r.account_executive }} · perdidos no Stage {{ k }}"{% endif %}>
             <div class="vbar-tip"></div>
             <div class="vbar-track" style="--h:{{ h_pct }}%">
               <div class="vbar-val">{{ tot|intg }}</div>
@@ -183,13 +183,27 @@
                 {% if lr > 0 %}<div class="vbar-seg" data-ch="rcv" style="background:#10B981;flex:{{ lr }}" data-drill="{{ seg_url }}&bucket=rcv_exp,rcv_outbound,rcv_inbound" data-drill-title="{{ r.account_executive }} · S{{ k }} · recebidos"></div>{% endif %}
               </div>
             </div>
-            <div class="vbar-name">{{ r.account_executive }} · S{{ k }}</div>
+            <div class="vbar-stage">S{{ k }}</div>
           </div>
         {% endfor %}
+          <div class="vbar-group-name">{{ r.account_executive }}</div>
+        </div>
       {% endfor %}
     </div>
   </div>
 </div>
+
+<style>
+  /* Perdidos S1/S2: um grupo por AE, duas colunas lado a lado e UM nome. */
+  .vbars-grouped .vbar-group{flex:1 1 0;min-width:0;display:flex;gap:3px;position:relative}
+  .vbars-grouped .vbar-col{width:clamp(10px,88%,40px)}
+  .vbars-grouped .vbar-stage{position:absolute;top:calc(100% + 3px);left:50%;transform:translateX(-50%);
+    font-size:10px;font-weight:600;color:var(--muted);pointer-events:none}
+  .vbars-grouped .vbar-group-name{position:absolute;top:calc(100% + 20px);right:50%;transform:rotate(-32deg);
+    transform-origin:top right;text-align:right;white-space:nowrap;font-size:11px;font-weight:500;
+    color:var(--fg-soft);padding-right:4px;pointer-events:none}
+  .vbars-grouped .vbar-group:hover .vbar-group-name{color:var(--fg);font-weight:600}
+</style>
 
 {# ------- Chart 2: Recebidas pelo AE — split Inbound/Outbound/Expansão ------- #}
 <div class="panel">
@@ -348,7 +362,11 @@
     const keepOrder = chart.dataset.keepOrder === '1';
     const valMode   = chart.dataset.valMode || 'total';   // 'total' | 'pct'
     const cont = chart.querySelector('.vbars');
-    const rows = Array.from(cont.children).filter(c => c.classList.contains('vbar'));
+    // data-grouped="1": barras dentro de .vbar-group (ex.: perdidos S1/S2) — não
+    // reordena nem tira do grupo; --count = nº de grupos.
+    const grouped = chart.dataset.grouped === '1';
+    const rows = grouped ? Array.from(cont.querySelectorAll('.vbar'))
+                         : Array.from(cont.children).filter(c => c.classList.contains('vbar'));
     const barChannels = active.filter(c => c !== 'goal');
     // Label legível por canal — lê do botão da legenda do próprio chart
     const labelFor = (ch) => {
@@ -364,10 +382,10 @@
     const goalValue = parseInt(chart.dataset.goalValue || '0', 10);
     const useGoal = active.includes('goal') && goalValue > 0;
     const max = useGoal ? Math.max(dataMax, goalValue) : dataMax;
-    if (!keepOrder) rows.sort((a,b) => b._total - a._total);
+    if (!keepOrder && !grouped) rows.sort((a,b) => b._total - a._total);
     const frag = document.createDocumentFragment();
     rows.forEach(r => {
-      frag.appendChild(r);
+      if (!grouped) frag.appendChild(r);
       const track = r.querySelector('.vbar-track');
       track.style.setProperty('--h', (r._total / max * 100) + '%');
       r.querySelectorAll('.vbar-seg').forEach(seg => {
@@ -413,7 +431,7 @@
     // espaço (is-empty é opacidade, não display:none). Então conta TODAS as
     // barras: contar só as não-zero inflava o gap e esmagava as barras — com 30
     // AEs e 4 zerados, cada barra ficava com meio pixel.
-    cont.style.setProperty('--count', Math.max(rows.length, 1));
+    cont.style.setProperty('--count', Math.max(grouped ? cont.querySelectorAll('.vbar-group').length : rows.length, 1));
 
     // Atualiza linha de meta: visibilidade + posição (segue o max dinâmico)
     const goalLine = chart.querySelector('.vbar-goal');
