@@ -6,7 +6,18 @@
 
 {# ------- Chart 1: Geradas pelo time do líder (auto) ------- #}
 <div class="panel">
-  <h2>Geradas pelo time do líder</h2>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
+    <h2>Geradas pelo time do líder{% if ctx.gr_lw_on %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· última semana fechada</span>{% endif %}</h2>
+    {% if ctx.gr_lw_url %}
+    <a href="{{ ctx.gr_lw_url }}" class="lw-btn{% if ctx.gr_lw_on %} is-on{% endif %}"
+       title="{% if ctx.gr_lw_on %}Voltar ao período anterior{% else %}Ver a última semana fechada (seg–dom){% endif %}">↺ Última semana</a>
+    {% endif %}
+  </div>
+  <style>
+    .lw-btn{display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--blue,#2563EB);color:var(--blue,#2563EB);
+      border-radius:999px;padding:6px 12px;font-weight:600;font-size:13px;text-decoration:none;white-space:nowrap}
+    .lw-btn.is-on{background:var(--blue,#2563EB);color:#fff}
+  </style>
   <div class="dchart" data-drill-chips="bucket" data-channels="acq exp goal" data-chart="auto"
        data-color-acq="#2563EB" data-color-exp="#1E3A8A"
        data-goal-mode="per-bar"

@@ -244,6 +244,45 @@
              subtítulo da página — um date-picker aqui só permitiria montar pares
              não-consecutivos e quebrar a comparação Early↔Late. --- #}
       {% if ctx.period_locked %}
+      {# --- Período por GRANULARIDADE (Geração de Demanda) --- #}
+      {% elif ctx.period_mode == 'gran' %}
+      <div class="f-group gr-group">
+        <label>Período</label>
+        <div class="gr-row">
+          <div class="gr-seg" role="group" aria-label="Granularidade">
+            {% for g in ctx.gr_gran %}<a class="gr-sbtn{% if g.active %} is-on{% endif %}" href="{{ g.url }}"{% if g.active %} aria-current="true"{% endif %}>{{ g.label }}</a>{% endfor %}
+          </div>
+          <a class="gr-ib" href="{{ ctx.gr_prev }}" aria-label="Período anterior">◀</a>
+          <span class="gr-cur">{{ ctx.gr_label }}</span>
+          <a class="gr-ib" href="{{ ctx.gr_next }}" aria-label="Próximo período">▶</a>
+          <a class="gr-today" href="{{ ctx.gr_today }}">Hoje</a>
+        </div>
+        <div class="gr-row gr-quick">
+          {% if ctx.gr_years %}
+          <select class="gr-year" aria-label="Ano" onchange="if(this.value)location.href=this.value">
+            {% for y in ctx.gr_years %}<option value="{{ y.url }}" {% if y.selected %}selected{% endif %}>{{ y.year }}</option>{% endfor %}
+          </select>
+          {% endif %}
+          {% for q in ctx.gr_quick %}<a class="gr-chip{% if q.active %} is-on{% endif %}{% if q.fy %} gr-fy{% endif %}" href="{{ q.url }}">{{ q.label }}</a>{% endfor %}
+        </div>
+      </div>
+      <style>
+        .gr-group .gr-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+        .gr-group .gr-quick{margin-top:6px}
+        .gr-seg{display:inline-flex;border:1px solid var(--line,#DFE4EB);border-radius:8px;overflow:hidden}
+        .gr-sbtn{padding:7px 12px;font-weight:600;font-size:13px;color:inherit;text-decoration:none;background:var(--surface,#fff)}
+        .gr-sbtn+.gr-sbtn{border-left:1px solid var(--line,#DFE4EB)}
+        .gr-sbtn.is-on{background:var(--blue,#2563EB);color:#fff}
+        .gr-ib,.gr-today{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line,#DFE4EB);border-radius:8px;
+          padding:6px 10px;font-weight:600;font-size:13px;color:inherit;text-decoration:none;background:var(--surface,#fff)}
+        .gr-ib:hover,.gr-today:hover,.gr-chip:hover,.gr-sbtn:hover{filter:brightness(.97)}
+        .gr-cur{font-weight:600;font-size:13px;min-width:210px;text-align:center;font-variant-numeric:tabular-nums}
+        .gr-group select.gr-year{width:auto;min-width:0;flex:0 0 auto;padding:5px 8px;border-radius:8px}
+        .gr-chip{border:1px solid var(--line,#DFE4EB);border-radius:999px;padding:4px 10px;font-size:12.5px;font-weight:500;color:inherit;
+          text-decoration:none;background:var(--surface,#fff);font-variant-numeric:tabular-nums}
+        .gr-chip.is-on{background:var(--fg,#16202D);border-color:var(--fg,#16202D);color:#fff}
+        .gr-chip.gr-fy{margin-left:6px}
+      </style>
       {# --- Período em BOTÕES (Overview): ano + Q1..Q4 + FY --- #}
       {% elif ctx.period_mode == 'qchips' %}
       <div class="f-group qc-group">
