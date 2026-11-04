@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import weakref
 from datetime import date, datetime, timedelta, timezone
 
 # FUSO DE BRASÍLIA, FIXO. O container do Cloud Run roda em UTC, e o código deste
@@ -1223,9 +1224,16 @@ def _identify_hold_deal_ids(deals: pd.DataFrame, force: bool = False) -> set:
     if len(cw):   # só candidatos recentes (~2 quarters) — o hold é sempre recente
         _cut = cw["po_emission_date"].max() - pd.Timedelta(days=210)
         cw = cw[cw["po_emission_date"] >= _cut]
+    # Agrupa por AE numa passada só. Filtrar o frame inteiro por AE dentro do laço
+    # custava ~2-3 ms por filtro com as strings Arrow do pandas 3 (65 ms por
+    # chamada, e /overview e /pipeline chamam a cada request). Mesma ordem de
+    # linhas do filtro, então o casamento de 1 ou 2 deals escolhe os mesmos.
+    by_ae: dict = {}
+    for _ae, _did, _amt in zip(cw["account_executive"].tolist(), cw["deal_id"].tolist(),
+                               cw["amount"].tolist()):
+        by_ae.setdefault(_ae, []).append((_did, float(_amt)))
     for ae, H in onhold.items():
-        rows = [(r.deal_id, float(r.amount))
-                for r in cw[cw["account_executive"] == ae][["deal_id", "amount"]].itertuples(index=False)]
+        rows = by_ae.get(ae, [])
         match = None
         for did, amt in rows:                       # 1 deal
             if abs(amt - H) < 2:
@@ -2773,6 +2781,35 @@ def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     return piv
 
 
+# Memo de valores DERIVADOS de um frame (um set, uma série), preso ao OBJETO.
+# Não dá pra chavear só por id(frame): o id é reaproveitado depois que o frame
+# morre, e um frame novo herdaria o derivado do velho. Por isso a entrada guarda
+# um weakref e só vale se ele ainda aponta pro MESMO objeto; quando o frame é
+# coletado, o callback tira a entrada (memória acompanha a vida do frame).
+_DERIVED_LOCK = threading.Lock()
+_DERIVED: dict = {}
+
+
+def _derived(obj, name, build):
+    k = (id(obj), name)
+    with _DERIVED_LOCK:
+        hit = _DERIVED.get(k)
+    if hit is not None and hit[0]() is obj:
+        return hit[1]
+    val = build()
+    def _drop(ref, k=k):
+        with _DERIVED_LOCK:
+            if _DERIVED.get(k, (None,))[0] is ref:
+                del _DERIVED[k]
+    try:
+        ref = weakref.ref(obj, _drop)
+    except TypeError:
+        return val
+    with _DERIVED_LOCK:
+        _DERIVED[k] = (ref, val)
+    return val
+
+
 def _stage_active_mask(piv, num, lo, hi):
     """Deals ATIVOS no estágio `num` na janela [lo, hi): entraram até o fim da
     janela e só saíram (outra 1ª entrada posterior) depois do início dela.
@@ -2781,9 +2818,14 @@ def _stage_active_mask(piv, num, lo, hi):
     ent = piv[f"s{num}"]
     if num == 7:
         return ((ent >= lo) & (ent < hi)).fillna(False)
-    stage_cols = [f"s{n}" for n in range(1, 8)] + ["s99"]
-    others = piv[stage_cols].drop(columns=[f"s{num}"])
-    exit_ts = others.where(others.gt(ent, axis=0)).min(axis=1)   # NaT = nunca saiu
+
+    def _exit_ts():
+        stage_cols = [f"s{n}" for n in range(1, 8)] + ["s99"]
+        others = piv[stage_cols].drop(columns=[f"s{num}"])
+        return others.where(others.gt(ent, axis=0)).min(axis=1)   # NaT = nunca saiu
+    # A saída só depende do frame e do estágio, não da janela: o Sales Overtime
+    # pede 8 trimestres × 2 estágios × 4 pares (~8 ms cada, 270 ms por página).
+    exit_ts = _derived(piv, f"exit_ts_{num}", _exit_ts)
     return ent.notna() & (ent < hi) & (exit_ts.isna() | (exit_ts >= lo))
 
 
@@ -3120,11 +3162,16 @@ def _lost_stage_of(deals: pd.DataFrame) -> pd.Series:
     try:
         piv = _get_funnel_entries()
         cols = [c for c in ("s2", "s3", "s4", "s5", "s6", "s7") if c in piv.columns]
-        hit2 = set(piv.loc[piv[cols].notna().any(axis=1), "deal_id"].astype(str))
+        # Preso ao frame do cache (mesmo objeto enquanto o parquet não muda).
+        hit2 = _derived(piv, "hit2", lambda: set(
+            piv.loc[piv[cols].notna().any(axis=1), "deal_id"].astype(str)))
     except Exception as e:  # noqa: BLE001 — sem histórico, cai no conservador
         print(f"pepeuhacker · lost-stage: histórico indisponível ({e})", flush=True)
         hit2 = set()
-    reached2 = deals["deal_id"].astype(str).isin(hit2) | scop
+    # Pertinência em Python puro: `Series.isin(set)` nas strings Arrow do pandas 3
+    # levava ~50 ms em 10 mil deals; a list comprehension, ~1,5 ms.
+    reached2 = pd.Series([x in hit2 for x in deals["deal_id"].astype(str).tolist()],
+                         index=deals.index, dtype=bool) | scop
     out = pd.Series(0, index=deals.index, dtype=int)
     out[lost & ~reached2] = 1
     out[lost & reached2 & ~scop] = 2

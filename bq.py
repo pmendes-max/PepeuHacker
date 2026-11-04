@@ -11,6 +11,7 @@ if os.path.exists(_LOCAL_SA):
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _LOCAL_SA)
 
 from pathlib import Path
+from collections import OrderedDict
 import re
 import pandas as pd
 import db_dtypes  # noqa: F401 — registra dtypes dbdate/dbtime p/ ler parquet do cache
@@ -50,6 +51,42 @@ def _write_parquet_atomic(df: pd.DataFrame, cache_file: Path) -> None:
 
 
 _bq_down_until = 0.0
+# read_parquet memoizado por arquivo. Cada request "quente" ainda relia de 2 a 6
+# parquets do disco ANTES de olhar o cache em memória do app (14 ms só o de
+# pipeline_deals), porque o stale-while-revalidate mora na leitura. O parquet só
+# muda quando alguém o regrava via `_write_parquet_atomic` (os.replace → inode e
+# mtime novos), então (mtime, inode, tamanho) identifica a versão com folga.
+# Devolve CÓPIA: os callers mutam o frame (canon_ae_names, to_usd...). LRU com
+# teto de arquivos pra memória não crescer com as janelas datadas (pipe_wow_…).
+_PQ_MEMO_MAX = 32
+_PQ_MEMO: "OrderedDict[str, tuple]" = OrderedDict()
+_PQ_MEMO_LOCK = threading.Lock()
+
+
+def _read_parquet(path: Path) -> pd.DataFrame:
+    try:
+        st = path.stat()
+    except OSError:
+        return pd.read_parquet(path)
+    sig = (st.st_mtime_ns, st.st_ino, st.st_size)
+    k = str(path)
+    with _PQ_MEMO_LOCK:
+        hit = _PQ_MEMO.get(k)
+        if hit is not None and hit[0] == sig:
+            _PQ_MEMO.move_to_end(k)
+            df = hit[1]
+        else:
+            df = None
+    if df is None:
+        df = pd.read_parquet(path)
+        with _PQ_MEMO_LOCK:
+            _PQ_MEMO[k] = (sig, df)
+            _PQ_MEMO.move_to_end(k)
+            while len(_PQ_MEMO) > _PQ_MEMO_MAX:
+                _PQ_MEMO.popitem(last=False)
+    return df.copy()
+
+
 
 # Stale-while-revalidate: quando o parquet vence, servimos o dado velho na hora
 # e disparamos UM refresh em background (dedup por chave). Nenhum request de
@@ -78,12 +115,12 @@ def _query_raw(sql: str, cache_key: str | None = None, ttl: int = CACHE_TTL,
     if cache_file and cache_file.exists() and not force_refresh:
         age = now - cache_file.stat().st_mtime
         if age < ttl:
-            return pd.read_parquet(cache_file)          # fresco
+            return _read_parquet(cache_file)          # fresco
         # Vencido → stale-while-revalidate: devolve o velho AGORA e atualiza em
         # background (se o BQ não estiver em cooldown). Usuário nunca espera.
         if now >= _bq_down_until:
             _spawn_refresh(sql, cache_key)
-        return pd.read_parquet(cache_file)
+        return _read_parquet(cache_file)
 
     # Sem cache em disco. BQ caiu há pouco? tenta um irmão stale antes de falhar.
     if not force_refresh and now < _bq_down_until:
