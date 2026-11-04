@@ -4420,6 +4420,8 @@ def base_context():
         # Selo de frescor: de QUANDO é o dado que está na tela. Ver
         # `source_freshness` — idade da fonte, nunca idade do cache.
         "freshness": source_freshness(),
+        # 2ª linha do selo: o que NÃO vem da fonte viva (valor, dono, data do PO).
+        "bi_freshness": bi_freshness(),
         # Filtro de PERÍODO mutável por aba: 'quarter' (Sales Overtime) troca o
         # date-range por presets de N trimestres + intervalo aberto quarter→quarter.
         **_period_widget_ctx(),
@@ -14642,6 +14644,53 @@ def source_freshness() -> dict:
         # velho de verdade, e quem abre a tela às 8h precisa saber disso.
         "stale": age_min > 240,
     }
+
+
+_BI_FRESH_LOCK = threading.Lock()
+_BI_FRESH: dict = {"sig": None, "val": None}
+
+
+def bi_freshness() -> dict:
+    """2ª linha do selo: de quando é a base do BI.
+
+    O selo de cima mede `hs_lastmodifieddate` da view VIVA, que só manda estágio,
+    close date e forecast category. Valor, dono (AE) e data do PO — e a própria
+    existência do deal — vêm da curada `int_adding_names_to_deals`, que lê a sync
+    legada parada desde ~11/10/2026. Um deal tocado pela ingestão fazia o selo
+    dizer "dado de 5 min atrás" com valor, dono e PO de semanas: o selo mentia.
+
+    A idade sai de dado JÁ CARREGADO, sem query nova: o `created_date` mais
+    recente do parquet de pipeline_deals (todos os deals do funil BR, lidos da
+    curada). Base parada = nenhum deal novo, e a data para junto. Só a coluna,
+    e só quando o parquet muda (memo por mtime) — custa nada por request.
+    Sem parquet ou sem a coluna, cai no aviso fixo."""
+    p = bq.CACHE_DIR / "pipeline_deals_raw_v6.parquet"
+    try:
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {"ok": False}
+    with _BI_FRESH_LOCK:
+        if _BI_FRESH["sig"] == sig:
+            return _BI_FRESH["val"]
+    try:
+        cd = pd.to_datetime(pd.read_parquet(p, columns=["created_date"])["created_date"],
+                            errors="coerce")
+        mx = cd.max()
+        if pd.isna(mx):
+            val = {"ok": False}
+        else:
+            d = mx.date()
+            dias = (_today() - d).days
+            # Deal novo entra todo dia útil; 4 dias cobre o fim de semana sem
+            # acender à toa.
+            val = {"ok": True, "newest": d, "age_days": dias, "stale": dias > 4}
+    except Exception as e:  # noqa: BLE001 — selo nunca derruba tela
+        print(f"pepeuhacker · selo da base do BI falhou ({e})", flush=True)
+        val = {"ok": False}
+    with _BI_FRESH_LOCK:
+        _BI_FRESH["sig"], _BI_FRESH["val"] = sig, val
+    return val
 
 
 def _refresh_loop(interval: int = 300, last_src: float = 0.0):

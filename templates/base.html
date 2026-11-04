@@ -423,6 +423,11 @@
          quando descobrimos que a fonte do HubSpot tinha parado havia 3 dias e o
          dashboard servia o funil de sexta sem nenhum aviso na tela. Fica em
          vermelho (.is-stale) quando a fonte passa de 3h sem gravar. #}
+      {# 2ª linha (11/2026): o selo de cima mede só a fonte VIVA (estágio, close
+         date, forecast category). Valor, dono e data do PO vêm da base do BI,
+         parada desde ~11/10/2026 — sem esta linha o selo dizia "5 min atrás"
+         para números de semanas. Ver `bi_freshness`. #}
+      <span class="fresh-stack">
       {% if ctx.freshness and ctx.freshness.ok %}
       <span class="fresh-seal {% if ctx.freshness.stale %}is-stale{% endif %}"
             title="Deal mais recente que o HubSpot mandou: {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 5 em 5 min.">
@@ -433,6 +438,18 @@
         {% endif %}
       </span>
       {% endif %}
+      {% if ctx.bi_freshness and ctx.bi_freshness.ok %}
+      <span class="fresh-bi {% if ctx.bi_freshness.stale %}is-stale{% endif %}"
+            title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot. Deal mais novo nessa base: criado em {{ ctx.bi_freshness.newest.strftime('%d/%m/%Y') }}. Deal criado depois disso ainda não aparece.">
+        valor, dono e PO: base do BI até {{ ctx.bi_freshness.newest.strftime('%d/%m') }}
+      </span>
+      {% else %}
+      <span class="fresh-bi is-stale"
+            title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot.">
+        valor, dono e PO: base do BI (desatualizada desde ~11/10/2026)
+      </span>
+      {% endif %}
+      </span>
       {# No Sales MX não há toggle: o time é medido em dólar e um deal em peso não
          tem leitura em real. A moeda é fixa e a página diz isso no subtítulo. #}
       {# `display:none` inline e não `hidden`: .money-toggle tem display:flex no

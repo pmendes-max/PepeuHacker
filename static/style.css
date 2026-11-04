@@ -454,6 +454,10 @@ nav a.active{
 }
 .fresh-seal.is-stale{color:var(--red);border-color:var(--red);background:transparent}
 .fresh-seal.is-stale::before{background:var(--red)}
+/* 2ª linha do selo: idade da base do BI (valor, dono, PO), embaixo do selo vivo */
+.fresh-stack{display:inline-flex;flex-direction:column;align-items:flex-start;gap:3px}
+.fresh-bi{font-size:11px;font-weight:500;color:var(--muted);white-space:nowrap;padding:0 2px;cursor:default}
+.fresh-bi.is-stale{color:var(--red)}
 
 /* ---------- LAYOUT ---------- */
 .wrap{max-width:1720px;margin:0 auto;padding:32px 28px 80px}
