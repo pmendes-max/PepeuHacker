@@ -14281,6 +14281,23 @@ def _gzip_static_file(disk_path):
     return gzdata
 
 
+# "↻ Refresh BQ" (?refresh=1) força cada loader da tela, e vários pedem a mesma
+# chave: o /pipeline mandava ae_performance 6 vezes pro BigQuery, em série, no
+# mesmo request. O escopo faz o 1º pedido forçado de cada chave ir ao BQ e os
+# seguintes lerem o parquet recém-gravado (ver `bq._force_once`). Teardown e não
+# after_request: roda até quando a view estoura, e a thread do waitress é
+# reaproveitada no próximo request.
+@app.before_request
+def _abre_escopo_force():
+    if request.args.get("refresh") == "1":
+        bq.begin_force_scope()
+
+
+@app.teardown_request
+def _fecha_escopo_force(_exc=None):
+    bq.end_force_scope()
+
+
 @app.after_request
 def perf_headers(response):
     """Gzip pra HTML/CSS/JS + cache forte pro /static + ETag/304 pra revisitas.
