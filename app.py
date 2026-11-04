@@ -304,8 +304,17 @@ DEPARTED_FROM = {
     # aqui porque, sem quota no Q4, o Pedro pediu em 19/10/2026 que ele suma de
     # todo dado em que aparece como VENDEDOR (dono do deal) dali em diante. O
     # corte é por dono do deal, então o time dele continua inteiro.
+    # EXCEÇÃO (ver DEPARTED_FROM_KEEP_WON): venda FECHADA dele continua contando.
     "Arthur Tkotz":        date(2026, 10, 1),
 }
+
+# Exceção ao corte acima para VENDA FECHADA (closedwon). Pedido do Pedro em
+# 04/11/2026: a Crown Embalagens (Arthur, R$ 80k, PO 26/10/2026) sumia de todas
+# as telas por causa do corte de 19/10. O pipeline aberto dele segue fora (o
+# pedido de 19/10 continua valendo pra funil); o que ele FECHA entra como venda
+# de gestor — líder = ele mesmo, fora das barras de vendedor, dentro do pod
+# dele, do Fernando (ORG_CHART) e do total.
+DEPARTED_FROM_KEEP_WON = {"Arthur Tkotz"}
 
 
 def drop_departed_from(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
@@ -3675,8 +3684,19 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
         eff = pd.to_datetime(eff, errors="coerce").dt.date
         drop = pd.Series(False, index=df.index)
         for ae, cutoff in DEPARTED_FROM.items():
-            drop |= (df["account_executive"] == ae) & eff.notna() & (eff >= cutoff)
+            m = (df["account_executive"] == ae) & eff.notna() & (eff >= cutoff)
+            if ae in DEPARTED_FROM_KEEP_WON:
+                m &= ~df["is_won"]              # venda fechada fica (ver a constante)
+            drop |= m
         df = df[~drop]
+    # Venda fechada de quem está em DEPARTED_FROM_KEEP_WON é venda de gestor:
+    # líder = ele mesmo (sem isso o leader vinha do snapshot cru e o deal caía
+    # fora do ALLOWED_LEADERS / do pod dele).
+    if DEPARTED_FROM_KEEP_WON:
+        _kw = df["is_won"] & df["account_executive"].isin(DEPARTED_FROM_KEEP_WON)
+        df.loc[_kw, "leader"] = df.loc[_kw, "account_executive"]
+        df.loc[_kw, "region"] = "BR"
+        df.loc[_kw, "is_manager_sale"] = True
 
     with _DATA_CACHE_LOCK:
         _DATA_CACHE[key] = df
@@ -4602,7 +4622,11 @@ def _overview_page(ov_tab, grain="ae"):
     # data da RECEITA (`rev_po`, com a extensão de fechamento); `won_cal` é o mesmo
     # conjunto no calendário do PO e alimenta SÓ deals, ticket, ciclo, new logos e
     # nº de AEs — as métricas que não são receita seguem o calendário normal.
-    _won_base = dd["is_won"] & dd["po_emission_date"].notna() & ~dd["deal_id"].isin(hold_ids)
+    # REGRA (Pedro, 04/11/2026): venda fechada com PO em validação financeira
+    # (hold) CONTA no realizado, com o selo "em validação financeira". Por isso
+    # `_won_base` não exclui mais o hold; `hld` segue existindo só pra informar
+    # quanto do realizado ainda está em validação (card e selo do drill).
+    _won_base = dd["is_won"] & dd["po_emission_date"].notna()
     won  = dd[_won_base & (dd["rev_po"] >= lo) & (dd["rev_po"] <= hi)].copy()
     won_cal = dd[_won_base & (dd["po_emission_date"] >= lo)
                  & (dd["po_emission_date"] <= hi)].copy()
@@ -4779,9 +4803,9 @@ def _overview_page(ov_tab, grain="ae"):
             "leader": leader,
             "region": region,
             "is_manager": ae in _managers_in(rq),
-            "realized": realized,                       # Won validado (PO Won)
-            "hold": hold,                               # Won em aprovação financeira
-            "won_total": realized + hold,               # ranking = validado + hold
+            "realized": realized,                       # Won c/ PO (validado + em validação)
+            "hold": hold,                               # dos quais em validação financeira
+            "won_total": realized,                      # hold já está no realizado
             "deals": int(len(wc)),                      # contagem: calendário
             "ticket": _ticket_of(wc),                   # ticket: calendário
             "cycle": float(c.mean()) if len(c) else None,
@@ -4956,7 +4980,9 @@ def _overview_page(ov_tab, grain="ae"):
                              if pd.notna(r["po_emission_date"]) else "—"),
                 })
             return out
-        deal_rows = _mk_deals(won, "validado") + _mk_deals(hld, "aprovação")
+        _hold_set = set(hld["deal_id"])
+        deal_rows = (_mk_deals(won[~won["deal_id"].isin(_hold_set)], "validado")
+                     + _mk_deals(won[won["deal_id"].isin(_hold_set)], "aprovação"))
         deal_rows.sort(key=lambda x: x["mrr"], reverse=True)
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
@@ -5871,7 +5897,7 @@ def overview_deals():
     if kind == "ticket":
         _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
         rows = []
-        for _, r in won.iterrows():
+        for _, r in (pd.concat([won, hld], ignore_index=True) if len(hld) else won).iterrows():
             rows.append({
                 "deal_name": r.get("deal_name") or "—",
                 "deal_url": _hs_deal_url(r.get("deal_id")),
@@ -5903,13 +5929,16 @@ def overview_deals():
     if kind in ("acq", "exp", "newlogo"):
         _dtype = "Up & cross sell" if kind == "exp" else "Aquisition"
         sel = won[won["deal_type"] == _dtype]
+        # Hold conta como venda (regra do Overview): entra com o selo dele.
+        sel_h = hld[hld["deal_type"] == _dtype]
         if kind == "newlogo":
             carriers = _newlogo_goal_aes(lo.date(), hi.date(),
                                          region=request.args.get("region"),
                                          leader=request.args.get("leader"),
                                          ae=(name if grain == "ae" else None))
             sel = sel[sel["account_executive"].isin(carriers)]
-        rows = _mk(sel, "Validado")
+            sel_h = sel_h[sel_h["account_executive"].isin(carriers)]
+        rows = _mk(sel, "Validado") + _mk(sel_h, "Em validação financeira")
         rows.sort(key=lambda x: x["data"], reverse=True)
         amount = float(sum(x["amount"] for x in rows))
         _titles = {"acq": "Deals de aquisição", "exp": "Deals de expansão",
@@ -5918,7 +5947,7 @@ def overview_deals():
                 {"key": "ae",        "label": "AE"},
                 {"key": "amount",    "label": "MRR",   "type": "money"},
                 {"key": "data",      "label": "PO em", "type": "date"}]
-        if any(" · " in x["status"] for x in rows):
+        if len(sel_h) or any(" · " in x["status"] for x in rows):
             # Há deal cuja receita foi para outro quarter pela extensão: sem a
             # coluna, o "PO em 01/10" apareceria no Q3 sem explicação.
             cols.insert(3, {"key": "status", "label": "Status"})
@@ -5928,7 +5957,7 @@ def overview_deals():
             "columns": cols, "rows": rows,
         })
 
-    rows = _mk(won, "Validado") + _mk(hld, "Em aprovação")
+    rows = _mk(won, "Validado") + _mk(hld, "Em validação financeira")
     rows.sort(key=lambda x: x["data"], reverse=True)
     amount = float(sum(x["amount"] for x in rows))
     return jsonify({

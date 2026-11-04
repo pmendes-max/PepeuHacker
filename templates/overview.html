@@ -70,7 +70,7 @@
           <td class="n"><b>{{ d.mrr|brl }}</b></td>
           <td>
             {% if d.status == 'aprovação' %}
-              <span style="font-size:11.5px;font-weight:600;color:#B45309;background:#FEF3C7;padding:2px 8px;border-radius:20px">em aprovação</span>
+              <span style="font-size:11.5px;font-weight:600;color:#B45309;background:#FEF3C7;padding:2px 8px;border-radius:20px">em validação financeira</span>
             {% else %}
               <span style="font-size:11.5px;font-weight:600;color:var(--green-ink);background:#D1FAE5;padding:2px 8px;border-radius:20px">validado</span>
             {% endif %}
@@ -115,6 +115,8 @@
   <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir os deals realizados (validado + hold)">
     <div class="kpi-l">Realizado de receita</div>
     <div class="kpi-v">{{ kpis.realized|brl }}</div>
+    {# Venda fechada com PO em validação financeira (hold) já está somada acima. #}
+    {% if kpis.hold %}<div class="kpi-s">dos quais {{ kpis.hold|brl }} em validação financeira</div>{% endif %}
     {% set _ext = rev_ext_note(ctx.filters.date_from, ctx.filters.date_to) %}
     {% if _ext %}<div class="kpi-s">{{ _ext }}</div>{% endif %}
   </div>

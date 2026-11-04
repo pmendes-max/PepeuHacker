@@ -1,39 +1,38 @@
 #!/bin/bash
-# Publica o pepeuhacker no Cloud Run.
+# Publica o pepeuhacker no Cloud Run — MESMO serviço, MESMO link.
 #
-# POR QUE ESTE ARQUIVO FOI RECRIADO: o script original estava listado no
-# .gcloudignore, então ele nunca subiu junto com o fonte e não veio no pacote
-# recuperado do Cloud Run — perdeu-se com o disco do laptop. As flags abaixo
-# foram extraídas do serviço que está NO AR (revisão pepeuhacker-00003-q2t),
-# então um deploy com este script reproduz a configuração atual em vez de
-# sobrescrevê-la com os padrões do gcloud.
+# Só atualiza o CÓDIGO. Toda configuração do serviço (service account, variáveis
+# de ambiente, memória, instâncias, acesso/IAP) é herdada da revisão que está no
+# ar: `gcloud run deploy` mantém o que não for passado como flag.
+#
+# POR QUE ASSIM: a versão anterior deste script passava --set-env-vars,
+# --service-account etc. com valores copiados da revisão 00003 (ago/2026). Em
+# 04/11/2026 isso publicou a 00076 por cima da 00075 com configuração e código
+# antigos; foi preciso voltar o tráfego pra 00075. Não reintroduzir flags de
+# configuração aqui — mudança de config se faz de propósito, à parte.
+#
+# ANTES DE PUBLICAR: este diretório tem de estar com o código de PRODUÇÃO
+# (`git checkout main && git pull`). Publicar de uma pasta velha sobrescreve o
+# site com código velho.
 set -euo pipefail
 
 GCLOUD="$HOME/google-cloud-sdk/bin/gcloud"
-# O gcloud exige Python 3.10+; o do sistema é 3.9.6. Este 3.12 é só pra ele.
-export CLOUDSDK_PYTHON="$HOME/.local/python312/bin/python3"
+# O gcloud exige Python 3.10+; o do sistema é 3.9.
+export CLOUDSDK_PYTHON="${CLOUDSDK_PYTHON:-$HOME/.local/python312/bin/python3}"
 
 cd "$(dirname "$0")"
 
 echo "Publicando pepeuhacker · projeto tractian-bi · us-central1"
-echo "ATENÇÃO: este serviço é público (allUsers). Confira o que está no código antes."
+echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')  ·  commit: $(git log -1 --format='%h %s' 2>/dev/null || echo '?')"
 read -r -p "Continuar? [s/N] " ok
 [ "$ok" = "s" ] || { echo "Cancelado."; exit 1; }
 
 "$GCLOUD" run deploy pepeuhacker \
   --source . \
   --project tractian-bi \
-  --region us-central1 \
-  --service-account senior-leadership@tractian-bi.iam.gserviceaccount.com \
-  --allow-unauthenticated \
-  --min-instances 1 \
-  --max-instances 3 \
-  --cpu 1 \
-  --memory 2Gi \
-  --timeout 300 \
-  --cpu-boost \
-  --set-env-vars PEPEU_CACHE_DIR=/var/cache/pepeuhacker,USD_BRL_RATE=5.05
+  --region us-central1
 
-# --min-instances 1: o cache são 125 parquets em tmpfs (RAM). Se a instância
-# reciclar, tudo é reconstruído do BigQuery no próximo acesso — manter uma
-# instância viva evita pagar essa reconstrução no cold start.
+echo
+echo "Se algo der errado, volte pra revisão anterior (o link não muda):"
+echo "  $GCLOUD run revisions list --service pepeuhacker --region us-central1 --project tractian-bi --limit 5"
+echo "  $GCLOUD run services update-traffic pepeuhacker --to-revisions=<REVISAO_ANTERIOR>=100 --region us-central1 --project tractian-bi"
