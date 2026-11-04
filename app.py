@@ -320,6 +320,28 @@ DEPARTED_FROM = {
 DEPARTED_FROM_KEEP_WON = {"Arthur Tkotz"}
 
 
+# Correção MANUAL da data do PO (deal_id → data que vale pro dashboard). Só pra
+# erro de dado confirmado pela liderança; o resto segue a data do HubSpot e a
+# extensão de fechamento (`_rev_date`).
+PO_DATE_OVERRIDES = {
+    # Ciplan Sa - DF Recovery (Lucas Allgayer, R$ 33.500): PO gravado 23/09/2026,
+    # mas o deal só foi ganho em 30/10/2026. Pedro, 04/11/2026: conta no Q4.
+    "63083893322": date(2026, 10, 30),
+}
+
+
+def _apply_po_overrides(df: pd.DataFrame, col: str = "po_emission_date") -> pd.DataFrame:
+    """Aplica PO_DATE_OVERRIDES na coluna de data do PO (já em datetime)."""
+    if not PO_DATE_OVERRIDES or df is None or not len(df) or "deal_id" not in df.columns:
+        return df
+    ids = df["deal_id"].astype(str)
+    for did, d in PO_DATE_OVERRIDES.items():
+        m = ids == did
+        if m.any():
+            df.loc[m, col] = pd.Timestamp(d)
+    return df
+
+
 def _keep_won_rows(df: pd.DataFrame) -> pd.Series:
     """True nas linhas de VENDA FECHADA de quem está em DEPARTED_FROM_KEEP_WON —
     as que o corte de DEPARTED_FROM tem de poupar. Frame sem indicação de ganho
@@ -3731,6 +3753,7 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
     df["close_date"] = pd.to_datetime(df["close_date"], errors="coerce")
     df["po_emission_date"] = pd.to_datetime(df["po_emission_date"], errors="coerce")
+    df = _apply_po_overrides(df)                       # correções manuais de PO
     df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")  # p/ ciclo de vendas
     # Data de validação do won = data de emissão do PO; cai pro close date se vazia.
     # É ela (priorizada sobre o close date do HubSpot) que define o quarter do won.
@@ -10409,6 +10432,7 @@ def _wq_realizado(fr, f, force=False) -> pd.DataFrame:
     w = w.assign(week_idx=w["dia"].astype(str).map({x: k for k, x in enumerate(sufs)}))
     w = w[w["week_idx"].notna()].astype({"week_idx": int})
     w["po"] = pd.to_datetime(w["po_emission_date"].astype(object), errors="coerce")
+    w = _apply_po_overrides(w, "po")                   # correções manuais de PO
     w["rev_po"] = _rev_date(w["po"])
     w = w[w["rev_po"].notna()]
     rq = w["rev_po"].map(lambda t: _quarter_start_of(t.date()))
