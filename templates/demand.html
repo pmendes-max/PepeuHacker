@@ -147,21 +147,13 @@
 {# ------- Chart 2: Recebidas pelo AE — split Inbound/Outbound/Expansão ------- #}
 <div class="panel">
   <h2>Recebidas pelo AE</h2>
-  <div class="dchart" data-drill-chips="bucket" data-channels="inbound outbound moved_out moved_in exp" data-chart="rcv">
+  <div class="dchart" data-drill-chips="bucket" data-channels="inbound outbound exp" data-chart="rcv">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857">
         <span class="leg-dot" style="background:#10B981"></span>Inbound
       </button>
       <button type="button" class="leg-toggle is-on" data-ch="outbound" data-drill-val="rcv_outbound" style="--c:#6366F1">
         <span class="leg-dot" style="background:#6366F1"></span>Outbound
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B"
-              title="a propriedade motion do deal era Inbound e foi alterada para Outbound">
-        <span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777"
-              title="a propriedade motion do deal era Outbound e foi alterada para Inbound">
-        <span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound
       </button>
       <button type="button" class="leg-toggle is-on" data-ch="exp" data-drill-val="rcv_exp" style="--c:#047857">
         <span class="leg-dot" style="background:#047857"></span>Expansão
@@ -196,6 +188,53 @@
           </div>
           <div class="vbar-name">{{ r.account_executive }}</div>
         </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{# ------- Perdidos no Stage 1 e no Stage 2 (pedido de 04/11/2026) -------
+   Por AE, duas colunas: S1 = perdido sem nunca chegar ao Stage 2 (Qualifying);
+   S2 = perdido depois do Stage 2 e antes do Scoping. Cada coluna empilha os
+   gerados pelo próprio AE (azul) e os recebidos (verde). Coorte por CRIAÇÃO no
+   período, igual ao resto da página; a regra mora em `_lost_stage_of`. #}
+<div class="panel">
+  <h2>Perdidos no Stage 1 e no Stage 2
+    <span style="font-size:13px;font-weight:400;color:var(--muted)">· S1 = Scheduled · S2 = Qualifying · criados no período</span>
+  </h2>
+  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="lost-s12" data-keep-order="1">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq,auto_exp" style="--c:#2563EB">
+        <span class="leg-dot" style="background:#2563EB"></span>Gerados pelo próprio AE
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="rcv" data-drill-val="rcv_exp,rcv_outbound,rcv_inbound" style="--c:#10B981;--ci:#047857">
+        <span class="leg-dot" style="background:#10B981"></span>Recebidos pelo AE
+      </button>
+    </div>
+    {% set ae_lost = by_ae|sort(attribute='lost_total', reverse=true)|list %}
+    <div class="vbars" style="--count:{{ (ae_lost|length) * 2 }}">
+      {% for r in ae_lost %}
+        {% for k in (1, 2) %}
+          {% set lo = r['lost%d_own'|format(k)]|int %}
+          {% set lr = r['lost%d_rcv'|format(k)]|int %}
+          {% set tot = lo + lr %}
+          {% set h_pct = (tot / max_lost * 100) if max_lost else 0 %}
+          {% set seg_url = url_for('demand_deals', name=r.account_executive, grain='ae', date_from=range_from, date_to=range_to, lost_stage=k) %}
+          <div class="vbar{% if tot <= 0 %} is-empty{% endif %}"
+               data-acq="{{ lo }}" data-rcv="{{ lr }}" data-name="{{ r.account_executive }} · S{{ k }}"
+               {% if tot > 0 %}data-drill="{{ seg_url }}" data-drill-title="{{ r.account_executive }} · perdidos no Stage {{ k }}"{% endif %}
+               {% if k == 2 %}style="margin-right:10px"{% endif %}>
+            <div class="vbar-tip"></div>
+            <div class="vbar-track" style="--h:{{ h_pct }}%">
+              <div class="vbar-val">{{ tot|intg }}</div>
+              <div class="vbar-col">
+                {% if lo > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ lo }}" data-drill="{{ seg_url }}&bucket=auto_acq,auto_exp" data-drill-title="{{ r.account_executive }} · S{{ k }} · gerados pelo próprio AE"></div>{% endif %}
+                {% if lr > 0 %}<div class="vbar-seg" data-ch="rcv" style="background:#10B981;flex:{{ lr }}" data-drill="{{ seg_url }}&bucket=rcv_exp,rcv_outbound,rcv_inbound" data-drill-title="{{ r.account_executive }} · S{{ k }} · recebidos"></div>{% endif %}
+              </div>
+            </div>
+            <div class="vbar-name">{{ r.account_executive }} · S{{ k }}</div>
+          </div>
+        {% endfor %}
       {% endfor %}
     </div>
   </div>
@@ -250,14 +289,12 @@
       <a href="{{ grain_urls.quarter }}" class="grain-btn {% if grain=='quarter' %}active{% endif %}">Trimestral</a>
     </div>
   </div>
-  <div class="dchart" data-drill-chips="bucket" data-channels="auto_acq auto_exp received_inbound received_outbound received_moved_out received_moved_in received_exp" data-chart="trend" data-keep-order="1">
+  <div class="dchart" data-drill-chips="bucket" data-channels="auto_acq auto_exp received_inbound received_outbound received_exp" data-chart="trend" data-keep-order="1">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="auto_acq" data-drill-val="auto_acq" style="--c:#2563EB"><span class="leg-dot" style="background:#2563EB"></span>Próprio · Aquisição</button>
       <button type="button" class="leg-toggle is-on" data-ch="auto_exp" data-drill-val="auto_exp" style="--c:#1E3A8A"><span class="leg-dot" style="background:#1E3A8A"></span>Próprio · Expansão</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857"><span class="leg-dot" style="background:#10B981"></span>Recebidas · Inbound</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_outbound" data-drill-val="rcv_outbound" style="--c:#6366F1"><span class="leg-dot" style="background:#6366F1"></span>Recebidas · Outbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B" title="a propriedade motion do deal era Inbound e foi alterada para Outbound"><span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777" title="a propriedade motion do deal era Outbound e foi alterada para Inbound"><span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_exp" data-drill-val="rcv_exp" style="--c:#047857"><span class="leg-dot" style="background:#047857"></span>Recebidas · Expansão</button>
     </div>
     {% set t_max = trend|map(attribute='total')|max or 1 %}

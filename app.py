@@ -2934,10 +2934,12 @@ def _get_demand_deals(force: bool = False) -> pd.DataFrame:
     bucket = bucket.mask(is_auto  & is_exp, "auto_exp")
     bucket = bucket.mask(~is_auto & is_exp, "rcv_exp")
     rcv_acq = ~is_auto & is_acq
-    bucket = bucket.mask(rcv_acq &  is_outb & ~moved, "rcv_outbound")
-    bucket = bucket.mask(rcv_acq & ~is_outb & ~moved, "rcv_inbound")
-    bucket = bucket.mask(rcv_acq & df["moved_to_out"], "rcv_moved_out")
-    bucket = bucket.mask(rcv_acq & df["moved_to_in"],  "rcv_moved_in")
+    # 04/11/2026 (pedido do Pedro): sem as faixas "Motion virou Outbound/Inbound".
+    # Recebida de aquisição é Inbound ou Outbound pela motion ATUAL do deal — quem
+    # trocou de canal entra no canal em que terminou. As colunas rcv_moved_* seguem
+    # existindo (sempre 0) pra não quebrar quem as lê.
+    bucket = bucket.mask(rcv_acq &  is_outb, "rcv_outbound")
+    bucket = bucket.mask(rcv_acq & ~is_outb, "rcv_inbound")
     df["bucket"] = bucket
 
     # Mapeia kind no shape antigo (acq/exp pra demand_generation; inbound/outbound/exp pra grain).
@@ -3052,11 +3054,37 @@ def _txt_cel(v, dash: str = "—") -> str:
     return t if t and t.lower() not in ("nan", "nat", "none") else dash
 
 
+def _lost_stage_of(deals: pd.DataFrame) -> pd.Series:
+    """Estágio em que o deal foi PERDIDO, só pros dois primeiros do funil:
+      1 = está em closedlost e nunca chegou ao Stage 2 (Qualifying) nem além;
+      2 = está em closedlost, chegou ao Stage 2 e NÃO chegou ao Scoping (3+);
+      0 = qualquer outro caso (aberto, ganho, ou perdido depois do Scoping).
+    Estado AO VIVO (`dealstage`) pra saber se é lost; o "chegou ao 2" vem do
+    histórico de estágios (`_get_funnel_entries`, s2..s7) e o "chegou ao 3+" de
+    `reached_scoping`, que também pega quem pulou etapa."""
+    if deals is None or not len(deals):
+        return pd.Series(0, index=getattr(deals, "index", None), dtype=int)
+    lost = deals["dealstage"].astype(str).eq("closedlost")
+    scop = deals["reached_scoping"].fillna(False).astype(bool)
+    try:
+        piv = _get_funnel_entries()
+        cols = [c for c in ("s2", "s3", "s4", "s5", "s6", "s7") if c in piv.columns]
+        hit2 = set(piv.loc[piv[cols].notna().any(axis=1), "deal_id"].astype(str))
+    except Exception as e:  # noqa: BLE001 — sem histórico, cai no conservador
+        print(f"pepeuhacker · lost-stage: histórico indisponível ({e})", flush=True)
+        hit2 = set()
+    reached2 = deals["deal_id"].astype(str).isin(hit2) | scop
+    out = pd.Series(0, index=deals.index, dtype=int)
+    out[lost & ~reached2] = 1
+    out[lost & reached2 & ~scop] = 2
+    return out
+
+
 def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
                        name: str = None, grain: str = "ae",
                        leader: str = None, region: str = None,
                        source: str = None, bucket: str = None,
-                       scoping: bool = False) -> list:
+                       scoping: bool = False, lost_stage: int = None) -> list:
     """Drill-down de demanda no MESMO universo das contagens (criados na janela,
     bucket != other). Cada linha traz nome, tipo, qualification owner (SDR; ou o
     próprio AE quando auto), estágio, valor e data de criação.
@@ -3079,6 +3107,8 @@ def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
         mask &= (deals["source"] == source)
     if scoping:
         mask &= deals["reached_scoping"]
+    if lost_stage in (1, 2):
+        mask &= _lost_stage_of(deals) == lost_stage
     # `bucket` fecha a lista com UM segmento da barra (ex.: só os que passaram a
     # Inbound). Aceita vários separados por vírgula.
     if bucket:
@@ -5115,6 +5145,24 @@ def demand():
     by_ae[["scop_acq", "scop_exp"]] = by_ae[["scop_acq", "scop_exp"]].fillna(0).astype(int)
     by_ae["scop_total"] = by_ae["scop_acq"] + by_ae["scop_exp"]
 
+    # Perdidos no Stage 1 e no Stage 2 (criados no período), por origem: gerados
+    # pelo próprio AE × recebidos. Mesmo universo de AEs do by_ae.
+    _ls = _lost_stage_of(deals)
+    for _k in (1, 2):
+        _t = _demand_by_ae_pd(deals[_ls == _k], from_d, to_d)
+        if len(_t):
+            _t = _t.groupby("account_executive")[[c for c in _t.columns if c.startswith(("auto_", "rcv_"))]].sum()
+            _own = _t[[c for c in ("auto_acq", "auto_exp") if c in _t.columns]].sum(axis=1)
+            _rcv = _t[[c for c in ("rcv_inbound", "rcv_outbound", "rcv_moved_out", "rcv_moved_in", "rcv_exp") if c in _t.columns]].sum(axis=1)
+            by_ae[f"lost{_k}_own"] = by_ae["account_executive"].map(_own).fillna(0).astype(int)
+            by_ae[f"lost{_k}_rcv"] = by_ae["account_executive"].map(_rcv).fillna(0).astype(int)
+        else:
+            by_ae[f"lost{_k}_own"] = 0
+            by_ae[f"lost{_k}_rcv"] = 0
+    by_ae["lost_total"] = by_ae[["lost1_own", "lost1_rcv", "lost2_own", "lost2_rcv"]].sum(axis=1)
+    max_lost = max(int(by_ae[["lost1_own", "lost1_rcv"]].sum(axis=1).max()) if len(by_ae) else 0,
+                   int(by_ae[["lost2_own", "lost2_rcv"]].sum(axis=1).max()) if len(by_ae) else 0, 1)
+
     # Meta semanal por AE: 3 opps × semanas decorridas no período
     weekly_goal = _weekly_ae_goal(from_d, to_d)
     # Reescala o eixo Y pra meta ser visível mesmo se ninguém bater.
@@ -5209,7 +5257,7 @@ def demand():
         trend=trend_pivot,
         grain=grain, grain_urls=grain_urls,
         totals=totals,
-        max_auto=max_auto, max_rcv=max_rcv, max_scop=max_scop,
+        max_auto=max_auto, max_rcv=max_rcv, max_scop=max_scop, max_lost=max_lost,
         weekly_goal=weekly_goal,
         week_rows=week_rows, week_stats=week_stats, max_week=max_week,
         range_from=from_d.isoformat(), range_to=to_d.isoformat(),
@@ -5396,16 +5444,21 @@ def demand_deals():
     # `scoping=1` vem do gráfico "chegaram a Scoping": só os deals que já
     # entraram no estágio 3 ou além.
     scop = request.args.get("scoping") == "1"
+    # `lost_stage=1|2` vem do gráfico "Perdidos no Stage 1 e 2".
+    _lsa = request.args.get("lost_stage")
+    lost_stage = int(_lsa) if _lsa in ("1", "2") else None
     deals = _get_demand_deals(force=request.args.get("refresh") == "1")
     rows = _demand_deals_rows(
         deals, from_d, to_d,
         name=None if is_total else name, grain=grain,
         leader=request.args.get("leader"), region=request.args.get("region"),
-        source=src, bucket=bkt, scoping=scop,
+        source=src, bucket=bkt, scoping=scop, lost_stage=lost_stage,
     )
     title = "Geração de Demanda — total" if is_total else name
     if scop:
         title += " · chegaram a Scoping"
+    if lost_stage:
+        title += f" · perdidos no Stage {lost_stage} ({'Scheduled' if lost_stage == 1 else 'Qualifying'})"
     if bkt:
         labels = [_CANAL_LABEL.get(b.strip(), b.strip()) for b in bkt.split(",") if b.strip()]
         if labels:

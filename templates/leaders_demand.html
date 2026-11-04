@@ -61,21 +61,13 @@
 {# ------- Chart 2: Recebidas pelo time — split Inbound/Outbound/Expansão ------- #}
 <div class="panel">
   <h2>Recebidas pelo time do líder</h2>
-  <div class="dchart" data-drill-chips="bucket" data-channels="inbound outbound moved_out moved_in exp" data-chart="rcv">
+  <div class="dchart" data-drill-chips="bucket" data-channels="inbound outbound exp" data-chart="rcv">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857">
         <span class="leg-dot" style="background:#10B981"></span>Inbound
       </button>
       <button type="button" class="leg-toggle is-on" data-ch="outbound" data-drill-val="rcv_outbound" style="--c:#6366F1">
         <span class="leg-dot" style="background:#6366F1"></span>Outbound
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B"
-              title="a propriedade motion do deal era Inbound e foi alterada para Outbound">
-        <span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777"
-              title="a propriedade motion do deal era Outbound e foi alterada para Inbound">
-        <span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound
       </button>
       <button type="button" class="leg-toggle is-on" data-ch="exp" data-drill-val="rcv_exp" style="--c:#047857">
         <span class="leg-dot" style="background:#047857"></span>Expansão
@@ -164,14 +156,12 @@
       <a href="{{ grain_urls.quarter }}" class="grain-btn {% if grain=='quarter' %}active{% endif %}">Trimestral</a>
     </div>
   </div>
-  <div class="dchart" data-drill-chips="bucket" data-channels="auto_acq auto_exp received_inbound received_outbound received_moved_out received_moved_in received_exp" data-chart="trend" data-keep-order="1">
+  <div class="dchart" data-drill-chips="bucket" data-channels="auto_acq auto_exp received_inbound received_outbound received_exp" data-chart="trend" data-keep-order="1">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="auto_acq" data-drill-val="auto_acq" style="--c:#2563EB"><span class="leg-dot" style="background:#2563EB"></span>Próprio · Aquisição</button>
       <button type="button" class="leg-toggle is-on" data-ch="auto_exp" data-drill-val="auto_exp" style="--c:#1E3A8A"><span class="leg-dot" style="background:#1E3A8A"></span>Próprio · Expansão</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_inbound" data-drill-val="rcv_inbound" style="--c:#10B981;--ci:#047857"><span class="leg-dot" style="background:#10B981"></span>Recebidas · Inbound</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_outbound" data-drill-val="rcv_outbound" style="--c:#6366F1"><span class="leg-dot" style="background:#6366F1"></span>Recebidas · Outbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_moved_out" data-drill-val="rcv_moved_out" style="--c:#F59E0B" title="a propriedade motion do deal era Inbound e foi alterada para Outbound"><span class="leg-dot" style="background:#F59E0B"></span>Motion virou Outbound</button>
-      <button type="button" class="leg-toggle is-on" data-ch="received_moved_in" data-drill-val="rcv_moved_in" style="--c:#DB2777" title="a propriedade motion do deal era Outbound e foi alterada para Inbound"><span class="leg-dot" style="background:#DB2777"></span>Motion virou Inbound</button>
       <button type="button" class="leg-toggle is-on" data-ch="received_exp" data-drill-val="rcv_exp" style="--c:#047857"><span class="leg-dot" style="background:#047857"></span>Recebidas · Expansão</button>
     </div>
     {% set t_max = trend|map(attribute='total')|max or 1 %}
