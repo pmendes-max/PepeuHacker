@@ -1,0 +1,278 @@
+{% extends "base.html" %}
+{% block title %}Forecast DoD · pepeuhacker{% endblock %}
+
+{% macro sgn(v) %}{{ '+' if v >= 0 else '−' }}{{ (v if v >= 0 else -v)|brl }}{% endmacro %}
+
+{% block content %}
+<h1>Forecast DoD · {{ q_label }}</h1>
+<p class="page-sub">
+  Day over day: o dia <b>{{ dia_medido }}</b> inteiro — <b>{{ prev_label }}</b> contra
+  <b>{{ curr_label }}</b> · faixa = <i>forecast category</i> do HubSpot, nomeada pelo
+  <b>peso</b> dos diretores · trimestre {{ q_range }}
+</p>
+
+{% if pares %}
+<div class="hist-chips">
+  <div class="grain-switch">
+    {% for p in pares %}
+      <a class="grain-btn {% if dia_sel == p.key %}active{% endif %}"
+         title="{{ p.title }}{% if p.aprox %} · ponta aproximada pela cópia do BI{% endif %}"
+         href="{{ chip_url(dia=p.key) }}">{{ p.label }}{% if p.aprox %}<sup>*</sup>{% endif %}</a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if sem_par %}
+<div class="panel">
+  <h2>Sem par de dias comparável</h2>
+  <p class="ph" style="margin:6px 0 0">
+    A tela compara a foto da meia-noite de um dia com a do dia anterior, e ainda
+    não há duas pontas consecutivas nos últimos dias.
+  </p>
+</div>
+
+{% elif sem_dado %}
+<div class="panel">
+  <p style="color:var(--muted);padding:8px 0">
+    Nenhum deal no forecast de <b>{{ q_label }}</b> nas duas meias-noites, para os filtros atuais.
+  </p>
+</div>
+
+{% else %}
+{% include "_chart_toggles.html" %}
+
+{# Qual foto é cada ponta. A cópia do BI é das ~17h da véspera, não da meia-noite:
+   quando ela entra no lugar de uma foto própria, a tela diz. #}
+<div class="hist-bridge{% if aprox %} is-aprox{% endif %}">
+  <span class="hb-lbl">{{ prev_label }}:</span> {{ prev_txt }}
+  <span class="hb-sep">·</span>
+  <span class="hb-lbl">{{ curr_label }}:</span> {{ curr_txt }}
+  {% if aprox %}
+  <span class="hb-aprox">* ponta aproximada: as ~7h da noite anterior à virada não
+    estão nela. A foto própria da meia-noite é gravada pelo app a cada virada
+    desde 24/09/2026.</span>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Destino de cada faixa <span class="h2-sub">· o volume de {{ prev_label }}, dia depois</span></h2>
+    <div class="dst-unit" role="group" aria-label="Unidade da barra">
+      <button type="button" class="dst-u active" data-unit="pct">% da faixa</button>
+      <button type="button" class="dst-u" data-unit="abs">{{ ctx.money_sym }}</button>
+    </div>
+  </div>
+  <span class="ph" style="margin:0 0 2px">
+    barra = o que a faixa tinha em {{ prev_label }}, medido no valor de origem ·
+    em <b>% da faixa</b> as barras têm o mesmo tamanho e comparam TAXAS; em <b>{{ ctx.money_sym }}</b>
+    comparam TAMANHOS · clique em qualquer pedaço
+  </span>
+
+  <div class="legend" style="margin:12px 0 14px">
+    {% for l in destino.legenda %}
+      <span class="leg-item"><i class="leg-sq{% if l.e_ficou %} is-ficou{% endif %}"
+            style="background:{{ l.color if not l.e_ficou else '#CBD5E1' }}"></i>{{ l.label }}</span>
+    {% endfor %}
+  </div>
+
+  <div class="tbl-wrap">
+    <table class="fw-tbl dst-tbl">
+      <thead>
+        <tr>
+          <th>Faixa em {{ prev_label }}</th>
+          <th class="n">Volume</th>
+          <th style="width:42%">← piorou · ficou · melhorou →</th>
+          {% for key, lbl, cor in destino.resumo_meta %}<th class="n">{{ lbl }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for b in destino.bands %}
+        <tr>
+          <td class="first" data-drill="{{ drill(de=b.key, mv=destino.mv_todos) }}"
+              title="Explodir os {{ b.n }} deals que estavam em {{ b.label }}">
+            <span class="leg-dot" style="background:{{ b.color }}"></span>
+            <b style="color:{{ b.ink }}">{{ b.label }}</b>
+            <span class="fw-hint">{{ b.hint }}</span>
+          </td>
+          <td class="n" data-drill="{{ drill(de=b.key, mv=destino.mv_todos) }}">
+            <b>{{ b.total|brl }}</b><span class="dst-sub">{{ b.n }} deals</span>
+          </td>
+          <td class="dst-cell">
+            {# A barra inteira escala com a unidade; os pedaços são sempre % da
+               faixa, então a composição não muda ao trocar de unidade — só o
+               comprimento total muda. #}
+            <div class="dst-bar" data-w-pct="100"
+                 data-w-abs="{{ (b.total / destino.span * 100)|round(2) }}"
+                 style="width:100%">
+              {% for sg in b.segs %}
+                <span class="dst-sg{% if sg.e_ficou %} is-ficou{% endif %}"
+                      data-drill="{{ drill(de=b.key, mv=sg.key) }}"
+                      style="width:{{ (sg.pct * 100)|round(3) }}%;
+                             {% if sg.e_ficou %}background:{{ b.color }}33;box-shadow:inset 0 0 0 1px {{ b.color }}88;color:{{ b.ink }}{% else %}background:{{ sg.color }}{% endif %}"
+                      title="{{ b.label }} · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}">
+                  {% if sg.pct >= 0.09 %}{{ (sg.pct * 100)|round|int }}%{% endif %}
+                </span>
+              {% endfor %}
+            </div>
+          </td>
+          {% for key, lbl, cor in destino.resumo_meta %}
+            {% set g = b.resumo[key] %}
+            <td class="n" data-drill="{{ drill(de=b.key, mv=destino.mv_grupo[key]) }}"
+                title="{{ lbl }} · {{ g.v|brl }} · {{ g.n }} deal{{ 's' if g.n != 1 else '' }}">
+              {# "0%" mentiria pra R$ 2 mil num pipe de R$ 1,9 mi: existe, mas
+                 não chega a 1%. O ponto fica reservado pro que é zero DE VERDADE. #}
+              <b style="color:{{ cor or b.ink }}">{% if not g.v %}·{% elif g.pct < 0.005 %}&lt;1%{% else %}{{ (g.pct * 100)|round|int }}%{% endif %}</b>
+              <span class="dst-sub">{% if g.v %}{{ g.v|brl }}{% endif %}</span>
+            </td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {# Veio de fora: medido AGORA, porque estes deals não tinham faixa anterior.
+     Fora da tabela de propósito — misturá-los com as cinco barras quebraria a
+     invariante de que cada barra fecha o nível anterior da faixa. Decomposto e
+     não um número só: entrar numa faixa e ser enterrado no mesmo dia são
+     coisas opostas, e somá-las chamaria de entrada o que foi perda. #}
+  <div class="dst-fora">
+    <div class="dst-f-head">
+      <b>Veio de fora do forecast</b>
+      <span class="dst-e-sub">{{ destino.entrou.n }} deals · não estavam no trimestre às {{ prev_label }} · medido no valor de agora</span>
+    </div>
+    <div class="dst-f-row">
+      {% for sg in destino.entrou.segs %}
+        <div class="dst-f-item" data-drill="{{ drill(de='out', mv=sg.key) }}"
+             title="Explodir · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deals">
+          <span class="dst-f-bar" style="width:{{ (sg.v / destino.entrou.span * 76 + 6)|round }}px;background:{{ sg.color }}"></span>
+          <span class="dst-f-txt">
+            <b style="color:{{ sg.color }}">{{ sg.v|brl }}</b>
+            <span class="dst-sub">{{ sg.label }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}</span>
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="hm-note">
+    <b>Won é coluna própria e não entra em "Subiu"</b>: virar receita não é ganhar
+    confiança, é acabar a aposta — e é o número que se pergunta primeiro. <b>Lost
+    conta como piora</b>, junto de quem desceu de faixa e de quem escorregou do
+    trimestre. As quatro colunas de resumo somam 100% da faixa.
+    Cada barra é medida no <b>valor de origem</b> e por isso soma exatamente o
+    nível que a faixa tinha em {{ prev_label }} — a mesma invariante da matriz de
+    migração. O que ficou na faixa e mudou de tamanho aparece como
+    reprecificação{% for b in destino.bands if b.repreco_dp|round(0) != 0 %}{% if loop.first %}: {% else %} · {% endif %}<b style="color:{{ b.ink }}">{{ b.label }}</b> {{ sgn(b.repreco_dp) }}{% endfor %}.
+    Won e Lost não são barras porque, como faixa de ORIGEM, são acumulado do
+    trimestre e numa escala só esmagariam as cinco — eles aparecem como destino,
+    dentro da faixa de onde o deal saiu, e no bloco de quem veio de fora.
+  </div>
+</div>
+{% endif %}
+
+<style>
+  .hist-chips{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px}
+  .hist-bridge{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;
+    margin:-8px 0 24px;padding:12px 16px;border:1px solid var(--border);
+    border-radius:10px;background:var(--surface);font-size:13px;color:var(--muted)}
+  .hist-bridge b{color:var(--fg)}
+  .hb-lbl{font-weight:600;color:var(--fg)}
+  .h2-sub{font-size:13px;font-weight:400;color:var(--muted)}
+  .hm-note{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);
+    font-size:12px;color:var(--muted);line-height:1.6}
+  .hm-tot{font-weight:700;border-left:1px solid var(--border);
+    font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+
+  /* ---- Tabelas desta tela ---- */
+  .fw-tbl td[data-drill]{cursor:pointer}
+  .fw-tbl td[data-drill]:hover{outline:2px solid var(--blue,#2563EB);outline-offset:-2px}
+  .fw-tbl tr[data-drill]{cursor:pointer}
+  .fw-tbl tr[data-drill]:hover{background:var(--surface-2)}
+  .fw-tbl .is-pos{color:#15803d}
+  .fw-tbl .is-neg{color:#dc2626}
+  /* A dica da faixa/movimento em cinza na MESMA célula do nome: nomear
+     "Best Case" ao lado do peso "75%" evita a tradução mental sem gastar
+     coluna (o rótulo oficial da tela é o peso — ver FORECAST_CATEGORY_LABEL). */
+  .fw-hint{display:block;font-size:11px;font-weight:400;color:var(--muted-2);
+    margin-top:2px;line-height:1.35;max-width:290px;white-space:normal}
+  .fw-pct{font-size:11px;font-weight:600;color:var(--muted-2);margin-left:5px}
+  .fw-n{font-size:10.5px;font-weight:600;color:var(--muted-2);margin-left:5px;
+    font-variant-numeric:tabular-nums}
+  .fw-sum td{border-top:2px solid var(--border);background:var(--surface-2)}
+  .fw-note{font-size:12px;color:var(--muted);text-align:right;white-space:nowrap}
+  .fw-split td{padding:14px 12px 6px;font-size:12px;font-weight:700;
+    color:var(--fg);border-top:1px solid var(--border)}
+  .fw-split span{font-weight:400;color:var(--muted)}
+
+  /* ---- Destino de cada faixa ---- */
+  .dst-unit{display:inline-flex;border:1px solid var(--border);border-radius:8px;
+    overflow:hidden;background:var(--surface)}
+  .dst-u{border:0;background:transparent;color:var(--muted);font-size:12px;
+    font-weight:600;padding:5px 12px;cursor:pointer;font-family:inherit}
+  .dst-u.active{background:var(--blue,#2563EB);color:#fff}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:var(--muted)}
+  .leg-item{display:inline-flex;align-items:center;gap:6px}
+  .leg-sq{width:10px;height:10px;border-radius:2px;display:inline-block}
+  /* O "ficou" não tem cor fixa: na barra ele veste a cor da própria faixa, e a
+     legenda só pode mostrar um cinza neutro representando "a cor da faixa". */
+  .leg-sq.is-ficou{background:#CBD5E1 !important;box-shadow:inset 0 0 0 1px #94A3B8}
+  .dst-tbl td{vertical-align:middle}
+  .dst-cell{padding-right:18px}
+  .dst-bar{display:flex;height:26px;border-radius:5px;overflow:hidden;
+    transition:width .18s ease}
+  .dst-sg{display:flex;align-items:center;justify-content:center;min-width:2px;
+    font-size:10.5px;font-weight:700;color:#fff;cursor:pointer;overflow:hidden}
+  .dst-sg:hover{outline:2px solid var(--fg);outline-offset:-2px;position:relative;z-index:1}
+  .dst-sub{display:block;font-size:10.5px;font-weight:400;color:var(--muted-2);
+    margin-top:1px}
+  .dst-fora{margin-top:16px;padding:12px 14px;border:1px solid var(--border);
+    border-radius:9px;background:var(--surface-2);font-size:12.5px}
+  .dst-f-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .dst-f-head b{color:var(--fg)}
+  .dst-f-row{display:flex;gap:26px;flex-wrap:wrap}
+  .dst-f-item{display:flex;align-items:center;gap:9px;cursor:pointer;
+    padding:4px 8px;margin:-4px -8px;border-radius:6px}
+  .dst-f-item:hover{background:var(--surface)}
+  .dst-f-bar{height:20px;border-radius:4px;flex:0 0 auto;min-width:6px}
+  .dst-f-txt{line-height:1.25}
+  .dst-e-sub{color:var(--muted-2)}
+  .hb-sep{color:var(--muted-2)}
+  .hist-bridge.is-aprox{border-color:#F59E0B66}
+  .hb-aprox{flex-basis:100%;font-size:12px;color:#B45309}
+</style>
+
+<script>
+/* Troca a unidade da barra do "Destino de cada faixa". Só o COMPRIMENTO da
+   barra muda: os pedaços são % da faixa nas duas unidades, então a composição
+   que o olho comparou continua a mesma — é a moldura que encolhe. Em "% da
+   faixa" todas medem igual e se comparam TAXAS; em "R$" a barra é proporcional
+   ao volume e se comparam TAMANHOS. */
+(function(){
+  "use strict";
+  function init(){
+    var box = document.querySelector('.dst-unit');
+    if (!box || box.dataset.wired) return;
+    box.dataset.wired = '1';
+    var bars = [].slice.call(document.querySelectorAll('.dst-bar'));
+    box.addEventListener('click', function(ev){
+      var btn = ev.target.closest('.dst-u');
+      if (!btn) return;
+      [].forEach.call(box.querySelectorAll('.dst-u'), function(b){
+        b.classList.toggle('active', b === btn);
+      });
+      var unit = btn.dataset.unit;
+      bars.forEach(function(bar){
+        bar.style.width = (unit === 'abs' ? bar.dataset.wAbs : bar.dataset.wPct) + '%';
+      });
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else { init(); }
+})();
+</script>
+
+{% include "_drilldown.html" %}
+{% endblock %}

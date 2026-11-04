@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Pipeline · pepeuhacker{% endblock %}
+{% macro usd(v) -%}
+US$ {{ '{:,.0f}'.format(v|float|round|int).replace(',', '.') }}
+{%- endmacro %}
+
+{% block content %}
+<h1>Sales MX · Pipeline</h1>
+<div class="page-sub">
+  Deals <b>abertos</b> do funil Sales MX · ARR por estágio · time de <b>{{ leader }}</b>
+  · valores em <b>ARR US$</b>
+</div>
+
+<div class="panel" style="margin-bottom:18px">
+  <div class="stats-strip">
+    <div class="stat c-blue">
+      <div class="stat-l">ARR em pipeline</div>
+      <div class="stat-v">{{ usd(total) }}</div>
+    </div>
+    <div class="stat c-slate">
+      <div class="stat-l">Deals abertos</div>
+      <div class="stat-v">{{ deals|intg }}</div>
+    </div>
+    <div class="stat c-slate">
+      <div class="stat-l">Ticket médio</div>
+      <div class="stat-v">{{ usd(total / deals if deals else 0) }}</div>
+    </div>
+    <div class="stat is-total">
+      <div class="stat-l">Estágios com pipe</div>
+      <div class="stat-v">{{ rows|selectattr('arr','greaterthan',0)|list|length }}</div>
+    </div>
+  </div>
+  {% if sem_close %}
+  <p class="ph" style="margin:12px 2px 0">
+    {# Mesmo aviso do Pipeline Total do BR: sem close date o deal não entra em
+       janela nenhuma, e no MX isso é a maioria do funil. #}
+    <b>{{ sem_close }}</b> destes deals não têm close date no HubSpot. Eles contam
+    aqui (esta tela não filtra por data), mas ficam de fora do Forecast.
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>ARR por estágio do funil{% if by %}
+      <span style="font-size:13px;font-weight:400;color:var(--muted)">· empilhado por
+        {{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</span>{% endif %}</h2>
+    <span class="ph" style="margin:0">altura da barra = ARR US$ · ordem do funil</span>
+  </div>
+
+  <div class="grain-switch" style="margin-bottom:14px">
+    <a class="grain-btn {% if not by %}active{% endif %}"
+       href="{{ url_for('mx_pipeline', **keep) }}">Sem quebra</a>
+    {% for d in dims %}
+      <a class="grain-btn {% if by == d.key %}active{% endif %}"
+         href="{{ url_for('mx_pipeline', by=d.key, **keep) }}">{{ d.label }}</a>
+    {% endfor %}
+  </div>
+
+  {% if by and segs %}
+  <div class="legend">
+    {% for s in segs %}
+      <span class="leg-item"><span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}</span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="vbars-wrap">
+    <div class="vbars mx-bars" style="--count:{{ rows|length }}">
+      {% for r in rows %}
+        {% set h = (r.arr / max_arr * 100) if max_arr else 0 %}
+        <div class="vbar{% if r.arr <= 0 %} is-empty{% endif %}" data-name="{{ r.label }}">
+          <div class="vbar-track" style="--h:{{ h }}%">
+            <div class="vbar-val">{{ usd(r.arr) }}</div>
+            <div class="vbar-col">
+              {% if by %}
+                {% for s in segs %}
+                  {% set v = r.segs[s.key] or 0 %}
+                  {% if v > 0 %}
+                    <div class="vbar-seg" title="{{ r.label }} · {{ s.label }}"
+                         style="background:{{ s.color }};flex:{{ v|round|int }}"></div>
+                  {% endif %}
+                {% endfor %}
+              {% else %}
+                <div class="vbar-seg" style="background:#7C3AED;flex:1"></div>
+              {% endif %}
+            </div>
+          </div>
+          <div class="vbar-name">{{ r.label }}</div>
+          <div class="vbar-sub">{{ r.deals }} deal{{ 's' if r.deals != 1 }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{% if seg_totals %}
+<div class="panel">
+  <h2>Composição por {{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>{{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</th>
+        <th class="n">Deals</th><th class="n">ARR US$</th><th class="n">% do pipe</th>
+        <th style="width:28%">Peso</th>
+      </tr></thead>
+      <tbody>
+      {% set mx = (seg_totals|map(attribute='arr')|max) or 1 %}
+      {% for s in seg_totals %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}</td>
+          <td class="n">{{ s.deals|intg }}</td>
+          <td class="n"><b>{{ usd(s.arr) }}</b></td>
+          <td class="n">{{ (s.share*100)|round|int }}%</td>
+          <td><div style="height:11px;border-radius:6px;background:{{ s.color }};min-width:2px;width:{{ (s.arr/mx*100)|round(1) }}%"></div></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          <td class="n"><b>{{ deals|intg }}</b></td>
+          <td class="n"><b>{{ usd(total) }}</b></td>
+          <td class="n"><b>100%</b></td><td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<style>
+  .mx-bars{ height:320px; padding-top:34px; margin-bottom:46px; min-width:100%; }
+  .mx-bars .vbar-col{ width:clamp(40px,62%,120px); gap:2px; }
+  .mx-bars .vbar-seg{ border-radius:4px; }
+  .mx-bars .vbar-name{ position:absolute; top:calc(100% + 9px); left:0; right:auto;
+    width:100%; transform:none; text-align:center; font-size:12px; font-weight:600;
+    color:var(--fg); white-space:nowrap; }
+  .mx-bars .vbar-sub{ position:absolute; top:calc(100% + 26px); left:0; width:100%;
+    text-align:center; font-size:11px; color:var(--muted);
+    font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .leg-item{display:inline-flex;align-items:center;gap:6px;margin-right:14px;
+    font-size:12.5px;color:var(--muted)}
+</style>
+{% endblock %}

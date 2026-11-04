@@ -11,17 +11,83 @@
   ponderados por conversão histórica (segmento × estágio × tipo)
 </p>
 
+{# Os mesmos 6 cards da aba Forecast (mesma ordem e cores), com o ponderado do
+   MODELO no lugar do da forecast category. Bruto, Realizado e On-hold são os
+   mesmos números das duas abas; só o peso muda. #}
+<div class="kpis-3">
+  <div class="kpi acc" data-drill="{{ url_for('forecast_model_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir todos os deals da projeção">
+    <div class="kpi-l">Projeção do quarter <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.projection|brl }}</div>
+    <div class="kpi-s">realizado + ponderado do modelo{% if totals.attainment is not none %} ·
+      <b>{{ (totals.attainment*100)|round|int }}%</b> da {{ 'meta' if is_leader else 'quota' }}{% endif %}</div>
+  </div>
+  <div class="kpi grn">
+    <div class="kpi-l">Realizado <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.done|brl }}</div>
+    <div class="kpi-s">{{ totals.realized_deals }} PO Won · por data de validação
+      {%- set _ext = rev_ext_note(ctx.filters.date_from, ctx.filters.date_to) %}{% if _ext %} · {{ _ext }}{% endif %}</div>
+  </div>
+  <div class="kpi acc">
+    <div class="kpi-l">Forecast ponderado <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.forecast|brl }}</div>
+    <div class="kpi-s">Negotiation · Decision · Procurement × conversão histórica</div>
+  </div>
+  <div class="kpi warn">
+    <div class="kpi-l">On-hold <span class="kpi-q">· MRR</span></div>
+    <div class="kpi-v">{{ totals.hold|brl }}</div>
+    <div class="kpi-s">MRR em validação financeira</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-l">Pipeline bruto <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ totals.gross|brl }}</div>
+    <div class="kpi-s">{{ totals.deals }} deals abertos · {{ totals.n_ae }} AEs com ponderado ·
+      {{ totals.gross_model|brl }} ({{ totals.deals_model }} deals) nos estágios que pesam</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-l">Conversão implícita</div>
+    <div class="kpi-v">{{ (totals.blended*100)|round|int }}<span class="un">%</span></div>
+    <div class="kpi-s">ponderado ÷ bruto (pipeline)</div>
+  </div>
+</div>
+
+{% if is_leader and totals.quota %}
+<p style="margin:-8px 0 18px;font-size:13px;color:var(--muted)">
+  <b style="color:var(--fg)">Meta dos diretores · Comp. Target:</b>
+  <b style="color:var(--fg)">{{ totals.quota|brl }}</b> no período ·
+  projeção <b style="color:{{ '#0F6E56' if (totals.attainment and totals.attainment >= 1) else '#185FA5' }}">{{ (totals.attainment*100)|round|int }}%</b>
+  {% if totals.gap is not none and totals.gap > 0 %}
+    · faltam <b style="color:#185FA5">{{ totals.gap|brl }}</b> pra meta
+  {% elif totals.gap is not none %}
+    · <b style="color:#0F6E56">{{ (-totals.gap)|brl }}</b> acima da meta
+  {% endif %}
+</p>
+{% endif %}
+
+{% if totals.mgr_count %}
+<p style="margin:-10px 0 20px;font-size:12.5px;color:var(--muted)">
+  Inclui vendas diretas de {{ totals.mgr_count }} gestor{{ 'es' if totals.mgr_count != 1 else '' }}
+  nos totais — Realizado <b>{{ totals.mgr_done|brl }}</b> ·
+  ponderado do modelo <b>{{ totals.mgr_forecast|brl }}</b> (amount).
+</p>
+{% endif %}
+
 {% from "_rank_chart.html" import rank_chart, rank_chart_script %}
-{{ rank_chart(chart, 'Projeção do modelo · por ' ~ unit, sub='Done + Forecast × Quota · % atingimento',
-              currency=true, legend_real='Done + Forecast', legend_quota='Quota',
-              tip_real='Done+Forecast', tip_quota='Quota', tip_line='Atingimento', toggle=true) }}
+{% set qlabel = 'Meta' if is_leader else 'Quota' %}
+{{ rank_chart(chart, 'Projeção do modelo · por ' ~ unit, sub='Done + Forecast × ' ~ qlabel ~ ' · % atingimento',
+              currency=true, legend_real='Done + Forecast', legend_quota=qlabel,
+              tip_real='Done+Forecast', tip_quota=qlabel, tip_line='Atingimento', toggle=true) }}
 {% if chart and chart.rows %}{{ rank_chart_script() }}{% endif %}
 
 {# ---------- Detalhe por vendedor/líder ---------- #}
 <div class="panel">
   <div class="panel-head">
-    <h2>Detalhe por {{ unit }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· Done + Forecast do modelo vs Quota</span></h2>
+    <h2>Detalhe por {{ unit }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· Done + Forecast do modelo vs {{ qlabel }}</span></h2>
   </div>
+  {% if is_leader %}
+  <p class="ph" style="margin:-2px 0 14px"><b>Meta</b> = Comp. Target do líder (planilha
+    da liderança) — não é a soma das quotas dos AEs do time. Mesmo alvo usado na aba
+    Forecast (ponderado) e na Cobertura de Pipeline.</p>
+  {% endif %}
   <div class="tbl-wrap">
     <table>
       <thead>
@@ -31,8 +97,9 @@
           <th class="n">Done</th>
           <th class="n">Forecast</th>
           <th class="n grp">Projeção</th>
-          <th class="n">Quota</th>
+          <th class="n">{{ qlabel }}{% if is_leader %}<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">Comp. Target</span>{% endif %}</th>
           <th class="n grp">% atingimento</th>
+          {% if is_leader %}<th class="n">Gap</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -45,6 +112,11 @@
           <td class="n grp"><b>{{ r.projection|brl }}</b></td>
           <td class="n">{% if r.quota %}{{ r.quota|brl }}{% else %}—{% endif %}</td>
           <td class="n grp"><b style="color:{{ '#0F6E56' if (r.attainment and r.attainment >= 1) else '#185FA5' }}">{{ pct(r.attainment) }}</b></td>
+          {% if is_leader %}
+          {# Gap = meta − projeção: positivo = falta, negativo = acima. #}
+          <td class="n" style="color:{{ '#0F6E56' if (r.gap is not none and r.gap <= 0) else '#185FA5' }}">
+            {% if r.gap is none %}—{% elif r.gap > 0 %}−{{ r.gap|brl }}{% else %}+{{ (-r.gap)|brl }}{% endif %}</td>
+          {% endif %}
         </tr>
       {% endfor %}
         <tr style="border-top:2px solid var(--border)">
@@ -55,6 +127,10 @@
           <td class="n grp"><b>{{ totals.projection|brl }}</b></td>
           <td class="n"><b>{{ totals.quota|brl }}</b></td>
           <td class="n grp"><b>{{ pct(totals.attainment) }}</b></td>
+          {% if is_leader %}
+          <td class="n" style="color:{{ '#0F6E56' if (totals.gap is not none and totals.gap <= 0) else '#185FA5' }}">
+            <b>{% if totals.gap is none %}—{% elif totals.gap > 0 %}−{{ totals.gap|brl }}{% else %}+{{ (-totals.gap)|brl }}{% endif %}</b></td>
+          {% endif %}
         </tr>
       </tbody>
     </table>
@@ -90,4 +166,6 @@
   </div>
   <p class="ph" style="margin:12px 2px 0">Percentual <b>efetivo</b> (original entre parênteses) — desconto de segurança de {{ ((1-safety)*100)|round|int }}% aplicado a todas as taxas. Só entram deals em <b>Negotiation · Decision · Procurement</b> com close date no trimestre. Times: <b>Commercial</b> = Bernardo · João Tavares · <b>MidMarket</b> = Fernando · Arthur · <b>Enterprise</b> = Scopel · Gustavo Giovani.</p>
 </div>
+{# Modal do drill do card de Projeção. #}
+{% include "_drilldown.html" %}
 {% endblock %}

@@ -1,0 +1,707 @@
+{% extends "base.html" %}
+{% block title %}Forecast WoW · pepeuhacker{% endblock %}
+
+{% set pessoa = 'Líder' if grain == 'leader' else 'AE' %}
+
+{# Valor com sinal — repetido em ~30 lugares da tela; macro pra o formato não
+   divergir entre painéis (e pra o '−' ser sempre o menos tipográfico). #}
+{% macro sgn(v) %}{{ '+' if v >= 0 else '−' }}{{ (v if v >= 0 else -v)|brl }}{% endmacro %}
+
+{% block content %}
+<h1>Forecast WoW · {{ q_label }}</h1>
+<p class="page-sub">
+  Semana que fechou em <b>{{ curr_label }}</b>, contra <b>{{ prev_label }}</b> ·
+  faixa = <i>forecast category</i> do HubSpot, nomeada pelo <b>peso</b> dos diretores
+  (já com fator de correção de {{ ((1-dir_factor)*100)|round|int }}%; Won conta cheio) ·
+  trimestre {{ q_range }}
+</p>
+
+{% if pares %}
+<div class="hist-chips">
+  <div class="grain-switch">
+    {% for p in pares %}
+      <a class="grain-btn {% if par_sel == p.key %}active{% endif %}"
+         title="{{ p.title }}" href="{{ chip_url(par=p.key) }}">{{ p.label }}</a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if sem_par %}
+<div class="panel">
+  <h2>Sem par de domingos comparável neste trimestre</h2>
+  <p class="ph" style="margin:6px 0 0">
+    A tela compara duas fotos as-of de domingos <b>consecutivos</b>, e só existe par
+    quando as duas pontas têm cópia diária do BI.
+    {% if faltando %}Faltam: <b>{{ faltando|join(' · ') }}</b>.{% endif %}
+    Antes de 23/03/2026 não há cópia nenhuma — ver a nota no fim do Histórico.
+  </p>
+</div>
+
+{% elif sem_dado %}
+<div class="panel">
+  <p style="color:var(--muted);padding:8px 0">
+    Nenhum deal no forecast de <b>{{ q_label }}</b> nos dois domingos, para os filtros atuais.
+  </p>
+</div>
+
+{% else %}
+{% include "_chart_toggles.html" %}
+
+{# ============ KPIs: o que a semana fez com a projeção ============ #}
+{# kpis-3 e não `kpis`: são 6 cards, e o auto-fit do `kpis` fecha 5 numa linha e
+   deixa o 6º órfão na largura padrão da tela. #}
+<div class="kpis-3">
+  {# O card explode o número que mostra (a composição da projeção); o "± na
+     semana" explode o movimento — cada número com a sua lista. #}
+  <div class="kpi acc" data-drill="{{ drill(parte='nivel') }}" title="Explodir os deals que compõem a projeção">
+    <div class="kpi-l">Projeção dos diretores <span class="kpi-q">· amount</span></div>
+    <div class="kpi-v">{{ proj_curr|brl }}</div>
+    <div class="kpi-s">
+      <b data-drill="{{ drill() }}" title="Explodir todo deal que mudou de estado na semana">{{ sgn(proj_delta) }} na semana</b> · partiu de {{ proj_prev|brl }}
+      {% if att_curr is not none %} · <b>{{ (att_curr*100)|round|int }}%</b> da meta{% endif %}
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-l">Pipeline previsto <span class="kpi-q">· 25→100%</span></div>
+    <div class="kpi-v">{{ prev_bruto_curr|brl }}</div>
+    <div class="kpi-s">bruto nas 4 faixas previstas · {{ sgn(prev_bruto_curr - prev_bruto_prev) }}</div>
+  </div>
+  <div class="kpi warn" data-drill="{{ drill(faixa='nf', parte='nivel') }}">
+    <div class="kpi-l">Not forecasted <span class="kpi-q">· peso 0</span></div>
+    <div class="kpi-v">{{ por_faixa.nf.v_curr|brl }}</div>
+    <div class="kpi-s">
+      {{ por_faixa.nf.n_curr }} deals abertos no trimestre · {{ sgn(por_faixa.nf.delta) }}
+    </div>
+  </div>
+  <div class="kpi grn" data-drill="{{ drill(faixa='won', parte='nivel') }}" title="Explodir o won acumulado no trimestre">
+    <div class="kpi-l">Won no trimestre <span class="kpi-q">· acumulado</span></div>
+    <div class="kpi-v">{{ por_faixa.won.v_curr|brl }}</div>
+    <div class="kpi-s">
+      {{ por_faixa.won.n_curr }} deals ·
+      {% if por_faixa.won.n_entrou %}<b data-drill="{{ drill(mv='ganho') }}" title="Explodir só os ganhos da semana">+{{ por_faixa.won.entrou|brl }}</b> ganhos nesta semana
+      ({{ por_faixa.won.n_entrou }}){% else %}nenhum ganho nesta semana{% endif %}
+    </div>
+  </div>
+  <div class="kpi danger" data-drill="{{ drill(faixa='lost', parte='nivel') }}" title="Explodir o lost acumulado no trimestre">
+    <div class="kpi-l">Lost no trimestre <span class="kpi-q">· acumulado</span></div>
+    <div class="kpi-v">{{ por_faixa.lost.v_curr|brl }}</div>
+    <div class="kpi-s">
+      {{ por_faixa.lost.n_curr }} deals ·
+      {% if por_faixa.lost.n_entrou %}<b data-drill="{{ drill(mv='perdido') }}" title="Explodir só as perdas da semana">−{{ por_faixa.lost.entrou|brl }}</b> perdidos nesta semana
+      ({{ por_faixa.lost.n_entrou }}){% else %}nenhuma perda nesta semana{% endif %}
+    </div>
+  </div>
+  {% if cover_curr and cover_curr.prev is not none %}
+  <div class="kpi">
+    <div class="kpi-l">Cobertura da faixa <span class="kpi-q">· por valor</span></div>
+    <div class="kpi-v">{{ cover_curr.prev|round|int }}<span class="un">%</span></div>
+    <div class="kpi-s">
+      do pipeline aberto numa faixa prevista
+      {% if cover_prev and cover_prev.prev is not none %}
+        · era {{ cover_prev.prev|round|int }}% no domingo anterior
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{# ---- Ponte de uma linha: liga os dois números da projeção. Ver _fcw_bridge:
+   fecha em zero por construção, então NÃO tem linha de resíduo (o Histórico PoP
+   tem porque lá nível e movimento vêm de fontes diferentes). ---- #}
+<div class="hist-bridge">
+  <span class="hb-lbl">Projeção em {{ prev_label }}:</span>
+  {{ proj_prev|brl }}
+  {% for r in ponte %}{% if r.dp|round(0) != 0 %}
+    <span title="{{ r.hint }}">{{ '+' if r.dp >= 0 else '−' }} {{ r.label|lower }}
+      {{ (r.dp if r.dp >= 0 else -r.dp)|brl }}</span>
+  {% endif %}{% endfor %}
+  <b>= {{ proj_curr|brl }}</b>
+</div>
+
+{# ============ 1) Destino de cada faixa ============
+   A pergunta que a tela existe pra responder: DENTRO do volume de cada faixa do
+   parâmetro, o que ficou, o que evoluiu, o que piorou. A matriz de migração lá
+   embaixo tem a mesma verdade, mas em 64 células — aqui ela vira cinco barras
+   que se leem da esquerda (pior) pra direita (melhor), na mesma ideia do
+   "moveu pra Late" do PoP. Tudo clicável: barra, pedaço de barra e resumo. #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Destino de cada faixa <span class="h2-sub">· o volume de {{ prev_label }}, semana depois</span></h2>
+    <div class="dst-unit" role="group" aria-label="Unidade da barra">
+      <button type="button" class="dst-u active" data-unit="pct">% da faixa</button>
+      <button type="button" class="dst-u" data-unit="abs">{{ ctx.money_sym }}</button>
+    </div>
+  </div>
+  <span class="ph" style="margin:0 0 2px">
+    barra = o que a faixa tinha em {{ prev_label }}, medido no valor de origem ·
+    em <b>% da faixa</b> as barras têm o mesmo tamanho e comparam TAXAS; em <b>{{ ctx.money_sym }}</b>
+    comparam TAMANHOS · clique em qualquer pedaço
+  </span>
+
+  <div class="legend" style="margin:12px 0 14px">
+    {% for l in destino.legenda %}
+      <span class="leg-item"><i class="leg-sq{% if l.e_ficou %} is-ficou{% endif %}"
+            style="background:{{ l.color if not l.e_ficou else '#CBD5E1' }}"></i>{{ l.label }}</span>
+    {% endfor %}
+  </div>
+
+  <div class="tbl-wrap">
+    <table class="fw-tbl dst-tbl">
+      <thead>
+        <tr>
+          <th>Faixa em {{ prev_label }}</th>
+          <th class="n">Volume</th>
+          <th style="width:42%">← piorou · ficou · melhorou →</th>
+          {% for key, lbl, cor in destino.resumo_meta %}<th class="n">{{ lbl }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for b in destino.bands %}
+        <tr>
+          <td class="first" data-drill="{{ drill(de=b.key, mv=destino.mv_todos) }}"
+              title="Explodir os {{ b.n }} deals que estavam em {{ b.label }}">
+            <span class="leg-dot" style="background:{{ b.color }}"></span>
+            <b style="color:{{ b.ink }}">{{ b.label }}</b>
+            <span class="fw-hint">{{ b.hint }}</span>
+          </td>
+          <td class="n" data-drill="{{ drill(de=b.key, mv=destino.mv_todos) }}">
+            <b>{{ b.total|brl }}</b><span class="dst-sub">{{ b.n }} deals</span>
+          </td>
+          <td class="dst-cell">
+            {# A barra inteira escala com a unidade; os pedaços são sempre % da
+               faixa, então a composição não muda ao trocar de unidade — só o
+               comprimento total muda. #}
+            <div class="dst-bar" data-w-pct="100"
+                 data-w-abs="{{ (b.total / destino.span * 100)|round(2) }}"
+                 style="width:100%">
+              {% for sg in b.segs %}
+                <span class="dst-sg{% if sg.e_ficou %} is-ficou{% endif %}"
+                      data-drill="{{ drill(de=b.key, mv=sg.key) }}"
+                      style="width:{{ (sg.pct * 100)|round(3) }}%;
+                             {% if sg.e_ficou %}background:{{ b.color }}33;box-shadow:inset 0 0 0 1px {{ b.color }}88;color:{{ b.ink }}{% else %}background:{{ sg.color }}{% endif %}"
+                      title="{{ b.label }} · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}">
+                  {% if sg.pct >= 0.09 %}{{ (sg.pct * 100)|round|int }}%{% endif %}
+                </span>
+              {% endfor %}
+            </div>
+          </td>
+          {% for key, lbl, cor in destino.resumo_meta %}
+            {% set g = b.resumo[key] %}
+            <td class="n" data-drill="{{ drill(de=b.key, mv=destino.mv_grupo[key]) }}"
+                title="{{ lbl }} · {{ g.v|brl }} · {{ g.n }} deal{{ 's' if g.n != 1 else '' }}">
+              {# "0%" mentiria pra R$ 2 mil num pipe de R$ 1,9 mi: existe, mas
+                 não chega a 1%. O ponto fica reservado pro que é zero DE VERDADE. #}
+              <b style="color:{{ cor or b.ink }}">{% if not g.v %}·{% elif g.pct < 0.005 %}&lt;1%{% else %}{{ (g.pct * 100)|round|int }}%{% endif %}</b>
+              <span class="dst-sub">{% if g.v %}{{ g.v|brl }}{% endif %}</span>
+            </td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {# Veio de fora: medido AGORA, porque estes deals não tinham faixa anterior.
+     Fora da tabela de propósito — misturá-los com as cinco barras quebraria a
+     invariante de que cada barra fecha o nível anterior da faixa. Decomposto e
+     não um número só: entrar numa faixa e ser enterrado na mesma semana são
+     coisas opostas, e somá-las chamaria de entrada o que foi perda. #}
+  <div class="dst-fora">
+    <div class="dst-f-head">
+      <b>Veio de fora do forecast</b>
+      <span class="dst-e-sub">{{ destino.entrou.n }} deals · não estavam no trimestre em {{ prev_label }} · medido no valor de agora</span>
+    </div>
+    <div class="dst-f-row">
+      {% for sg in destino.entrou.segs %}
+        <div class="dst-f-item" data-drill="{{ drill(de='out', mv=sg.key) }}"
+             title="Explodir · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deals">
+          <span class="dst-f-bar" style="width:{{ (sg.v / destino.entrou.span * 76 + 6)|round }}px;background:{{ sg.color }}"></span>
+          <span class="dst-f-txt">
+            <b style="color:{{ sg.color }}">{{ sg.v|brl }}</b>
+            <span class="dst-sub">{{ sg.label }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}</span>
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="hm-note">
+    <b>Won é coluna própria e não entra em "Subiu"</b>: virar receita não é ganhar
+    confiança, é acabar a aposta — e é o número que se pergunta primeiro. <b>Lost
+    conta como piora</b>, junto de quem desceu de faixa e de quem escorregou do
+    trimestre. As quatro colunas de resumo somam 100% da faixa.
+    Cada barra é medida no <b>valor de origem</b> e por isso soma exatamente o
+    nível que a faixa tinha em {{ prev_label }} — a mesma invariante da matriz de
+    migração. O que ficou na faixa e mudou de tamanho aparece como
+    reprecificação{% for b in destino.bands if b.repreco_dp|round(0) != 0 %}{% if loop.first %}: {% else %} · {% endif %}<b style="color:{{ b.ink }}">{{ b.label }}</b> {{ sgn(b.repreco_dp) }}{% endfor %}.
+    Won e Lost não são barras porque, como faixa de ORIGEM, são acumulado do
+    trimestre e numa escala só esmagariam as cinco — eles aparecem como destino,
+    dentro da faixa de onde o deal saiu, e no bloco de quem veio de fora.
+  </div>
+</div>
+
+{# ============ 1) Faixas, semana contra semana ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Pipeline por faixa <span class="h2-sub">· {{ prev_label }} × {{ curr_label }}</span></h2>
+    <span class="ph" style="margin:0">Δ da faixa = entrou − saiu ± reprecificação · clique em qualquer número pra explodir</span>
+  </div>
+
+  {% macro faixa_rows(rows, span) %}
+    {% for r in rows %}
+    <tr>
+      <td class="first">
+        <span class="leg-dot" style="background:{{ r.color }}"></span>{{ r.label }}
+        <span class="fw-hint">{{ r.hint }}</span>
+      </td>
+      <td class="n" style="color:var(--muted)">{{ r.n_prev }} → <b style="color:var(--fg)">{{ r.n_curr }}</b></td>
+      <td class="n" style="color:var(--muted)">{{ r.v_prev|brl }}</td>
+      <td class="n" data-drill="{{ drill(faixa=r.key, parte='nivel') }}"><b style="color:{{ r.ink }}">{{ r.v_curr|brl }}</b></td>
+      <td class="n {% if r.delta > 0 %}is-pos{% elif r.delta < 0 %}is-neg{% endif %}">
+        <b>{{ sgn(r.delta) }}</b>
+        {% if r.pct is not none and r.v_prev %}<span class="fw-pct">{{ '+' if r.pct >= 0 else '−' }}{{ ((r.pct if r.pct >= 0 else -r.pct)*100)|round|int }}%</span>{% endif %}
+      </td>
+      <td class="fw-bars">
+        {# Duas barras na MESMA escala: a de cima é o domingo anterior (oca), a de
+           baixo o atual (cheia). Comparar altura de barra é mais rápido que ler
+           duas colunas de número — e o número fica do lado pra auditar. #}
+        <div class="fw-bar is-prev" style="width:{{ (r.v_prev / span * 100)|round(1) if span else 0 }}%;--c:{{ r.color }}"></div>
+        <div class="fw-bar" style="width:{{ (r.v_curr / span * 100)|round(1) if span else 0 }}%;background:{{ r.color }}"></div>
+      </td>
+      <td class="n is-pos" {% if r.n_entrou %}data-drill="{{ drill(faixa=r.key, parte='entrou') }}"{% endif %}>
+        {% if r.entrou %}+{{ r.entrou|brl }} <span class="fw-n">{{ r.n_entrou }}</span>{% else %}·{% endif %}
+      </td>
+      <td class="n is-neg" {% if r.n_saiu %}data-drill="{{ drill(faixa=r.key, parte='saiu') }}"{% endif %}>
+        {% if r.saiu %}−{{ r.saiu|brl }} <span class="fw-n">{{ r.n_saiu }}</span>{% else %}·{% endif %}
+      </td>
+      <td class="n" style="color:var(--muted)" {% if r.repreco %}data-drill="{{ drill(faixa=r.key, parte='repreco') }}"{% endif %}>
+        {% if r.repreco|round(0) != 0 %}{{ sgn(r.repreco) }}{% else %}·{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  {% endmacro %}
+
+  <div class="tbl-wrap">
+    <table class="fw-tbl">
+      <thead>
+        <tr>
+          <th>Faixa</th>
+          <th class="n">Deals</th>
+          <th class="n">{{ prev_label }}</th>
+          <th class="n">{{ curr_label }}</th>
+          <th class="n">Δ</th>
+          <th style="width:22%">Comparativo</th>
+          <th class="n">Entrou</th>
+          <th class="n">Saiu</th>
+          <th class="n">Repreço</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set span_b = [bands|map(attribute='v_prev')|max, bands|map(attribute='v_curr')|max]|max %}
+        {{ faixa_rows(bands, span_b) }}
+        <tr class="fw-sum">
+          <td class="first"><b>Pipeline aberto no trimestre</b></td>
+          <td class="n">{{ bands|sum(attribute='n_prev') }} → <b>{{ bands|sum(attribute='n_curr') }}</b></td>
+          <td class="n">{{ (bands|sum(attribute='v_prev'))|brl }}</td>
+          <td class="n"><b>{{ (bands|sum(attribute='v_curr'))|brl }}</b></td>
+          {% set _d = (bands|sum(attribute='v_curr')) - (bands|sum(attribute='v_prev')) %}
+          <td class="n {% if _d > 0 %}is-pos{% elif _d < 0 %}is-neg{% endif %}"><b>{{ sgn(_d) }}</b></td>
+          <td colspan="4" class="fw-note">
+            ponderado pela faixa: {{ (bands|sum(attribute='p_prev'))|brl }} →
+            <b>{{ (bands|sum(attribute='p_curr'))|brl }}</b>
+          </td>
+        </tr>
+
+        {# Won e Lost têm escala PRÓPRIA de barra: são acumulados do trimestre e
+           medem uma ordem de grandeza acima do pipe aberto (no Q3/2026, R$ 11,6
+           mi de Lost contra R$ 1,9 mi na maior faixa). Na mesma escala, as 5
+           faixas de cima viravam cinco tracinhos. #}
+        <tr class="fw-split">
+          <td colspan="9">
+            Desfecho no trimestre <span>· acumulado, não pipeline · <b>Entrou</b> = o que fechou nesta semana · escala de barra própria</span>
+          </td>
+        </tr>
+        {% set _out = [por_faixa.won, por_faixa.lost] %}
+        {% set span_o = [_out|map(attribute='v_prev')|max, _out|map(attribute='v_curr')|max]|max %}
+        {{ faixa_rows(_out, span_o) }}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ============ 2) Ponte da projeção ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>O que mexeu na projeção <span class="h2-sub">· {{ ponte|sum(attribute='n') }} deals se moveram, de {{ n_deals }} no trimestre</span></h2>
+    <span class="ph" style="margin:0">a soma das linhas é exatamente o Δ da projeção — os movimentos particionam os deals</span>
+  </div>
+  {% set span_p = ponte|map(attribute='dp')|map('abs')|max %}
+  <div class="tbl-wrap">
+    <table class="fw-tbl">
+      <thead>
+        <tr>
+          <th>Movimento</th><th class="n">Deals</th>
+          <th class="n">Bruto movido</th><th class="n">Δ projeção</th>
+          <th style="width:38%">Contribuição</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in ponte %}
+        <tr data-drill="{{ drill(mv=r.key) }}">
+          <td class="first">
+            <span class="leg-dot" style="background:{{ r.color }}"></span>{{ r.label }}
+            <span class="fw-hint">{{ r.hint }}{% for d in r.det %}<br>
+              <b style="color:var(--muted)">{{ d.n }}</b> {{ d.txt }} · {{ d.v|brl }}{% endfor %}</span>
+          </td>
+          <td class="n">{{ r.n }}</td>
+          <td class="n" style="color:var(--muted)">{% if r.assinado %}{{ sgn(r.bruto) }}{% else %}{{ r.bruto|brl }}{% endif %}</td>
+          <td class="n {% if r.dp > 0 %}is-pos{% elif r.dp < 0 %}is-neg{% endif %}"><b>{{ sgn(r.dp) }}</b></td>
+          <td>
+            {# Zero no MEIO: o olho separa o que somou do que subtraiu antes de
+               ler número nenhum. #}
+            <div class="fw-wf">
+              <div class="fw-wf-zero"></div>
+              <div class="fw-wf-bar {% if r.dp < 0 %}is-neg{% endif %}"
+                   style="width:{{ ((r.dp if r.dp >= 0 else -r.dp) / span_p * 50)|round(2) if span_p else 0 }}%;background:{{ r.color }}"></div>
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+        <tr class="fw-sum">
+          <td class="first"><b>Δ da projeção na semana</b></td>
+          <td class="n">{{ ponte|sum(attribute='n') }}</td>
+          <td class="n"></td>
+          <td class="n {% if proj_delta > 0 %}is-pos{% elif proj_delta < 0 %}is-neg{% endif %}"><b>{{ sgn(proj_delta) }}</b></td>
+          <td class="fw-note">
+            {{ proj_prev|brl }} → <b>{{ proj_curr|brl }}</b>
+            {% if meta_ok and meta %} · meta {{ meta|brl }}
+              ({{ (att_prev*100)|round|int }}% → <b>{{ (att_curr*100)|round|int }}%</b>){% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% if not meta_ok %}
+  <div class="hm-note">
+    Sem linha de meta: o Comp. Target da planilha da liderança é do trimestre
+    <b>corrente</b>, e desenhá-lo sobre um trimestre passado compararia o forecast
+    de uma época com a meta de outra. Mesma regra do Histórico do Forecast.
+  </div>
+  {% endif %}
+</div>
+
+{# ============ 3) Matriz de migração ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Matriz de migração <span class="h2-sub">· faixa em {{ prev_label }} → faixa em {{ curr_label }}</span></h2>
+    <span class="ph" style="margin:0">célula no valor de <b>origem</b> — a linha soma o nível do domingo anterior · acima da diagonal = ganhou confiança, abaixo = perdeu · clique numa célula</span>
+  </div>
+  <div class="rank-wrap" style="overflow-x:auto">
+    <table class="mig">
+      <thead>
+        <tr>
+          <th class="mig-name">de \ para</th>
+          {% for c in matriz.eixo %}
+            <th class="mig-h" style="color:{{ c.ink }}">{{ c.label }}</th>
+          {% endfor %}
+          <th class="hm-tot">Nível em {{ prev_label }}</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in matriz.rows %}
+        <tr>
+          <td class="mig-name" style="color:{{ row.ink }}">{{ row.label }}</td>
+          {% for c in row.cells %}
+            {% if c.vazio %}
+              <td class="mig-c is-void" title="deal fora do forecast do trimestre nas duas pontas fica fora da tela">—</td>
+            {% elif c.n == 0 %}
+              <td class="mig-c">·</td>
+            {% elif c.diag %}
+              <td class="mig-c is-diag" data-drill="{{ drill(de=c.de, para=c.para) }}"
+                  title="ficou em {{ row.label }} · {{ c.n }} deals">
+                {{ c.v|brl }}<span class="fw-n">{{ c.n }}</span>
+              </td>
+            {% else %}
+              <td class="mig-c" data-drill="{{ drill(de=c.de, para=c.para) }}"
+                  style="--a:{{ '%.3f'|format(((c.v if c.v >= 0 else -c.v) / matriz.span)) }};--c:{{ c.color }}"
+                  title="{{ row.label }} → {{ matriz.eixo[loop.index0].label }} · {{ c.label }} · {{ c.n }} deals">
+                {{ c.v|brl }}<span class="fw-n">{{ c.n }}</span>
+              </td>
+            {% endif %}
+          {% endfor %}
+          <td class="hm-tot" title="{{ 'nível da faixa no domingo anterior' if row.e_nivel else 'o que entrou no forecast, medido agora' }}">{{ row.total|brl }}</td>
+        </tr>
+      {% endfor %}
+        <tr class="mig-foot">
+          <td class="mig-name"><b>Nível em {{ curr_label }}</b></td>
+          {% for v in matriz.rodape %}<td class="mig-c"><b>{{ v|brl }}</b></td>{% endfor %}
+          <td class="hm-tot"></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="hm-note">
+    A linha e a coluna <b>Fora do forecast</b> são o que fecha a matriz: sem a
+    coluna, o deal que escorregou pra fora do trimestre desapareceria da linha da
+    faixa dele; sem a linha, o que entrou apareceria do nada.
+    <b>Cada célula é medida no valor de origem</b> (o amount do domingo anterior),
+    e a linha "Fora" — que não tem origem — no valor de agora. É isso que faz a
+    linha somar exatamente o nível anterior da faixa. O rodapé, por isso,
+    <b>não é a soma da coluna</b>: é o nível de cada faixa agora. A diferença
+    entre um e outro é a reprecificação, que o painel de faixas mostra em coluna
+    própria. A diagonal (o "ficou") é quase sempre a maior célula da matriz e
+    fica fora da escala de cor de propósito — senão todo movimento de verdade
+    saía na mesma tinta pálida.
+  </div>
+</div>
+
+{# ============ 4) Por pessoa ============ #}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Movimento por {{ pessoa }} <span class="h2-sub">· em Δ projeção</span></h2>
+    <span class="ph" style="margin:0">quem puxou a projeção pra cima e por qual caminho · clique na célula</span>
+  </div>
+  {% if people %}
+  <div class="tbl-wrap">
+    <table class="fw-tbl">
+      <thead>
+        <tr>
+          <th>{{ pessoa }}</th>{% if grain != 'leader' %}<th>Líder</th>{% endif %}
+          <th class="n">{{ prev_label }}</th>
+          <th class="n">{{ curr_label }}</th>
+          <th class="n grp">Δ projeção</th>
+          {% for k in ['entrou','subiu','ganho'] %}
+            <th class="n" style="color:{{ mv_meta[k].color }}">{{ mv_meta[k].label|replace(' (Won)','') }}</th>
+          {% endfor %}
+          {% for k in ['desceu','saiu','perdido'] %}
+            <th class="n" style="color:{{ mv_meta[k].color }}">{{ mv_meta[k].label|replace(' (Lost)','') }}</th>
+          {% endfor %}
+          <th class="n">Repreço</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for p in people %}
+        <tr>
+          <td class="first" title="{{ p.name }}">{{ p.short }}</td>
+          {% if grain != 'leader' %}<td style="color:var(--muted)">{{ p.leader or "—" }}</td>{% endif %}
+          <td class="n" style="color:var(--muted)">{{ p.p_prev|brl }}</td>
+          <td class="n">{{ p.p_curr|brl }}</td>
+          <td class="n grp {% if p.dp > 0 %}is-pos{% elif p.dp < 0 %}is-neg{% endif %}">
+            <b>{{ sgn(p.dp) }}</b>
+          </td>
+          {% for k in ['entrou','subiu','ganho','desceu','saiu','perdido','repreco'] %}
+            {% set v = p['mv_' ~ k] %}
+            <td class="n" style="color:{{ mv_meta[k].color if v|round(0) != 0 else 'var(--muted-2)' }}"
+                {% if v|round(0) != 0 %}data-drill="{{ drill(mv=k, name=p.name) }}"{% endif %}>
+              {% if v|round(0) != 0 %}{{ sgn(v) }}{% else %}·{% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if grain == 'leader' %}
+  <div class="hm-note">
+    A soma da coluna não fecha com o time de propósito: no grão de líder cada deal
+    conta no gerente <b>e</b> no diretor dele, a mesma convenção das outras telas
+    de Leaders. O Δ do time vem do frame sem essa duplicação.
+  </div>
+  {% endif %}
+  {% else %}
+  <div class="empty-state">Nenhum {{ pessoa }} com movimento de faixa nesta semana.</div>
+  {% endif %}
+</div>
+
+{# ---- Como ler ---- #}
+<div class="panel">
+  <h2>Como ler esta tela</h2>
+  <p class="ph" style="margin:6px 0 0">
+    <b>Leia junto com a cobertura.</b> O peso da faixa é o julgamento do dono do
+    deal, então duas semanas só são comparáveis se a categoria estiver preenchida
+    nas duas. Em {{ curr_label }},
+    <b>{{ cover_curr.prev|round|int }}%</b> do pipeline aberto do trimestre (por valor)
+    estava numa das 4 faixas previstas — {{ cover_curr.sem|round|int }}% sem categoria
+    nenhuma e {{ cover_curr.omit|round|int }}% em <i>Not forecasted</i> explícito.
+    Uma semana em que o "Subiu de faixa" cresce junto com a cobertura pode ser CRM
+    sendo preenchido, não confiança nova.
+    <br><br>
+    <b>De onde vem.</b> Das cópias <b>diárias</b> do BI
+    (<code>materialized_data_source</code>), a mesma fonte do Histórico do
+    Forecast: estágio, amount, close date e forecast category <i>as-of</i> cada
+    domingo. Não existe stream de eventos de forecast category no BigQuery, então
+    todo movimento aqui é a diferença entre as duas fotos — um deal que subiu na
+    quarta e voltou na sexta aparece como "ficou". Em troca, a ponte fecha em zero
+    sempre: nível e movimento saem da mesma fonte.
+    <br><br>
+    <b>O que define estar dentro.</b> Pipeline aberto = um dos 6 estágios
+    (Scheduled→Procurement) <i>e</i> close date dentro do trimestre, os dois
+    as-of o domingo — usar o close date de hoje apagaria retroativamente quem
+    escorregou. <b>Won</b> conta pela data de validação (emissão do PO, com
+    fallback no close date), igual à aba Forecast — e, quando há fechamento
+    estendido, o PO validado nos dias da extensão conta no trimestre anterior
+    (no Q3/26, validado até 02/10 conta como 30/09). <b>Lost</b> conta pelo close
+    date, que é a data em que o HubSpot marcou a perda.
+    {% if won_hoje is not none and por_faixa.won %}
+    <br><br>
+    <b>Por que o Won aqui pode não bater com o Histórico.</b> Esta tela lê o Won da
+    <b>foto</b> de {{ curr_label }}: <b>{{ por_faixa.won.v_curr|brl }}</b>. O
+    Histórico do Forecast monta o Done acumulado da base de <b>hoje</b> — um deal
+    ganho não deixa de ter sido ganho, e a data de validação não muda depois — e por
+    isso mostra <b>{{ won_hoje|brl }}</b>
+    {%- set _dw = won_hoje - por_faixa.won.v_curr %}
+    {%- if _dw|round(0) != 0 %}, {{ (_dw if _dw >= 0 else -_dw)|brl }} a
+    {{ 'mais' if _dw > 0 else 'menos' }}{% endif %}. A diferença é PO lançado depois
+    do domingo com data de validação anterior a ele. As duas leituras estão certas:
+    aqui a pergunta é o que a semana mudou, e reescrever o passado com informação de
+    hoje apagaria justamente isso.
+    {% endif %}
+    {% if faltando %}
+    <br><br>
+    <b>Domingos sem foto neste trimestre:</b> {{ faltando|join(' · ') }} — as
+    semanas que tocam neles não viram par, em vez de virar barra de saldo zero.
+    {% endif %}
+  </p>
+</div>
+{% endif %}
+
+<style>
+  .hist-chips{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px}
+  .hist-bridge{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;
+    margin:-8px 0 24px;padding:12px 16px;border:1px solid var(--border);
+    border-radius:10px;background:var(--surface);font-size:13px;color:var(--muted)}
+  .hist-bridge b{color:var(--fg)}
+  .hb-lbl{font-weight:600;color:var(--fg)}
+  .h2-sub{font-size:13px;font-weight:400;color:var(--muted)}
+  .hm-note{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);
+    font-size:12px;color:var(--muted);line-height:1.6}
+  .hm-tot{font-weight:700;border-left:1px solid var(--border);
+    font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+
+  /* ---- Tabelas desta tela ---- */
+  .fw-tbl td[data-drill]{cursor:pointer}
+  .fw-tbl td[data-drill]:hover{outline:2px solid var(--blue,#2563EB);outline-offset:-2px}
+  .fw-tbl tr[data-drill]{cursor:pointer}
+  .fw-tbl tr[data-drill]:hover{background:var(--surface-2)}
+  .fw-tbl .is-pos{color:#15803d}
+  .fw-tbl .is-neg{color:#dc2626}
+  /* A dica da faixa/movimento em cinza na MESMA célula do nome: nomear
+     "Best Case" ao lado do peso "75%" evita a tradução mental sem gastar
+     coluna (o rótulo oficial da tela é o peso — ver FORECAST_CATEGORY_LABEL). */
+  .fw-hint{display:block;font-size:11px;font-weight:400;color:var(--muted-2);
+    margin-top:2px;line-height:1.35;max-width:290px;white-space:normal}
+  .fw-pct{font-size:11px;font-weight:600;color:var(--muted-2);margin-left:5px}
+  .fw-n{font-size:10.5px;font-weight:600;color:var(--muted-2);margin-left:5px;
+    font-variant-numeric:tabular-nums}
+  .fw-sum td{border-top:2px solid var(--border);background:var(--surface-2)}
+  .fw-note{font-size:12px;color:var(--muted);text-align:right;white-space:nowrap}
+  .fw-split td{padding:14px 12px 6px;font-size:12px;font-weight:700;
+    color:var(--fg);border-top:1px solid var(--border)}
+  .fw-split span{font-weight:400;color:var(--muted)}
+
+  /* Barra dupla (anterior oca / atual cheia) na mesma escala. */
+  .fw-bars{min-width:120px}
+  .fw-bar{height:8px;border-radius:5px;min-width:2px;margin:2px 0}
+  .fw-bar.is-prev{background:transparent;border:1.5px solid var(--c);
+    height:6px;opacity:.55}
+
+  /* Waterfall com o zero no meio. */
+  .fw-wf{position:relative;height:14px;min-width:140px}
+  .fw-wf-zero{position:absolute;left:50%;top:0;bottom:0;width:1px;
+    background:var(--border)}
+  .fw-wf-bar{position:absolute;left:50%;top:2px;height:10px;border-radius:0 4px 4px 0;
+    min-width:2px}
+  .fw-wf-bar.is-neg{left:auto;right:50%;border-radius:4px 0 0 4px}
+
+  /* ---- Matriz de migração ---- */
+  .mig{border-collapse:collapse;font-size:12px;width:100%}
+  .mig th,.mig td{padding:6px 9px;white-space:nowrap;text-align:right}
+  .mig thead th{font-weight:700;border-bottom:1px solid var(--border);font-size:11px}
+  .mig .mig-name{text-align:left;font-weight:700;position:sticky;left:0;
+    background:var(--surface);z-index:1}
+  .mig tbody tr:hover .mig-name{background:var(--surface-2)}
+  /* --a = |valor| sobre a maior célula FORA da diagonal; --c = cor do movimento.
+     Uma cor por natureza de movimento e a saturação dizendo "quanto" — a mesma
+     ideia do heatmap dos históricos, com a diferença de que aqui a direção do
+     movimento já é uma informação categórica, não só o sinal. */
+  .mig-c{font-variant-numeric:tabular-nums;color:var(--muted);cursor:pointer;
+    border-radius:4px}
+  .mig-c[style*="--a"]{background:color-mix(in srgb,var(--c) calc(var(--a) * 70%),transparent);
+    color:var(--fg)}
+  .mig-c:hover{outline:2px solid var(--blue,#2563EB);outline-offset:-2px}
+  .mig-c.is-diag{background:var(--surface-2);color:var(--muted);cursor:pointer}
+  .mig-c.is-void{color:var(--muted-2);cursor:default;background:
+    repeating-linear-gradient(135deg,transparent,transparent 4px,
+      var(--border-soft) 4px,var(--border-soft) 5px)}
+  .mig-foot td{border-top:2px solid var(--border);background:var(--surface-2);
+    color:var(--fg)}
+  .mig-foot .mig-c{cursor:default}
+
+  /* ---- Destino de cada faixa ---- */
+  .dst-unit{display:inline-flex;border:1px solid var(--border);border-radius:8px;
+    overflow:hidden;background:var(--surface)}
+  .dst-u{border:0;background:transparent;color:var(--muted);font-size:12px;
+    font-weight:600;padding:5px 12px;cursor:pointer;font-family:inherit}
+  .dst-u.active{background:var(--blue,#2563EB);color:#fff}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:var(--muted)}
+  .leg-item{display:inline-flex;align-items:center;gap:6px}
+  .leg-sq{width:10px;height:10px;border-radius:2px;display:inline-block}
+  /* O "ficou" não tem cor fixa: na barra ele veste a cor da própria faixa, e a
+     legenda só pode mostrar um cinza neutro representando "a cor da faixa". */
+  .leg-sq.is-ficou{background:#CBD5E1 !important;box-shadow:inset 0 0 0 1px #94A3B8}
+  .dst-tbl td{vertical-align:middle}
+  .dst-cell{padding-right:18px}
+  .dst-bar{display:flex;height:26px;border-radius:5px;overflow:hidden;
+    transition:width .18s ease}
+  .dst-sg{display:flex;align-items:center;justify-content:center;min-width:2px;
+    font-size:10.5px;font-weight:700;color:#fff;cursor:pointer;overflow:hidden}
+  .dst-sg:hover{outline:2px solid var(--fg);outline-offset:-2px;position:relative;z-index:1}
+  .dst-sub{display:block;font-size:10.5px;font-weight:400;color:var(--muted-2);
+    margin-top:1px}
+  .dst-fora{margin-top:16px;padding:12px 14px;border:1px solid var(--border);
+    border-radius:9px;background:var(--surface-2);font-size:12.5px}
+  .dst-f-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .dst-f-head b{color:var(--fg)}
+  .dst-f-row{display:flex;gap:26px;flex-wrap:wrap}
+  .dst-f-item{display:flex;align-items:center;gap:9px;cursor:pointer;
+    padding:4px 8px;margin:-4px -8px;border-radius:6px}
+  .dst-f-item:hover{background:var(--surface)}
+  .dst-f-bar{height:20px;border-radius:4px;flex:0 0 auto;min-width:6px}
+  .dst-f-txt{line-height:1.25}
+  .dst-e-sub{color:var(--muted-2)}
+</style>
+
+<script>
+/* Troca a unidade da barra do "Destino de cada faixa". Só o COMPRIMENTO da
+   barra muda: os pedaços são % da faixa nas duas unidades, então a composição
+   que o olho comparou continua a mesma — é a moldura que encolhe. Em "% da
+   faixa" todas medem igual e se comparam TAXAS; em "R$" a barra é proporcional
+   ao volume e se comparam TAMANHOS. */
+(function(){
+  "use strict";
+  function init(){
+    var box = document.querySelector('.dst-unit');
+    if (!box || box.dataset.wired) return;
+    box.dataset.wired = '1';
+    var bars = [].slice.call(document.querySelectorAll('.dst-bar'));
+    box.addEventListener('click', function(ev){
+      var btn = ev.target.closest('.dst-u');
+      if (!btn) return;
+      [].forEach.call(box.querySelectorAll('.dst-u'), function(b){
+        b.classList.toggle('active', b === btn);
+      });
+      var unit = btn.dataset.unit;
+      bars.forEach(function(bar){
+        bar.style.width = (unit === 'abs' ? bar.dataset.wAbs : bar.dataset.wPct) + '%';
+      });
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else { init(); }
+})();
+</script>
+
+{% include "_drilldown.html" %}
+{% endblock %}

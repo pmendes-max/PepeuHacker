@@ -1,5 +1,6 @@
 """Pepeu Hacker — Sales performance dashboard for Tractian.
 Flask app serving on localhost. Data source: BigQuery (tractian-bi)."""
+import math
 import os
 import re
 import socket
@@ -7,17 +8,70 @@ import subprocess
 import threading
 import time
 import urllib.parse
-from datetime import date, datetime, timedelta
-import pandas as pd
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from datetime import date, datetime, timedelta, timezone
 
+# FUSO DE BRASÍLIA, FIXO. O container do Cloud Run roda em UTC, e o código deste
+# arquivo sempre falou em horário de Brasília — "12:00 BRT" em `_last_two_sundays`,
+# "hoje" em `_today()`. Nas três horas entre 21h e meia-noite os dois discordavam:
+# o dashboard já virava o dia (e, em 30/09 e 31/12, o TRIMESTRE) enquanto ainda
+# era ontem pra quem estava olhando. Descoberto em 15/09/2026 pelo selo de
+# frescor, que mostrava "dado de 17:02" às 14h.
+#
+# Offset fixo e não `ZoneInfo("America/Sao_Paulo")` de propósito: o Brasil
+# acabou com o horário de verão em 2019, então -03:00 vale o ano inteiro, e a
+# imagem `python:3.11-slim` não garante o banco de fusos do sistema — um
+# ZoneInfo sem tzdata levanta exceção no import e derruba o app inteiro.
+import numpy as np
+import pandas as pd
+from flask import Flask, request, redirect, jsonify
+from flask import render_template as _flask_render_template
+from flask import url_for as _flask_url_for
+
+import agent_api
 import bq
 import hubspot
 
 app = Flask(__name__)
+
+
+class _JsonSemNaN(app.json_provider_class):
+    """`jsonify` que escreve NaN/±inf como `null`.
+
+    O `json` do Python escreve `NaN` cru, que NÃO é JSON: o `JSON.parse` do
+    navegador aborta a resposta inteira e o drill morre com "Erro ao carregar".
+    A causa de sempre é `r.get("x") or "—"` sobre célula vazia do pandas —
+    `float('nan')` é truthy e passa pelo `or`. O padrão está em ~25 drills
+    (`_txt_cel` conserta um a um, mas o próximo drill reabre o bug); em
+    12/10/2026 derrubou o drill do Unit Price (venda sem AE). Saneando aqui,
+    nenhuma resposta sai inválida, e o drill já mostra `null` como "—"."""
+
+    @staticmethod
+    def _limpa(o):
+        if isinstance(o, float):
+            return o if math.isfinite(o) else None
+        if isinstance(o, dict):
+            return {k: _JsonSemNaN._limpa(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_JsonSemNaN._limpa(v) for v in o]
+        return o
+
+    def dumps(self, obj, **kwargs):
+        return super().dumps(self._limpa(obj), **kwargs)
+
+
+app.json = _JsonSemNaN(app)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 app.jinja_env.globals.update(zip=zip, enumerate=enumerate)
+
+
+def render_template(template_name, **context):
+    """O `render_template` do Flask com uma saída a mais: `?format=json` devolve
+    os dados que a tela desenharia, em vez do HTML. É a porta dos agentes de IA
+    (agent_api.py) — mesma função de rota, mesmos números, nenhuma conta repetida."""
+    if agent_api.quer_json():
+        return agent_api.resposta_da_tela(template_name, context)
+    return _flask_render_template(template_name, **context)
 
 
 def _asset_v(filename: str) -> str:
@@ -31,17 +85,105 @@ def _asset_v(filename: str) -> str:
 app.jinja_env.globals["asset_v"] = _asset_v
 
 
+# ---- Idioma da interface (26/10/2026): PT-BR, ES, EN ----
+# A tradução acontece no navegador (static/i18n.js + o dicionário do idioma em
+# static/i18n/<lang>.js, gerado por tools/i18n/gerar.py). Aqui só: qual idioma
+# a pessoa escolheu (cookie `lang`, gravado pelo seletor do cabeçalho) e a lista
+# de nomes de gente que o tradutor nunca toca. PT é o original: nada carrega.
+IDIOMAS = (("pt", "PT-BR"), ("es", "ES"), ("en", "EN"))
+_IDIOMA_HTML = {"pt": "pt-BR", "es": "es", "en": "en"}
+
+
+def _ui_lang() -> str:
+    from flask import has_request_context
+    if not has_request_context():
+        return "pt"
+    v = (request.cookies.get("lang") or "pt").lower()
+    return v if v in _IDIOMA_HTML else "pt"
+
+
+_I18N_NOMES = {"t": 0.0, "v": []}
+
+
+def _i18n_nomes() -> list:
+    """Nomes de pessoas que aparecem nas telas (roster, líderes, México, dono de
+    qualquer deal) e a forma curta deles ("A. Hernández"). O tradutor troca
+    cada um por {nome} antes de procurar a frase no dicionário — então
+    "Fulano · Saldo" traduz pra qualquer Fulano, e nome nunca é traduzido.
+    Recalcula de hora em hora (gente nova entra no HubSpot)."""
+    if _I18N_NOMES["v"] and time.time() - _I18N_NOMES["t"] < 3600:
+        return _I18N_NOMES["v"]
+    nomes = set(LEADER_ORDER) | set(LEADER_ROLE)
+    for ros in ROSTERS_BR.values():
+        nomes |= set(ros)
+    nomes |= set(MX_ROSTER) | set(MX_DISPLAY.values())
+    for fn in (_get_pipeline_deals, _get_demand_deals, _get_forecast_deals, _mx_deals):
+        try:
+            nomes |= set(fn()["account_executive"].dropna().astype(str).unique())
+        except Exception:  # noqa: BLE001 — sem a fonte, segue com o que tem
+            pass
+    nomes = {n.strip() for n in nomes if isinstance(n, str) and len(n.strip()) > 3}
+    nomes |= {short_name(n) for n in nomes if " " in n}
+    _I18N_NOMES.update(t=time.time(), v=sorted(n for n in nomes if len(n) > 3))
+    return _I18N_NOMES["v"]
+
+
+app.jinja_env.globals.update(ui_lang=_ui_lang, IDIOMAS=IDIOMAS, IDIOMA_HTML=_IDIOMA_HTML,
+                             i18n_nomes=_i18n_nomes)
+
+
 # Allowlist: only these leaders' data is shown anywhere in the dashboard.
 # Hides US/MX leaders + BR leaders not in this list (Francisco Maia, Pedro Mendes,
 # Victor Ferraz, João Vitor Granzotti Machado, "No leader assigned").
-ALLOWED_LEADERS = {
+# Líderes válidos POR PAÍS. Isto NÃO pode ser um set global, e o motivo é um bug
+# que aconteceu: eu tinha posto o gestor do México num único set compartilhado,
+# achando que o nome "não existe no funil BR". Só que a curada
+# `account_executives_performance` atravessa países — e esse gate era a ÚNICA
+# coisa segurando o México fora do Brasil. Resultado: 22 linhas de vendedores
+# mexicanos entraram no dashboard do BR (dropdown de AE, ranking, quota).
+#
+# Agora o conjunto responde à requisição: numa tela do BR só líder brasileiro
+# passa; numa do MX, só o gestor mexicano. Assim o filtro que já existia em ~30
+# lugares vira, sozinho, a fronteira entre os dois países — sem editar nenhum
+# deles e sem depender de alguém lembrar de filtrar região na tela nova.
+_ALLOWED_LEADERS_BR = frozenset({
     "Leonardo Scopel",
     "Fernando Barati",
     "Bernardo Agosti",
     "João Tavares",
     "Gustavo Giovani",
     "Arthur Tkotz",        # RSM Mid Market (player-coach) — pod sob Fernando (Q3/2026)
-}
+})
+# México: um gestor só, sem camada intermediária (ver ORG_CHART).
+_ALLOWED_LEADERS_MX = frozenset({"Mauricio Del Hierro"})
+
+
+class _LideresDaRegiao:
+    """Conjunto de líderes válidos na requisição atual.
+
+    Se comporta como set (é usado em `.isin(...)`, `sorted(...)`, `&`, `|`), mas
+    resolve o conteúdo na hora da chamada. Escolhido em vez de trocar os ~30
+    `isin(ALLOWED_LEADERS)` por uma função: cada um desses seria uma chance de
+    esquecer, e esquecer aqui é silencioso — vira dado de outro país na tela."""
+
+    def _s(self) -> frozenset:
+        return _ALLOWED_LEADERS_MX if _is_mx() else _ALLOWED_LEADERS_BR
+
+    def __iter__(self):      return iter(self._s())
+    def __contains__(self, x): return x in self._s()
+    def __len__(self):       return len(self._s())
+    def __or__(self, o):     return self._s() | set(o)
+    def __ror__(self, o):    return set(o) | self._s()
+    def __and__(self, o):    return self._s() & set(o)
+    def __rand__(self, o):   return set(o) & self._s()
+    def __sub__(self, o):    return self._s() - set(o)
+    def __rsub__(self, o):   return set(o) - self._s()
+    def __eq__(self, o):     return self._s() == o
+    def __hash__(self):      return hash(self._s())
+    def __repr__(self):      return f"LideresDaRegiao({sorted(self._s())})"
+
+
+ALLOWED_LEADERS = _LideresDaRegiao()
 
 # AEs desligados — escondidos dos charts e dropdowns (não aparecem em lugar nenhum).
 DEPARTED_AES = {
@@ -75,7 +217,71 @@ NON_AE_USERS = {
 }
 
 # União usada nos filtros — qualquer pessoa nesse set fica escondida dos charts.
-HIDDEN_FROM_AE_VIEWS = DEPARTED_AES | NON_AE_USERS
+class _EscondidosDaRegiao:
+    """Quem some das visões por AE, no país da requisição.
+
+    No Brasil: quem saiu + os diretores/gerentes. No México: o gestor do país —
+    quem "saiu" lá continua visível de propósito, porque é ele que carrega o
+    histórico (o roster mexicano é o funil inteiro, não uma lista curada)."""
+
+    def _s(self) -> frozenset:
+        return frozenset(NON_AE_USERS_MX) if _is_mx() else frozenset(DEPARTED_AES | NON_AE_USERS)
+
+    def __iter__(self):        return iter(self._s())
+    def __contains__(self, x): return x in self._s()
+    def __len__(self):         return len(self._s())
+    def __or__(self, o):       return self._s() | set(o)
+    def __ror__(self, o):      return set(o) | self._s()
+    def __and__(self, o):      return self._s() & set(o)
+    def __rand__(self, o):     return set(o) & self._s()
+    def __sub__(self, o):      return self._s() - set(o)
+    def __rsub__(self, o):     return set(o) - self._s()
+    def __repr__(self):        return repr(sorted(self._s()))
+
+
+HIDDEN_FROM_AE_VIEWS = _EscondidosDaRegiao()
+
+
+# ------------------------------------------------------------------
+# Duas exclusões DIFERENTES, que por muito tempo foram a mesma lista
+# ------------------------------------------------------------------
+# `HIDDEN_FROM_AE_VIEWS` juntava dois motivos incompatíveis de esconder alguém:
+#
+#   · DEPARTED_AES  — saiu da empresa. O deal dele não é de ninguém: some de
+#                     tudo, inclusive dos totais.
+#   · NON_AE_USERS  — gestor/diretor que fecha deal próprio. O deal EXISTE e é
+#                     do time dele; ele só não é um vendedor.
+#
+# Tratar os dois igual apagava o funil dos gestores das telas de pipeline: o
+# ganho aparecia (o realizado atribui o líder a ele mesmo), mas os R$ 357 mil
+# abertos em nome deles não apareciam em lugar nenhum — o deal só existia no dia
+# em que fechava. Regra correta, pedida em 24/08/2026: aparece no dashboard do
+# LÍDER, nunca no ranking de VENDEDORES.
+#
+# Por isso as duas funções abaixo, e por isso elas têm nomes que dizem a
+# intenção: no frame de dados usa-se `drop_departed_people` (o gestor FICA); só
+# onde a saída é uma linha/barra POR AE usa-se `drop_non_ae_people`.
+
+def drop_departed_people(df: pd.DataFrame) -> pd.DataFrame:
+    """Tira quem saiu da empresa. Gestor/diretor CONTINUA no frame — o deal dele
+    é do time e precisa aparecer em pipeline, forecast e totais."""
+    if df is None or len(df) == 0 or "account_executive" not in df.columns:
+        return df
+    return df[~df["account_executive"].isin(DEPARTED_AES)]
+
+
+def _nao_vendedores() -> set:
+    """Quem nunca é linha/barra POR AE — gestores, no país da requisição."""
+    return NON_AE_USERS_MX if _is_mx() else NON_AE_USERS
+
+
+def drop_non_ae_people(df: pd.DataFrame) -> pd.DataFrame:
+    """Tira gestor/diretor. Usar SÓ imediatamente antes de agregar por AE (ranking
+    de vendedores, barra por pessoa, dropdown de AE) — nunca no frame que alimenta
+    total, pipeline ou visão por líder, senão o deal do gestor some de novo."""
+    if df is None or len(df) == 0 or "account_executive" not in df.columns:
+        return df
+    return df[~df["account_executive"].isin(_nao_vendedores())]
 
 # AEs que saíram A PARTIR de um quarter específico: mantêm o histórico ANTES do
 # cutoff, mas somem do cutoff em diante. Diferente de DEPARTED_AES (que apaga o
@@ -84,7 +290,47 @@ HIDDEN_FROM_AE_VIEWS = DEPARTED_AES | NON_AE_USERS
 DEPARTED_FROM = {
     "Victor Paravani": date(2026, 7, 1),   # sai no Q3/2026 — mantém Q2
     "Raul Tezza":      date(2026, 7, 1),
+    # Fora do roster do Q4/2026 (planilha "Brazil BP Q4 2026") — mantêm o Q3.
+    # Em 08/10/2026 Diego, Victor Hugo, Gabriel Faria e Raphael ainda tinham
+    # ~R$ 1,6 mi de funil aberto no nome deles no HubSpot; esses deals somem das
+    # telas até serem redistribuídos (aí aparecem sozinhos no novo dono).
+    "Diego Iasbeck":       date(2026, 10, 1),
+    "Victor Hugo Borges":  date(2026, 10, 1),
+    "Gabriel Faria":       date(2026, 10, 1),
+    "Raphael Boccaletti":  date(2026, 10, 1),
+    "Rayssa Holanda":      date(2026, 10, 1),
+    "Flavio Correa":       date(2026, 10, 1),
+    # NÃO saiu: segue RSM do pod no Q4 (líder no roster e no ORG_CHART). Está
+    # aqui porque, sem quota no Q4, o Pedro pediu em 19/10/2026 que ele suma de
+    # todo dado em que aparece como VENDEDOR (dono do deal) dali em diante. O
+    # corte é por dono do deal, então o time dele continua inteiro.
+    # EXCEÇÃO (ver DEPARTED_FROM_KEEP_WON): venda FECHADA dele continua contando.
+    "Arthur Tkotz":        date(2026, 10, 1),
 }
+
+# Exceção ao corte acima para VENDA FECHADA (closedwon). Pedido do Pedro em
+# 04/11/2026: a Crown Embalagens (Arthur, R$ 80k, PO 26/10/2026) sumia de todas
+# as telas por causa do corte de 19/10. O pipeline aberto dele segue fora (o
+# pedido de 19/10 continua valendo pra funil); o que ele FECHA entra como venda
+# de gestor — líder = ele mesmo, fora das barras de vendedor, dentro do pod
+# dele, do Fernando (ORG_CHART) e do total.
+DEPARTED_FROM_KEEP_WON = {"Arthur Tkotz"}
+
+
+def _keep_won_rows(df: pd.DataFrame) -> pd.Series:
+    """True nas linhas de VENDA FECHADA de quem está em DEPARTED_FROM_KEEP_WON —
+    as que o corte de DEPARTED_FROM tem de poupar. Frame sem indicação de ganho
+    (pipeline/snapshot sem `is_won`/`dealstage`) → nada é poupado."""
+    if df is None or not len(df) or "account_executive" not in df.columns:
+        return pd.Series(False, index=getattr(df, "index", None))
+    m = df["account_executive"].isin(DEPARTED_FROM_KEEP_WON)
+    if "is_won" in df.columns:
+        won = df["is_won"].fillna(False).astype(bool)
+    elif "dealstage" in df.columns:
+        won = df["dealstage"] == "closedwon"
+    else:
+        return pd.Series(False, index=df.index)
+    return m & won
 
 
 def drop_departed_from(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
@@ -146,7 +392,7 @@ def merge_ae_quarter_dups(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # Override manual de líder/região (legado). Vazio: a atribuição de time passou a
-# ser dirigida pelo Q3_ROSTER (abaixo), que é quarter-scoped na curated (preserva
+# ser dirigida pelo ROSTERS_BR (abaixo), que é quarter-scoped na curated (preserva
 # histórico) e global no deal-level. Mantido como no-op p/ os call sites.
 LEADER_OVERRIDES: dict = {}
 
@@ -165,21 +411,128 @@ def apply_leader_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Roster Q3/2026 — fonte da verdade informada pela liderança (planilha).
-# Define TIME (leader = RSM/gerente direto), QUOTA (MRR, BRL) e META DE NEW LOGOS
-# por AE. Chave = nome EXATO no BigQuery. Aplicado:
-#   • curated  → só nas linhas do quarter Q3 (preserva histórico Q2 no /perf etc.)
-#   • deal-level → global por nome (deal-level já usa 1 líder = time atual)
-#   • /overview  → quota + meta de new logos autoritativas quando o período é o Q3
-# Arthur Tkotz é player-coach (tem quota própria E gerencia um pod sob o Fernando).
+# Extensão do fechamento do quarter — SÓ para RECEITA REALIZADA.
+# Quando a empresa estende o fechamento, o PO validado nos primeiros dias do
+# quarter seguinte conta como realizado do quarter estendido, como se tivesse
+# sido validado no último dia dele. É o que o registro de venda do Ops faz: o
+# Embalatec (deal 62704492076) está como PO Won em 01/10/2026 no HubSpot e
+# validado em 30/09/2026 no Ops.
+#
+# Todo o resto (pipeline, forecast dos abertos, ciclo, ticket, conversão,
+# contagem de deals, demanda) segue o calendário normal: a extensão muda a data
+# em que a RECEITA cai, não a data em que o deal aconteceu.
+#
+# Chave = início do quarter estendido; valor = último dia de validação aceito.
 # ============================================================
+REALIZED_QUARTER_EXTENSIONS: dict = {
+    date(2026, 7, 1): date(2026, 10, 2),   # Q3/26: validado até 02/10/2026
+}
+
+
+def _rev_date(s):
+    """Data de validação → data da RECEITA REALIZADA (aplica as extensões).
+
+    Aceita Series datetime64 (devolve datetime64, preservando tz), Series de
+    `date` ou um escalar (date/Timestamp). Validado dentro de uma extensão vira o
+    último dia do quarter estendido; qualquer outra data passa intacta. Use em
+    TODA janela, quarter ou atribuição de líder do realizado — e em nenhum outro
+    lugar."""
+    if not REALIZED_QUARTER_EXTENSIONS:
+        return s
+    if isinstance(s, pd.Series):
+        if pd.api.types.is_datetime64_any_dtype(s):
+            out = s.copy()
+            tz = getattr(s.dt, "tz", None)
+            for qs, ext_end in REALIZED_QUARTER_EXTENSIONS.items():
+                q_end = pd.Timestamp(_quarter_end_of(qs))
+                lim = pd.Timestamp(ext_end) + pd.Timedelta(days=1)
+                if tz is not None:
+                    q_end, lim = q_end.tz_localize(tz), lim.tz_localize(tz)
+                m = (s >= q_end + pd.Timedelta(days=1)) & (s < lim)
+                # Mantém a hora/tz do Timestamp original? Não: a receita cai no
+                # DIA final do quarter; meia-noite basta pra qualquer janela.
+                out = out.mask(m, q_end)
+            return out
+        return s.map(_rev_date)
+    if s is None or (not isinstance(s, (date, pd.Timestamp))) or pd.isna(s):
+        return s
+    d = s.date() if isinstance(s, (pd.Timestamp, datetime)) else s
+    for qs, ext_end in REALIZED_QUARTER_EXTENSIONS.items():
+        q_end = _quarter_end_of(qs)
+        if q_end < d <= ext_end:
+            if isinstance(s, pd.Timestamp):
+                return pd.Timestamp(q_end, tz=s.tz)
+            if isinstance(s, datetime):
+                return datetime.combine(q_end, datetime.min.time(), tzinfo=s.tzinfo)
+            return q_end
+    return s
+
+
+def _rev_tag(d) -> str:
+    """Selo curto pros drills: "conta no Q3/26" quando a data de validação caiu
+    numa extensão de fechamento (a receita foi para o quarter anterior); "" no
+    caso normal. A data exibida no drill continua sendo a real."""
+    if d is None or pd.isna(d):
+        return ""
+    r = _rev_date(d)
+    if r is None or pd.isna(r) or r == d:
+        return ""
+    rd = r.date() if isinstance(r, datetime) else r
+    return f"conta no {_quarter_label(_quarter_start_of(rd))}"
+
+
+def rev_ext_note(date_from=None, date_to=None) -> str:
+    """Aviso de uma linha pro card de Realizado quando a janela encosta numa
+    extensão de fechamento: o fim do quarter estendido está dentro dela (o
+    realizado INCLUI validados depois do fim) ou ela começa nos dias da extensão
+    (o realizado EXCLUI os validados nesses dias). "" no caso normal. Janela
+    vazia = quarter de hoje, o default das telas."""
+    try:
+        lo = pd.to_datetime(date_from).date() if date_from else _quarter_start_of(_today())
+        hi = pd.to_datetime(date_to).date() if date_to else _quarter_end_of(_today())
+    except Exception:
+        return ""
+    if lo > hi:
+        return ""
+    for qs, ext_end in REALIZED_QUARTER_EXTENSIONS.items():
+        q_end, lbl = _quarter_end_of(qs), _quarter_label(qs)
+        # Janela que já contém o fim do quarter E os dias da extensão: mover a
+        # data não muda nada, e o aviso só confundiria.
+        if lo <= q_end <= hi < ext_end:
+            return (f"{lbl} inclui PO validado até {ext_end:%d/%m} "
+                    "(fechamento estendido)")
+        if q_end < lo <= ext_end:
+            return (f"validados até {ext_end:%d/%m} contam no {lbl} "
+                    "(fechamento estendido)")
+    return ""
+
+
+app.jinja_env.globals["rev_ext_note"] = rev_ext_note
+
+
+# ============================================================
+# Rosters POR TRIMESTRE — fonte da verdade informada pela liderança (planilha).
+# Cada um define TIME (leader = RSM/gerente direto), QUOTA (MRR, BRL) e META DE
+# NEW LOGOS por AE do SEU trimestre. Chave = nome EXATO (canônico) no BigQuery.
+# Aplicado:
+#   • curated  → cada roster só nas linhas do próprio quarter (histórico intacto)
+#   • deal-level → o roster do trimestre VIGENTE, global por nome (1 líder = time atual)
+#   • telas com período → o roster do trimestre quando a janela cabe nele
+#     (`_roster_window`); fora disso, a quota da curated.
+# Mudou o time num trimestre novo? Crie o dict dele e registre em ROSTERS_BR —
+# o dos trimestres anteriores NÃO se edita (é o que a tela mostra pro passado).
+# ============================================================
+# Q3/2026. Arthur Tkotz é player-coach (tem quota própria E gerencia um pod sob o Fernando).
 Q3_START = date(2026, 7, 1)
 Q3_END   = date(2026, 9, 30)
-Q3_ROSTER = {
+_Q3_ROSTER_BR = {
     # Bernardo Agosti (Commercial + Mid Market)
     "Felipe Martins":                      {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 50000,  "new_logos": 4},
     "Rafael Avellar":                      {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 28000,  "new_logos": 2},
-    "Diego Loures":                        {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 5000,   "new_logos": 1},  # "Diego Loures Peter" — nome exato no BQ = "Diego Loures"
+    # ATENÇÃO: na base ele é "Diego Peter", NÃO "Diego Loures" — o comentário
+    # antigo aqui afirmava o contrário e por isso o erro passou. O casamento é
+    # feito por bq.AE_NAME_ALIASES; sem ele esta chave não encontra deal nenhum.
+    "Diego Loures":                        {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 5000,   "new_logos": 1},  # "Diego Loures Peter" — na base: "Diego Peter"
     "Pedro Ferri":                         {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 28000,  "new_logos": 2},
     "Matheus Bonfim":                      {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 23666,  "new_logos": 2},
     "Matheus Stanford":                    {"leader": "Bernardo Agosti", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
@@ -229,8 +582,146 @@ Q3_ROSTER = {
     "Lucas Allgayer":                      {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 125000, "new_logos": 4},
     "Raphael Boccaletti":                  {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 87500,  "new_logos": 2},
 }
+
+# Q4/2026 — planilha "Brazil BP Q4 2026" (aba AE Capacity), recebida em 08/10/2026.
+# `leader` = coluna RSM; a coluna "Líder" é o diretor, que o ORG_CHART já resolve
+# (Bernardo ⊃ João, Fernando ⊃ Arthur, Pedro ⊃ Leonardo e Gustavo).
+# Mudanças contra o Q3:
+#   · saíram do time: Diego Iasbeck, Victor Hugo Borges, Gabriel Faria, Raphael
+#     Boccaletti, Rayssa Holanda e Flavio Correa (ver DEPARTED_FROM);
+#   · Arthur Tkotz deixa de carregar quota: fica só RSM do pod. Em 19/10/2026 o
+#     Pedro pediu que o deal próprio dele saia de TUDO no Q4 (não conta nem como
+#     venda de gestor): ver DEPARTED_FROM;
+#   · 19/10/2026: Francisco Burns passa pro pod do Arthur e Julio Camargo vai
+#     direto pro Fernando. Os dois têm R$ 90 mil de quota, então a capacity de
+#     cada time e os Comp. Targets derivados não mudam;
+#   · 21/10/2026: Rafael Avellar e Diego Peter (chave "Diego Loures") saem da
+#     gestão direta do Bernardo e vão pro time do João Tavares, mesma quota. O
+#     Comp. Target do João sobe com os R$ 77,5 mil de capacity; o do Bernardo
+#     não muda (o João está dentro dele);
+#   · entram Bruno Almeida, Pedro Capriotti e Gabriel Silva (rampa) e Thomas
+#     Talarico / Luigi Mantoni, que começam até ~22/10 e ainda NÃO existem no
+#     HubSpot — quota 0 no Q4; quando o owner aparecer, conferir se o nome casa
+#     com a chave daqui (senão, alias em bq.AE_NAME_ALIASES).
+# "Diego Peter" na planilha = "Diego Loures" aqui (alias em bq.py).
+Q4_START = date(2026, 10, 1)
+Q4_END   = date(2026, 12, 31)
+_Q4_ROSTER_BR = {
+    # Bernardo Agosti (Commercial + Mid Market)
+    "Felipe Martins":                      {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 50000,  "new_logos": 4},
+    "Pedro Ferri":                         {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 50000,  "new_logos": 4},
+    "Matheus Bonfim":                      {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 42667,  "new_logos": 3},
+    "Matheus Stanford":                    {"leader": "Bernardo Agosti", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Bruno Almeida":                       {"leader": "Bernardo Agosti", "tier": "Commercial", "quota": 5000,   "new_logos": 1},
+    # João Tavares (RSM Commercial, sob o Bernardo)
+    "Daniel Del Paschoa":                  {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
+    "Douglas Barbosa":                     {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
+    "Luca Dalmazi":                        {"leader": "João Tavares",    "tier": "Commercial", "quota": 23666,  "new_logos": 2},
+    "Pedro Capriotti":                     {"leader": "João Tavares",    "tier": "Commercial", "quota": 5000,   "new_logos": 1},
+    "Rafael Avellar":                      {"leader": "João Tavares",    "tier": "Commercial", "quota": 50000,  "new_logos": 4},
+    "Diego Loures":                        {"leader": "João Tavares",    "tier": "Commercial", "quota": 27500,  "new_logos": 2},
+    # Arthur Tkotz (RSM Mid Market, sob o Fernando) — sem quota própria no Q4
+    "João Pedro Vellardo Kouyomdjian":     {"leader": "Arthur Tkotz",    "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Francisco Burns":                     {"leader": "Arthur Tkotz",    "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Breno Smanio":                        {"leader": "Arthur Tkotz",    "tier": "Mid Market", "quota": 49500,  "new_logos": 3},
+    # Fernando Barati (Mid Market)
+    "Flávio Domingues":                    {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 49500,  "new_logos": 3},
+    "Bruno Brunelli":                      {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Julio Camargo":                       {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Maria Eduarda Da Silva Pasqualinotto":{"leader": "Fernando Barati", "tier": "Mid Market", "quota": 90000,  "new_logos": 4},
+    "Gabriel Silva":                       {"leader": "Fernando Barati", "tier": "Mid Market", "quota": 9000,   "new_logos": 1},
+    # Gustavo Giovani (Enterprise, direto ao Pedro)
+    "Matheus Farias":                      {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Dantt Oliveira":                      {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Gabriel Martins":                     {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Thiago Ribeiro":                      {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 106261, "new_logos": 2},
+    "Vinicius Borges":                     {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Luigi Mantoni":                       {"leader": "Gustavo Giovani", "tier": "Enterprise", "quota": 0,      "new_logos": 0},
+    # Leonardo Scopel (Enterprise, direto ao Pedro)
+    "Caio Mesquita":                       {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Lucas Allgayer":                      {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 125000, "new_logos": 2},
+    "Thomas Talarico":                     {"leader": "Leonardo Scopel", "tier": "Enterprise", "quota": 0,      "new_logos": 0},
+}
+
+# Trimestre → roster do BRASIL. A ordem não importa; o vigente é o mais recente
+# que já começou (`_roster_quarter_current`).
+ROSTERS_BR = {
+    Q3_START: _Q3_ROSTER_BR,
+    Q4_START: _Q4_ROSTER_BR,
+}
 # region do roster = BR (todo o time). Mapa nome→região p/ deal-level.
-Q3_ROSTER_REGION = "BR"
+_ROSTER_REGION_BR = "BR"
+
+
+def _roster_region() -> str:
+    """Região que o roster estampa. Era a constante "BR" fixa, e por isso o
+    Forecast do México mostrava 'BR' na coluna Região de 6 dos 8 vendedores
+    mexicanos — e qualquer filtro de região passava a mentir."""
+    return "MX" if _is_mx() else _ROSTER_REGION_BR
+
+
+ROSTER_REGION = _ROSTER_REGION_BR
+
+# Os rosters acima sao do BRASIL, e eram percorridos sem olhar o pais: na tela do
+# Mexico eles injetavam os 30 brasileiros no ranking (e linhas sinteticas deles na
+# curada). Mesmo remedio do ALLOWED_LEADERS — o conteudo passa a responder a
+# requisicao, entao os ~20 usos espalhados nao precisam saber de pais nenhum.
+#
+# No MX o roster sai da tabela do BI (`_mx_roster`): o escopo de la e o funil
+# inteiro (decisao do usuario), entao quem manda no universo de vendedores e a
+# lista fixa MX_ROSTER, com a quota do trimestre em dolar.
+
+
+def _roster_quarter_current() -> date:
+    """Trimestre do roster VIGENTE: o mais recente que já começou. Num trimestre
+    novo ainda sem roster, segue o último declarado (melhor time conhecido)."""
+    hoje = _quarter_start_of(_today())
+    started = [q for q in ROSTERS_BR if q <= hoje]
+    return max(started) if started else min(ROSTERS_BR)
+
+
+def _roster_of(q) -> dict:
+    """Roster do trimestre `q` no país da requisição ({} se não houver)."""
+    if q is None:
+        return {}
+    if _is_mx():
+        return _mx_roster(q) if q in ROSTERS_BR else {}
+    return ROSTERS_BR.get(q, {})
+
+
+def _roster_window(from_d, to_d):
+    """Início do trimestre cujo roster vale para a janela [from_d, to_d], ou None
+    quando ela não cabe inteira num trimestre com roster (aí a quota sai da
+    curated, somada nos trimestres que a janela toca)."""
+    if from_d is None or to_d is None:
+        return None
+    q = _quarter_start_of(from_d)
+    return q if (q in ROSTERS_BR and to_d <= _quarter_end_of(q)) else None
+
+
+class _RosterDaRegiao(dict):
+    """Dict do roster VIGENTE que resolve o conteudo na hora da chamada, por pais
+    e por data (vira sozinho no primeiro dia de um trimestre com roster novo).
+
+    Herda de dict pra continuar valendo em `in`, `[]`, `.items()`, `.get()`,
+    `len()` e no teste de verdade — os usos existentes ficam intactos."""
+
+    def _d(self) -> dict:
+        return _roster_of(_roster_quarter_current())
+
+    def __iter__(self):        return iter(self._d())
+    def __len__(self):         return len(self._d())
+    def __contains__(self, k): return k in self._d()
+    def __getitem__(self, k):  return self._d()[k]
+    def __bool__(self):        return bool(self._d())
+    def get(self, k, d=None):  return self._d().get(k, d)
+    def items(self):           return self._d().items()
+    def keys(self):            return self._d().keys()
+    def values(self):          return self._d().values()
+    def __repr__(self):        return repr(self._d())
+
+
+ROSTER = _RosterDaRegiao()
 
 # ============================================================
 # Câmbio p/ reporte global. O time BR é medido em MRR (BRL); a receita é reportada
@@ -243,8 +734,15 @@ MONTHS_PER_YEAR = 12  # MRR → ARR
 
 
 def mrr_brl_to_arr_usd(mrr_brl) -> float:
-    """MRR em BRL → ARR em USD (anualiza ×12 e converte pela taxa do dólar)."""
-    return (to_float(mrr_brl) * MONTHS_PER_YEAR / USD_BRL_RATE) if USD_BRL_RATE else 0.0
+    """MRR em BRL → ARR em USD (anualiza ×12 e converte pela taxa do dólar).
+
+    No México o valor JÁ chega em USD (a conversão de moeda acontece na volta da
+    query, em bq.to_usd), então aqui só anualiza — dividir pelo câmbio de novo
+    encolheria o número em 5x."""
+    v = to_float(mrr_brl) * MONTHS_PER_YEAR
+    if _is_mx():
+        return v
+    return (v / USD_BRL_RATE) if USD_BRL_RATE else 0.0
 
 
 def arr_usd_to_mrr_brl(arr_usd) -> float:
@@ -263,41 +761,75 @@ Q3_TEAM_REVENUE_META_ARR_USD = 5_950_000
 # definido mais abaixo) porque isto roda no import.
 Q3_TEAM_REVENUE_META = Q3_TEAM_REVENUE_META_ARR_USD * USD_BRL_RATE / MONTHS_PER_YEAR
 
+# Q4/2026: US$ 6.765.000 ARR — planilha "BP Q4 2026" (aba AE Capacity, abaixo do
+# total da quota Q4: capacity US$ 4.422.263,72 → meta 152,98% dela). Mesma
+# convenção do Q3: ancorada em ARR USD, MRR BRL derivado pelo câmbio.
+Q4_TEAM_REVENUE_META_ARR_USD = 6_765_000
+
+# Q2/2026: US$ 5.905.000 ARR — passada pelo Pedro em 13/10/2026 ("a quota do Q2
+# era 5905"). O Q2 não tem roster no app: o Comp. Target de cada líder sai da
+# capacity do time NAQUELA época (linhas curadas do Q2), ver `_comp_targets_from_roster`.
+# Só a cobertura histórica do PoP Histórico Q lê esta entrada: as demais telas
+# chegam à meta por `_roster_window`, que não devolve trimestre sem roster.
+Q2_START = date(2026, 4, 1)
+Q2_TEAM_REVENUE_META_ARR_USD = 5_905_000
+
+# Trimestre → meta top-down do time (MRR BRL). Trimestre fora daqui não tem meta
+# top-down: o card cai na soma das quotas do escopo.
+TEAM_REVENUE_META = {
+    Q2_START: Q2_TEAM_REVENUE_META_ARR_USD * USD_BRL_RATE / MONTHS_PER_YEAR,
+    Q3_START: Q3_TEAM_REVENUE_META,
+    Q4_START: Q4_TEAM_REVENUE_META_ARR_USD * USD_BRL_RATE / MONTHS_PER_YEAR,
+}
+
 
 def apply_q3_roster_curated(df: pd.DataFrame) -> pd.DataFrame:
-    """Sobrescreve TIME (leader/region) e QUOTA pelo Q3_ROSTER, com escopos
-    diferentes de propósito:
+    """Em cada quarter com roster, sobrescreve leader e quota_in_brl das linhas
+    dos AEs dele. Quarter-scoped → preserva o histórico dos outros quarters.
+    Requer coluna `quarter` (date). (Nome mantido pelos call sites; hoje vale
+    pra todos os rosters de ROSTERS_BR, não só o do Q3.)
 
-      • TIME  → quarters >= Q3_START. O roster é o time VIGENTE até a liderança
-        mandar um novo: ele não "expira" no fim do Q3. Antes era só Q3, e na virada
-        pro Q4 o líder voltava a ser o `leader` CRU do BQ — que para o player-coach
-        Arthur Tkotz é o gestor dele (Fernando). Resultado: a venda do Arthur no Q4
-        (Crown Embalagens, PO 26/10/2026) caía no Fernando e sumia do pod do
-        Arthur (filtro de líder, barra na visão de líderes, drill). Mesmo bug pro
-        Daniel Del Paschoa, cujo leader cru ainda é o Bernardo (ver Q3_ROSTER).
-      • QUOTA → só Q3. A quota declarada é a do Q3; Q4+ segue a da curated.
-
-    Quarters ANTERIORES ao Q3 não são tocados → histórico preservado. Requer
-    coluna `quarter` (date)."""
-    if df is None or len(df) == 0 or "quarter" not in df.columns or not Q3_ROSTER:
+    Do Q4/2026 em diante o roster também é EXCLUSIVO na quota: AE fora dele no
+    trimestre fica com quota 0 na curated. A tabela do BI segue com meta pra quem
+    saiu ou virou gestor (Arthur Tkotz com R$ 125 mil no Q4), e essa meta vazava
+    em toda janela que atravessa trimestres. O Q3 fica como sempre foi."""
+    if df is None or len(df) == 0 or "quarter" not in df.columns:
         return df
-    is_q3 = df["quarter"] == Q3_START
-    from_q3 = df["quarter"] >= Q3_START
-    for ae, v in Q3_ROSTER.items():
-        is_ae = df["account_executive"] == ae
-        m = from_q3 & is_ae
-        if m.any():
-            df.loc[m, "leader"] = v["leader"]
-            if "region" in df.columns:
-                df.loc[m, "region"] = Q3_ROSTER_REGION
-        mq = is_q3 & is_ae
-        if mq.any() and "quota_in_brl" in df.columns:
-            df.loc[mq, "quota_in_brl"] = v["quota"]
+    for q in ROSTERS_BR:
+        roster = _roster_of(q)
+        if not roster:
+            continue
+        is_q = df["quarter"] == q
+        for ae, v in roster.items():
+            m = is_q & (df["account_executive"] == ae)
+            if m.any():
+                df.loc[m, "leader"] = v["leader"]
+                if "region" in df.columns:
+                    df.loc[m, "region"] = _roster_region()
+                if "quota_in_brl" in df.columns:
+                    df.loc[m, "quota_in_brl"] = v["quota"]
+        # Líder sem quota no trimestre (Arthur no Q4): a linha dele vira de
+        # gestor — líder ele mesmo. O BI o pendura no Gustavo Giovani.
+        for L in _leaders_without_quota(q):
+            m = is_q & (df["account_executive"] == L)
+            if m.any():
+                df.loc[m, "leader"] = L
+        if (q >= ROSTER_QUOTA_EXCLUSIVE_FROM and not _is_mx()
+                and "quota_in_brl" in df.columns):
+            out = is_q & ~df["account_executive"].isin(list(roster))
+            if out.any():
+                df.loc[out, "quota_in_brl"] = 0.0
+                if "new_logos_quota" in df.columns:
+                    df.loc[out, "new_logos_quota"] = 0
     return df
 
 
+# A partir deste trimestre, quem não está no roster não carrega quota (ver acima).
+ROSTER_QUOTA_EXCLUSIVE_FROM = Q4_START
+
+
 # Marca de ORIGEM da linha na curada: False = medida pelo BI, True = declarada pelo
-# Q3_ROSTER. Existe porque depois do concat "AE que o BI ainda não mediu" e "AE com
+# roster do trimestre. Existe porque depois do concat "AE que o BI ainda não mediu" e "AE com
 # realizado zero medido" ficam indistinguíveis, e as duas coisas se leem de forma
 # oposta num ranking. Nunca recebe pd.NA: a coluna serve de máscara e `~pd.NA`
 # propaga NA — um `df[~df[flag]]` devolveria frame VAZIO em vez das linhas reais.
@@ -327,9 +859,11 @@ _ROSTER_SYNTH_ZERO = (
 
 
 def inject_roster_missing_curated(df: pd.DataFrame) -> pd.DataFrame:
-    """Cria na curada a linha que falta pra AE nomeado no Q3_ROSTER.
+    """Cria na curada a linha que falta pra AE nomeado no roster de um trimestre
+    (ROSTERS_BR; só os trimestres já começados).
 
-    INVARIANTE: o Q3_ROSTER é a fonte da verdade de QUEM está no time no Q3; a
+    INVARIANTE: cada roster é a fonte da verdade de QUEM está no time no trimestre
+    dele (o texto abaixo fala do Q3, onde isso nasceu — vale igual pro Q4); a
     curada é a fonte do HISTÓRICO. Onde as duas discordam sobre a EXISTÊNCIA da
     pessoa, o roster ganha — mas só dentro do trimestre dele. No fim, todo nome do
     roster tem exatamente UMA linha em Q3_START (a real, se houver; senão a
@@ -374,7 +908,7 @@ def inject_roster_missing_curated(df: pd.DataFrame) -> pd.DataFrame:
     declarou. `user_id` nulo é funcional, não cosmético — é o marcador natural de
     "esta linha não veio do BigQuery".
     """
-    if (df is None or len(df) == 0 or not Q3_ROSTER
+    if (df is None or len(df) == 0
             or "quarter" not in df.columns
             or "account_executive" not in df.columns):
         return df
@@ -388,11 +922,20 @@ def inject_roster_missing_curated(df: pd.DataFrame) -> pd.DataFrame:
               f" reescrita — esse nome é da marca de origem do roster", flush=True)
     df[_ROSTER_SYNTH_FLAG] = pd.array([False] * len(df), dtype="boolean")
 
-    # Ausência testada por (nome, Q3_START), não "ausente da tabela inteira": o
+    # Ausência testada por (nome, quarter), não "ausente da tabela inteira": o
     # invariante que as telas precisam é por trimestre, e assim o caso "AE antigo
-    # que a curada ainda não fechou no Q3" também fica coberto.
-    have = set(df.loc[df["quarter"] == Q3_START, "account_executive"].dropna())
-    missing = [ae for ae in Q3_ROSTER if ae not in have]
+    # que a curada ainda não fechou no trimestre" também fica coberto. Só
+    # trimestres já começados: roster de trimestre futuro não cria linha.
+    cur_q = _roster_quarter_current()
+    missing, miss_q, miss_cfg = [], [], []
+    for q in sorted(ROSTERS_BR):
+        if q > cur_q:
+            continue
+        roster = _roster_of(q)
+        have = set(df.loc[df["quarter"] == q, "account_executive"].dropna())
+        for ae, cfg in roster.items():
+            if ae not in have:
+                missing.append(ae); miss_q.append(q); miss_cfg.append(cfg)
     if not missing:
         return df
     n = len(missing)
@@ -413,14 +956,14 @@ def inject_roster_missing_curated(df: pd.DataFrame) -> pd.DataFrame:
         # casa. Timestamp aqui faria o recorte por trimestre (apply_filters,
         # apply_q3_roster_curated, _period_leader_map) deixar de casar. quarter_end
         # é obrigatório: é por ele que `apply_filters` corta a borda de baixo.
-        "quarter": [Q3_START] * n,
-        "quarter_end": [_quarter_end_of(Q3_START)] * n,
-        "leader": [Q3_ROSTER[a]["leader"] for a in missing],
-        "region": [Q3_ROSTER_REGION] * n,
+        "quarter": miss_q,
+        "quarter_end": [_quarter_end_of(q) for q in miss_q],
+        "leader": [c["leader"] for c in miss_cfg],
+        "region": [_roster_region()] * n,
         "role": ["AE"] * n,
         "is_currently_active": [True] * n,
-        "quota_in_brl": [Q3_ROSTER[a]["quota"] for a in missing],
-        "new_logos_quota": [Q3_ROSTER[a]["new_logos"] for a in missing],
+        "quota_in_brl": [c["quota"] for c in miss_cfg],
+        "new_logos_quota": [c["new_logos"] for c in miss_cfg],
         _ROSTER_SYNTH_FLAG: [True] * n,
     }
     for c in _ROSTER_SYNTH_ZERO:
@@ -442,33 +985,156 @@ def inject_roster_missing_curated(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _leaders_without_quota(q=None) -> set:
+    """Líderes da hierarquia (RSM/gerente) que NÃO carregam quota no roster do
+    trimestre `q` (default: o vigente). O deal próprio deles vira venda de
+    gestor: o líder é ele mesmo e ele não entra como vendedor. Nasceu pro Arthur
+    Tkotz, player-coach no Q3/2026 e só RSM no Q4 — derivado do roster, sem
+    lista à parte, pra que o próximo "virou só gestor" saia sozinho da planilha.
+    Só BR: o México não tem camada intermediária."""
+    if _is_mx():
+        return set()
+    roster = _roster_of(q if q is not None else _roster_quarter_current())
+    if not roster:
+        return set()
+    return {L for L in _ALLOWED_LEADERS_BR if L not in roster} - NON_AE_USERS
+
+
+def _managers_in(q=None) -> set:
+    """Quem é GESTOR (não vendedor) no trimestre `q`: NON_AE_USERS + líderes sem
+    quota no roster dele. Use onde a linha por AE marca `is_manager`."""
+    return (NON_AE_USERS_MX if _is_mx() else NON_AE_USERS) | _leaders_without_quota(q)
+
+
 def apply_roster_leader(df: pd.DataFrame) -> pd.DataFrame:
-    """Deal-level: atribui leader/region do Q3_ROSTER a todos os deals dos AEs do
+    """Deal-level: atribui leader/region do ROSTER vigente a todos os deals dos AEs do
     roster (deal-level usa 1 líder = time atual). Global por nome. Usado no
     /pipeline (visão corrente). Rotas com histórico (overview) reatribuem por
-    quarter via _attr_deal_leader pra não vazar o roster pro passado."""
-    if df is None or len(df) == 0 or "account_executive" not in df.columns or not Q3_ROSTER:
+    quarter via _attr_deal_leader pra não vazar o roster pro passado.
+
+    Deal de GESTOR/DIRETOR recebe ele mesmo como líder — a venda direta é do time
+    dele. É a mesma regra que `_attr_deal_leader` já aplicava no realizado, mas
+    ela vivia SÓ lá: nos frames de pipeline o gestor vinha com `leader` NULO
+    (o join do BQ monta `ae_meta` com `role = 'AE'`, e gestor não é AE), então o
+    gate seguinte — `leader in ALLOWED_LEADERS` — descartava o deal mesmo depois
+    de tirado da lista de escondidos. Era esse o motivo real de o funil dos
+    gestores não aparecer, e não a lista de exclusão sozinha."""
+    if df is None or len(df) == 0 or "account_executive" not in df.columns:
         return df
-    lead = df["account_executive"].map({a: v["leader"] for a, v in Q3_ROSTER.items()})
-    m = lead.notna()
-    if m.any():
-        df.loc[m, "leader"] = lead[m]
+    if ROSTER:
+        lead = df["account_executive"].map({a: v["leader"] for a, v in ROSTER.items()})
+        m = lead.notna()
+        if m.any():
+            df.loc[m, "leader"] = lead[m]
+            if "region" in df.columns:
+                df.loc[m, "region"] = _roster_region()
+    # Gestor → líder de si mesmo. `region` junto, senão o filtro de região
+    # (que compara `== 'BR'`) derrubaria o deal por causa de um NULO.
+    mg = df["account_executive"].isin(NON_AE_USERS | _leaders_without_quota())
+    if mg.any():
+        if "leader" not in df.columns:
+            df["leader"] = pd.NA
+        df.loc[mg, "leader"] = df.loc[mg, "account_executive"]
         if "region" in df.columns:
-            df.loc[m, "region"] = Q3_ROSTER_REGION
+            df.loc[mg, "region"] = _roster_region()
     return df
 
 
-def _apply_roster_current(df: pd.DataFrame) -> pd.DataFrame:
+# ------------------------------------------------------------------
+# Regiao da requisicao: as MESMAS telas servem BR e MX
+# ------------------------------------------------------------------
+# O caminho decide o pipeline. `/mx/...` roda exatamente as views do BR — o que
+# muda e (a) qual funil o BigQuery le e (b) a camada de time. Foi assim, e nao
+# duplicando as telas, porque "tudo identico" so e sustentavel se houver UM
+# codigo: tela duplicada diverge no primeiro ajuste que alguem esquecer de
+# aplicar nos dois lados.
+def _is_mx() -> bool:
+    from flask import has_request_context
+    return has_request_context() and request.path.startswith("/mx/")
+
+
+# Endpoint do BR -> endpoint espelho do MX. Preenchido lá embaixo, junto das
+# rotas; consultado em tempo de chamada, por isso pode nascer vazio aqui.
+_MX_ENDPOINT_BY_TARGET: dict = {}
+
+
+def url_for(endpoint, **values):
+    """`url_for` ciente da região.
+
+    Numa tela do México, um `url_for('pipeline_total_deals')` escrito no template
+    do Brasil apontava pra `/pipeline/total/deals` — e o clique trazia os deals
+    BRASILEIROS pra dentro da tela do México. Como as views são as MESMAS, o
+    template não tem como saber em que país está; quem sabe é a requisição. Por
+    isso o remapeamento mora aqui, num lugar só, e vale pro Python e pro Jinja.
+    """
+    if _is_mx():
+        endpoint = _MX_ENDPOINT_BY_TARGET.get(endpoint, endpoint)
+    return _flask_url_for(endpoint, **_drill_carry(endpoint, values))
+
+
+def _mx_path(path: str) -> str:
+    """Prefixa /mx nos caminhos que o código monta À MÃO (drill_path dos rank
+    charts). Mesmo problema do url_for, em string crua."""
+    if _is_mx() and path.startswith("/") and not path.startswith("/mx/"):
+        return "/mx" + path
+    return path
+
+
+_MX_PIPELINE = "Sales MX"
+
+
+def _mx_equivalente(path: str) -> str:
+    """A tela do México que corresponde a `path` (do AE ou do Leaders do BR), ou
+    o Overview do México se ela não existir lá (ex.: Sales Overtime)."""
+    if path.startswith("/mx/"):
+        return path
+    for mx, br in _MX_PATH_TO_BR.items():
+        if br == path:
+            return mx
+    sem_leaders = path.replace("/leaders/", "/", 1) if path.startswith("/leaders/") else path
+    for mx, br in _MX_PATH_TO_BR.items():
+        if br == sem_leaders:
+            return mx
+    return "/mx/overview/sales"
+
+
+def _pl() -> str:
+    """Pipeline do HubSpot a consultar nesta requisicao."""
+    return _MX_PIPELINE if _is_mx() else bq.SALES_BR
+
+
+def _apply_roster_current(df: pd.DataFrame, cut_from: date | None = None) -> pd.DataFrame:
     """Frames de SNAPSHOT vindos direto do BQ (pipeline stalled/funnel/wow) trazem
-    o leader/region CRU da SQL (não-roster). Reatribui pelo Q3_ROSTER e remove quem
+    o leader/region CRU da SQL (não-roster). Reatribui pelo ROSTER vigente e remove quem
     já saiu (cutoff <= hoje) — espelha o que _get_pipeline_deals faz. Visão corrente
-    (não histórica), então usa o time atual global."""
+    (não histórica), então usa o time atual global.
+
+    `cut_from` troca "quem já saiu (cutoff <= hoje)" por "quem já tinha saído em
+    DATA X" — é o que uma série HISTÓRICA precisa: DEPARTED_FROM é a lista de
+    quem mantém o histórico ANTES do cutoff, e cortar por hoje apagava o passado
+    inteiro dessas pessoas (media R$ 70 mil, 6,3% do último ponto do Q2/2026, só
+    do Raul Tezza — e a aba Forecast, que corta por data, nunca fechava com a
+    série). Usa-se o INÍCIO da janela, e não a data de cada linha, pra série não
+    ganhar um degrau artificial: se a pessoa saiu no meio, o degrau seria a saída
+    dela, não movimento de pipeline."""
     if df is None or len(df) == 0 or "account_executive" not in df.columns:
         return df
+    if _is_mx():
+        # O MX nao tem roster nem hierarquia na base (metade do time esta como
+        # "No leader assigned"). Em vez de abrir excecao em cada um dos ~30
+        # lugares que filtram por ALLOWED_LEADERS, todo deal do MX recebe o
+        # gestor do pais como lider: os gates passam, o escopo e o funil inteiro
+        # e nenhuma tela do BR foi tocada.
+        df = df.copy()
+        df["leader"] = MX_LEADER
+        if "region" in df.columns:
+            df["region"] = "MX"
+        return df
     df = apply_roster_leader(df.copy())
-    _gone = {ae for ae, cut in DEPARTED_FROM.items() if cut <= _today()}
+    _ref = cut_from or _today()
+    _gone = {ae for ae, cut in DEPARTED_FROM.items() if cut <= _ref}
     if _gone:
-        df = df[~df["account_executive"].isin(_gone)]
+        df = df[~df["account_executive"].isin(_gone) | _keep_won_rows(df)]
     return df
 
 
@@ -483,9 +1149,8 @@ def _period_leader_map(force: bool = False) -> dict:
 
 def _attr_deal_leader(frame: pd.DataFrame, date_col: str, lmap: dict) -> list:
     """Líder de cada deal = líder do curated no quarter da data do deal (date_col).
-    Fallback: gestor→ele mesmo; senão roster (Q3 em diante — time vigente); senão
-    o leader atual do frame. Corrige atribuição histórica (Q2 fica no líder de Q2,
-    Q3+ no do roster)."""
+    Fallback: gestor→ele mesmo; senão roster do quarter; senão o leader atual do frame.
+    Corrige atribuição histórica (Q2 fica no líder de Q2, Q3 no do roster)."""
     if not len(frame):
         return []
     out = []
@@ -493,10 +1158,10 @@ def _attr_deal_leader(frame: pd.DataFrame, date_col: str, lmap: dict) -> list:
         q = _quarter_start_of(dt.date()) if pd.notna(dt) else None
         ld = lmap.get((ae, q))
         if ld is None:
-            if ae in NON_AE_USERS:
+            if ae in NON_AE_USERS or ae in _leaders_without_quota(q):
                 ld = ae                                   # venda direta do gestor
-            elif q is not None and q >= Q3_START and ae in Q3_ROSTER:
-                ld = Q3_ROSTER[ae]["leader"]              # AE do roster sem linha curated no quarter
+            elif ae in _roster_of(q if q in ROSTERS_BR else None):
+                ld = _roster_of(q)[ae]["leader"]          # AE novo do roster sem linha curated
             else:
                 ld = cur                                  # fallback: leader do snapshot
         out.append(ld)
@@ -547,13 +1212,18 @@ def _identify_hold_deal_ids(deals: pd.DataFrame, force: bool = False) -> set:
 ORG_CHART = {
     # Gustavo Giovani reporta DIRETO ao Pedro Mendes (VP) desde 15/jul/2026 —
     # não é mais subordinado do Leonardo Scopel.
-    "Pedro Mendes":    ["Leonardo Scopel", "Fernando Barati", "Bernardo Agosti", "Gustavo Giovani"],
+    # Mauricio Del Hierro (México) reporta DIRETO ao Pedro Mendes (VP) — instrução
+    # de 24/08/2026. É o único gestor dos 7 vendedores do MX; não há camada
+    # intermediária no país, ao contrário do BR (diretor → gerente → AE).
+    "Pedro Mendes":    ["Leonardo Scopel", "Fernando Barati", "Bernardo Agosti",
+                        "Gustavo Giovani", "Mauricio Del Hierro"],
     "Leonardo Scopel": [],
     "Fernando Barati": ["Arthur Tkotz"],
     "Bernardo Agosti": ["João Tavares"],
     "Gustavo Giovani": [],
     "João Tavares":    [],
     "Arthur Tkotz":    [],
+    "Mauricio Del Hierro": [],
 }
 
 # Ordem hierárquica do dropdown (VP → Diretores → Gerentes/RSMs).
@@ -561,6 +1231,7 @@ LEADER_ORDER = [
     "Pedro Mendes",
     "Leonardo Scopel", "Fernando Barati", "Bernardo Agosti",
     "Gustavo Giovani", "Arthur Tkotz", "João Tavares",
+    "Mauricio Del Hierro",
 ]
 
 # Meta de RECEITA de cada diretor/gerente = "Comp. Target" (planilha da liderança).
@@ -599,7 +1270,7 @@ LEADER_ORDER = [
 # Confere com o fator medido nos 6 targets (spread 4e-08, só arredondamento).
 #
 # TRÊS COISAS DEIXAM ESTE DICT STALE, e nenhuma avisa sozinha:
-#   1) mexer no Q3_ROSTER (mover AE, mudar quota) → muda a capacity;
+#   1) mexer no roster do trimestre (mover AE, mudar quota) → muda a capacity;
 #   2) mudar Q3_TEAM_REVENUE_META_ARR_USD → muda o numerador;
 #   3) mudar USD_BRL_RATE → a meta em BRL é derivada do câmbio.
 # Em qualquer um dos casos, recalcular pela fórmula acima e reconferir a soma.
@@ -607,7 +1278,7 @@ LEADER_ORDER = [
 # Bônus: foi por esse fator que se confirmou que o alvo do João já embute o
 # Daniel Del Paschoa — com o Daniel o fator dele casa com os outros 5 na 7ª
 # decimal, sem o Daniel dispara pra 1,509.
-LEADER_BOARD_TARGET = {
+_LEADER_BOARD_TARGET_Q3 = {
     "Bernardo Agosti":   459240.97,
     "João Tavares":      183614.43,
     "Fernando Barati":   898651.49,
@@ -615,6 +1286,88 @@ LEADER_BOARD_TARGET = {
     "Leonardo Scopel":   414054.44,
     "Gustavo Giovani":   732011.44,
 }
+
+
+def _comp_targets_from_roster(q) -> dict:
+    """Comp. Target por líder DERIVADO do roster + meta top-down do trimestre —
+    a mesma mecânica da planilha (ver acima): capacity(time) × meta / capacity
+    total. Os 4 líderes de topo somam a meta exata por construção, então o
+    invariante deste bloco não tem como quebrar ao mexer no roster. É o caminho
+    do Q4/2026 em diante; o Q3 fica com os números digitados da planilha.
+
+    Trimestre com meta e SEM roster (Q2/2026): a capacity sai das linhas curadas
+    do trimestre, com o líder que cada AE tinha nelas — "proporcional à capacity
+    do time na época", pedido do Pedro. A hierarquia entre líderes é a de hoje
+    (Fernando ⊃ Arthur, Bernardo ⊃ João)."""
+    roster, meta = ROSTERS_BR.get(q, {}), TEAM_REVENUE_META.get(q)
+    if not roster and meta:
+        cur = _get_clean_ae_perf()
+        cur = cur[pd.to_datetime(cur["quarter"]).dt.date == q]
+        roster = {a: {"quota": float(v), "leader": ld} for (a, ld), v in
+                  cur.groupby(["account_executive", "leader"])["quota_in_brl"].sum().items()}
+    total = sum(float(v["quota"]) for v in roster.values())
+    if not roster or not meta or not total:
+        return {}
+    fator = float(meta) / total
+    out = {}
+    for L in _ALLOWED_LEADERS_BR:
+        team = _expand_leader_em(L, q)
+        cap = sum(float(v["quota"]) for v in roster.values() if v["leader"] in team)
+        if cap:
+            out[L] = round(cap * fator, 2)
+    return out
+
+
+# Q4/2026 (capacity R$ 1.858.094 · meta US$ 6,765 mi = R$ 2.846.937,50 · fator 1,532181),
+# conferido em 08/10/2026:
+#   Bernardo 680.032,77 (⊃ João 197.139,68) · Fernando 854.957,35 (⊃ Arthur 351.635,68)
+#   Gustavo 928.901,97 · Leonardo 383.045,41  → topo soma R$ 2.846.937,50.
+# 21/10/2026, com Rafael Avellar e Diego Peter no time do João: João 315.883,76
+# (os outros não mudam; o topo segue somando a meta).
+LEADER_TARGETS_BY_QUARTER = {Q3_START: _LEADER_BOARD_TARGET_Q3}
+_LEADER_TARGETS_DERIVED: dict = {}
+
+
+def _leader_targets(q) -> dict:
+    """Comp. Target por líder do trimestre `q` ({} se não houver meta declarada:
+    quem chama cai na soma das quotas do time)."""
+    if q is None:
+        return {}
+    if _is_mx():
+        # Um gestor só: a meta dele é a soma das metas declaradas dos 7 (o painel
+        # do Mauricio). Sem meta declarada no trimestre, {} — quem chama cai na
+        # soma das quotas do time, como no Brasil.
+        quotas = _mx_quota_declarada(q)
+        return {MX_LEADER: float(sum(quotas.values()))} if quotas else {}
+    if q in LEADER_TARGETS_BY_QUARTER:
+        return LEADER_TARGETS_BY_QUARTER[q]
+    if q not in _LEADER_TARGETS_DERIVED:
+        _LEADER_TARGETS_DERIVED[q] = _comp_targets_from_roster(q)
+    return _LEADER_TARGETS_DERIVED[q]
+
+
+class _MetaLiderVigente(dict):
+    """LEADER_BOARD_TARGET = Comp. Target do trimestre CORRENTE pela data da
+    RECEITA (na extensão de fechamento ainda é o anterior) — a mesma regra do
+    `meta_ok` das telas de forecast. Resolve na hora da chamada, então vira
+    sozinho na virada do trimestre. Telas com período usam `_leader_targets`."""
+
+    def _d(self) -> dict:
+        return _leader_targets(_quarter_start_of(_rev_date(_today())))
+
+    def __iter__(self):        return iter(self._d())
+    def __len__(self):         return len(self._d())
+    def __contains__(self, k): return k in self._d()
+    def __getitem__(self, k):  return self._d()[k]
+    def __bool__(self):        return bool(self._d())
+    def get(self, k, d=None):  return self._d().get(k, d)
+    def items(self):           return self._d().items()
+    def keys(self):            return self._d().keys()
+    def values(self):          return self._d().values()
+    def __repr__(self):        return repr(self._d())
+
+
+LEADER_BOARD_TARGET = _MetaLiderVigente()
 
 # Cargo de cada um — usado pra mostrar contexto no dropdown.
 LEADER_ROLE = {
@@ -625,6 +1378,7 @@ LEADER_ROLE = {
     "Gustavo Giovani": "Gerente Enterprise",
     "João Tavares":    "Gerente Commercial",
     "Arthur Tkotz":    "RSM Mid Market",
+    "Mauricio Del Hierro": "Gerente México",
 }
 
 
@@ -638,13 +1392,55 @@ def expand_leader(leader: str) -> set:
     return out
 
 
-def _leader_meta_total(leader_names) -> float:
+# Hierarquia que valeu num trimestre passado e não vale mais — só o que MUDOU;
+# o resto segue o ORG_CHART. Gustavo respondia ao Leonardo até 15/07/2026, então
+# no Q2/26 o time do Leonardo inclui o dele (pedido do Pedro em 13/10/2026). Hoje
+# só o PoP Histórico Q (meta, pipe, realizado, painéis e drills) lê isto.
+ORG_CHART_BY_QUARTER = {
+    date(2026, 4, 1): {"Leonardo Scopel": ["Gustavo Giovani"]},
+}
+
+
+def _expand_leader_em(leader: str, q) -> set:
+    """`expand_leader` com a hierarquia do trimestre `q` (ORG_CHART_BY_QUARTER)."""
+    if not leader:
+        return set()
+    extra = ORG_CHART_BY_QUARTER.get(q, {})
+    out, fila = set(), [leader]
+    while fila:
+        x = fila.pop()
+        if x in out:
+            continue
+        out.add(x)
+        fila.extend(expand_leader(x) - {x})
+        fila.extend(extra.get(x, []))
+    return out
+
+
+def _leader_meta_total(leader_names, targets=None) -> float:
     """Total da meta (Board Target) de um conjunto de líderes, contando só os de
     TOPO — exclui quem é subordinado de outro líder presente (evita somar o alvo
     do gerente dentro do do diretor). Ex.: {Fernando, Arthur} → só Fernando."""
     names = set(leader_names)
     top = [L for L in names if not any(L != o and L in expand_leader(o) for o in names)]
-    return float(sum(LEADER_BOARD_TARGET.get(L, 0.0) for L in top))
+    t = LEADER_BOARD_TARGET if targets is None else targets
+    return float(sum(t.get(L, 0.0) for L in top))
+
+
+def _apply_leader_meta(rows, projection_key="projection", targets=None):
+    """Põe a META de cada diretor/gerente em linhas JÁ agregadas por líder, com
+    atingimento e gap. Meta = LEADER_BOARD_TARGET (o "Comp. Target" da planilha
+    da liderança) — a MESMA fonte que a Cobertura de Pipeline e o Modelo
+    Analytics usam, e NÃO a soma das quotas dos AEs do time (essa é a "quota
+    capacity", outro número). Fallback: líder fora do dict mantém o que vier em
+    `quota` (tipicamente a soma do time), pra nunca zerar a coluna."""
+    for r in rows:
+        t = LEADER_BOARD_TARGET if targets is None else targets
+        r["quota"] = float(t.get(r["leader"], r.get("quota") or 0.0))
+        proj = float(r.get(projection_key) or 0.0)
+        r["attainment"] = (proj / r["quota"]) if r["quota"] else None
+        r["gap"] = (r["quota"] - proj) if r["quota"] else None
+    return rows
 
 
 def _leader_rollup(ae_rows, leader_filter, sum_fields):
@@ -692,15 +1488,15 @@ def _explode_leaders(df, leader_filter):
     return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0]
 
 
-def _pipe_leader_df(by_ae_df, leader_filter, use_board_target=True):
+def _pipe_leader_df(by_ae_df, leader_filter, targets=None):
     """Rollup por LÍDER do by_ae de pipeline: cada líder soma seu time
     (expand_leader). remaining_quota recalculado no nível do líder (clip 0).
     Devolve DataFrame com as MESMAS colunas do by_ae por-AE (account_executive=L)
     pra reusar `_cov_items` sem mudança.
 
-    `use_board_target=False` soma a quota do time em vez de usar o Board Target.
-    O Board Target da planilha é do trimestre CORRENTE, então não vale quando a
-    janela é outro trimestre (caso do Early no M3, que aponta pro próximo)."""
+    `targets` = Comp. Target por líder do trimestre da janela (`_leader_targets`).
+    Vazio/None (janela sem trimestre com meta declarada — ex. o Early no M3, que
+    aponta pro próximo) soma a quota do time."""
     cols = ["account_executive", "leader", "region", "quota_brl", "early_amount",
             "late_amount", "early_deals", "late_deals", "validated", "hold",
             "acq", "exp", "remaining_quota"]
@@ -711,8 +1507,7 @@ def _pipe_leader_df(by_ae_df, leader_filter, use_board_target=True):
         if not len(sub):
             continue
         # Meta do líder = Board Target (planilha), não a soma das quotas do time.
-        q = (LEADER_BOARD_TARGET.get(L, float(sub["quota_brl"].sum()))
-             if use_board_target else float(sub["quota_brl"].sum()))
+        q = float((targets or {}).get(L, sub["quota_brl"].sum()))
         val = float(sub["validated"].sum()); hld = float(sub["hold"].sum())
         rows.append({
             "account_executive": L, "leader": L, "region": "BR", "quota_brl": q,
@@ -801,6 +1596,10 @@ def fmt_pct_raw(n, digits=1):
     return f"{to_float(n):.{digits}f}%".replace(".", ",")
 
 
+# O Jinja tem o `url_for` dele, que ignora o wrapper do módulo — sem isto os
+# templates continuariam gerando link do Brasil dentro do México.
+app.jinja_env.globals["url_for"] = url_for
+
 app.jinja_env.filters["brl"] = fmt_brl
 app.jinja_env.filters["money"] = fmt_money
 app.jinja_env.filters["usd"] = fmt_usd
@@ -816,6 +1615,24 @@ def _fmt_mult(v):
     if abs(v - round(v)) < 0.05:
         return f"{int(round(v))}x"
     return f"{v:.1f}".replace(".", ",") + "x"
+
+
+def _nice_money_step(span, target=8):
+    """Passo 'redondo' (1/2/2,5/5 × 10ⁿ) pra um eixo de R$ com ~`target` ticks.
+
+    Existe pro eixo ASSINADO do Histórico PoP: dividir cada lado do zero em 4
+    partes iguais espremia o lado menor — numa janela em que as perdas são 1/4
+    dos ganhos, os 4 rótulos negativos saíam colados uns nos outros. Com um
+    passo único, os dois lados usam a mesma régua e cada lado ganha o número de
+    ticks que o seu tamanho comporta."""
+    if span <= 0:
+        return 1.0
+    raw = span / max(target, 1)
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5):
+        if raw <= m * mag:
+            return m * mag
+    return 10 * mag
 
 
 def _nice_int_axis(rawmax):
@@ -883,13 +1700,17 @@ def _build_rank_chart(items, drill_base, axis_mode="currency",
     _goalv = float(goal_line) if goal_line else 0.0
 
     # Eixo esquerdo (barras): R$ (currency) ou contagem inteira (count).
-    if axis_mode == "count":
+    if axis_mode == "count":   # 'currency' (R$/US$ pelo toggle) · 'usd' (sempre US$)
         _axis_max, _ticks = _nice_int_axis(_maxv)
         _scale = float(_axis_max)
         yL = [{"label": fmt_int(t), "y": round(_base_y - t / _scale * _PLOT, 1)} for t in _ticks]
     else:
         _scale = _maxv
-        yL = [{"label": fmt_brl(_maxv * k / 4), "y": round(_base_y - k / 4 * _PLOT, 1)} for k in range(5)]
+        # 'usd' = o valor JÁ é dólar e não deve passar pela conversão do
+        # fmt_brl (que multiplica por 12 e divide pelo câmbio). É o modo do
+        # Sales MX, onde a série nasce em ARR USD.
+        _f = fmt_usd if axis_mode == "usd" else fmt_brl
+        yL = [{"label": _f(_maxv * k / 4), "y": round(_base_y - k / 4 * _PLOT, 1)} for k in range(5)]
 
     # Eixo direito (linha): % de atingimento (percent) ou multiplicador Nx (multiplier).
     # A meta (goal_line) entra no topo do eixo p/ ficar sempre visível.
@@ -1039,6 +1860,12 @@ PT_MONTHS_SHORT = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","
 
 def _fmt_date_short(d: date) -> str:
     return f"{d.day} {PT_MONTHS_SHORT[d.month-1]} {d.year}"
+
+
+def _fmt_date_curta(d: date) -> str:
+    """Sem o ano — pra eixo apertado, onde "28 jun 2026" não cabe em toda coluna
+    e o ano já está dito no título da tela."""
+    return f"{d.day} {PT_MONTHS_SHORT[d.month-1]}"
 
 
 # Meta semanal de opps auto-geradas por AE: 3 por semana, cumulativo dentro do
@@ -1226,8 +2053,12 @@ def _format_period(filters: dict, presets: list, active_preset: str) -> str:
     return f"{label} · {rng}" if label else rng
 
 
+BRT = timezone(timedelta(hours=-3), "BRT")
+
+
 def _today():
-    return date.today()
+    """Hoje em Brasília — ver a nota do fuso junto aos imports."""
+    return datetime.now(BRT).date()
 
 
 def _last_two_sundays(today_d=None, now_dt=None) -> tuple:
@@ -1240,7 +2071,7 @@ def _last_two_sundays(today_d=None, now_dt=None) -> tuple:
     days_since_sunday = (today_d.weekday() - 6) % 7
     if days_since_sunday == 0:
         # Hoje é domingo. Snapshot de hoje 12h só existe a partir das 12h locais.
-        now = now_dt or datetime.now()
+        now = now_dt or datetime.now(BRT)
         if now.hour < 12:
             days_since_sunday = 7
     last_sunday = today_d - timedelta(days=days_since_sunday)
@@ -1427,6 +2258,28 @@ def build_presets(available_quarters: list[date]) -> list[dict]:
 
 # Cobertura de Pipeline (visão AE e visão diretores) — o filtro de período aqui é
 # Close Date e a página só olha pra frente.
+# Caminho da rota-espelho -> caminho da rota do BRASIL que ela reusa. Preenchido
+# junto do registro das rotas, la embaixo. Sem ele, tirar o prefixo "/mx" nao
+# basta: /mx/pipeline/cobertura viraria "/pipeline/cobertura", que nao e o
+# "/pipeline" do Brasil — e a tela ficava fora do registro de Cobertura, sem a
+# trava do trimestre corrente que faz o multiplicador significar alguma coisa.
+_MX_PATH_TO_BR: dict = {}
+
+
+def _rota_base(path: str) -> str:
+    """Caminho sem o prefixo de país.
+
+    As tuplas abaixo (COVERAGE_PATHS, WOW_PATHS, …) são registros POR TELA, não
+    por país — dizem coisas como "aqui o período é close date" ou "aqui não há
+    date-picker, a janela é domingo a domingo". Como o México roda as MESMAS
+    views, ele precisa cair nos mesmos registros; comparar o path cru deixava
+    /mx/... de fora de todos e a tela mexicana perdia filtro, trava de trimestre
+    e rótulo de período — sem nada quebrar visivelmente."""
+    if not path.startswith("/mx/"):
+        return path
+    return _MX_PATH_TO_BR.get(path) or path[3:]
+
+
 COVERAGE_PATHS = ("/pipeline", "/leaders/pipeline")
 
 # Pipeline Total — "quanto dinheiro tem no funil, cortado como eu quiser".
@@ -1441,9 +2294,57 @@ PIPELINE_TOTAL_PATHS = ("/pipeline/total", "/leaders/pipeline/total")
 WOW_PATHS = ("/pipeline/wow/early", "/pipeline/wow/late",
              "/leaders/pipeline/wow/early", "/leaders/pipeline/wow/late")
 
+# Histórico PoP — mesma natureza (snapshots de domingo 12h BRT), mas em série de
+# N semanas. A janela é uma CONTAGEM de domingos, escolhida no chip da própria
+# página (?weeks=), não um intervalo: por isso entra junto do PoP nas listas de
+# "sem date-picker", mas fora de PRESET_KEYS_BY_PATH (não usa preset nenhum).
+WOW_HIST_PATHS = ("/pipeline/wow/history", "/leaders/pipeline/wow/history",
+                  # PoP Histórico por quarter (só Leaders): mesma natureza — a
+                  # janela é chip da página, e o trimestre de cada semana sai
+                  # da própria semana, não do date-picker.
+                  "/leaders/pipeline/wow/quarter",
+                  # Cópia pro Sales AE BR (20/10/2026): mesma tela, grão de AE.
+                  "/pipeline/wow/quarter")
+
+# Pipeline DoD — a janela é o par de MEIAS-NOITES escolhido no chip da página
+# (?dia=), e o pipe é o funil aberto inteiro, sem corte de close date. Por isso
+# entra junto das telas sem date-picker.
+# O Pipeline WoW é a mesma tela com pontas semanais (?semana=) e entra aqui pelo
+# mesmo motivo.
+PIPELINE_DOD_PATHS = ("/leaders/pipeline/dod", "/leaders/pipeline/wow")
+
 # Funil II — o período aqui não é close date nem snapshot: é a data em que o deal
 # ENTROU na etapa. Janela aberta (sem datas) = histórico inteiro, de propósito.
 FUNNEL2_PATHS = ("/pipeline/funnel-ii", "/leaders/pipeline/funnel-ii")
+
+# WoW do Forecast — o período recorta o QUARTER (close date), igual à aba
+# Forecast e ao Histórico dela; o par de domingos comparados é escolhido no chip
+# da própria página (?par=), não no date-picker. Por isso NÃO entra nas listas de
+# "sem date-picker": aqui as datas significam algo (qual trimestre), só não
+# significam "quais domingos".
+FORECAST_WOW_PATHS = ("/forecast/wow", "/leaders/forecast/wow",
+                      # DoD: mesma natureza, com o par de DIAS no chip (?dia=).
+                      "/leaders/forecast/dod")
+
+# Aba Forecast (a tela-mãe do grupo). Existe pra ela entrar no registro de
+# filtros extras: Deal Type recorta esta tela pelo mesmo motivo do WoW e do
+# Funil II — aquisição e expansão têm ticket, ciclo e taxa de conversão
+# diferentes, e o ponderado somado esconde isso.
+FORECAST_PATHS = ("/forecast", "/leaders/forecast")
+
+# As sub-abas do grupo Forecast que NÃO honram o corte de Deal Type: o Histórico
+# mede o time inteiro semana a semana e o Modelo Analytics já parametriza tipo
+# dentro da própria probabilidade (segmento × estágio × tipo). Elas existem nesta
+# lista só pra o CHIP não mentir — ver `build_active_chips`.
+FORECAST_NO_DTYPE_PATHS = ("/forecast/history", "/leaders/forecast/history",
+                           "/forecast/model", "/leaders/forecast/model")
+
+# Aba Legal — o período recorta o CLOSE DATE, mas olhando pra TRÁS (a aba só
+# fala de deal fechado). Por isso não reusa os presets da Cobertura, que são
+# todos futuros: aqui os úteis são trimestre corrente, passado e ano. Janela
+# aberta por padrão de propósito — são ~1.4k tickets do jurídico em 2 anos e
+# meio, e travar num trimestre deixaria as células da matriz sem amostra.
+LEGAL_PATHS = ("/pipeline/legal", "/leaders/pipeline/legal")
 
 # Whitelist de presets por rota — preserva a ordem informada aqui.
 # None = mostra todos.
@@ -1456,11 +2357,14 @@ PRESET_KEYS_BY_PATH = {
     # Mesmos presets da Cobertura (close date olha pra frente), mas sem pin:
     # a aba abre com o funil inteiro e o trimestre é uma escolha do usuário.
     **{p: ("current_q", "next_q", "next_2q") for p in PIPELINE_TOTAL_PATHS},
+    # Só presets pra trás: a aba mede desfecho, e trimestre futuro não tem
+    # deal fechado pra medir.
+    **{p: ("current_q", "last_q", "this_year", "last_year", "all") for p in LEGAL_PATHS},
 }
 
 
 def filter_presets_for_path(presets: list[dict], path: str) -> list[dict]:
-    allowed = PRESET_KEYS_BY_PATH.get(path)
+    allowed = PRESET_KEYS_BY_PATH.get(_rota_base(path))   # MX usa os presets da mesma TELA
     if allowed is None:
         return presets
     by_key = {p["key"]: p for p in presets}
@@ -1472,7 +2376,8 @@ def filter_presets_for_path(presets: list[dict], path: str) -> list[dict]:
 PERIOD_LABEL_BY_PATH = {**{p: "Close Date" for p in COVERAGE_PATHS},
                         **{p: "Close Date" for p in PIPELINE_TOTAL_PATHS},
                         **{p: "Domingos comparados" for p in WOW_PATHS},
-                        **{p: "Entrada na etapa" for p in FUNNEL2_PATHS}}
+                        **{p: "Entrada na etapa" for p in FUNNEL2_PATHS},
+                        **{p: "Fechamento do deal" for p in LEGAL_PATHS}}
 
 
 def get_filters():
@@ -1497,16 +2402,51 @@ def get_filters():
         # Vazio em toda outra aba, onde os selects nem são renderizados.
         "dtype":     request.args.get("dtype", ""),
         "source":    request.args.get("source", ""),
+        # Propriedade Product do HubSpot. Multi-select, então "prod=smarttrac"
+        # significa "inclui Smart Trac" (ver `_pt_apply_dim_filter`).
+        "prod":      request.args.get("prod", ""),
         "fcat":      request.args.get("fcat", ""),
+        # Presença de close date no Pipeline Total: "" (todos) · "com" · "sem".
+        # Não é uma dimensão de _PT_DIMS porque é teste de NULO, não de valor —
+        # `_pt_apply_dim_filter` compara `col == raw`, que não sabe responder
+        # "tem qualquer data preenchida".
+        # Saneado aqui, como as datas e pelo mesmo motivo: valor inventado na URL
+        # não pode deixar a página num 4º estado sem chip aceso — cai em "todos".
+        "cdate":     (request.args.get("cdate", "")
+                      if request.args.get("cdate") in ("com", "sem") else ""),
+        # Presença de Customer Owner no Pipeline Total: "" (todos) · "com" · "sem".
+        # Mesmo molde do `cdate` (teste de nulo, saneado na origem).
+        "cown":      (request.args.get("cown", "")
+                      if request.args.get("cown") in ("com", "sem") else ""),
+        # Cortes da aba Legal: `env` = o que conta como "jurídico envolvido"
+        # (ticket · interação nominal · qualquer um) e `coh` = a coorte da
+        # comparação (Negociação+ · todos os fechados). Ficam aqui pelo mesmo
+        # motivo de `dtype`/`source`: é o que faz os chips de Ativos, o Limpar e
+        # os url_for(**ctx.filters) do drill carregarem o corte de graça.
+        # Saneados na origem (default quando o valor não existe) pra URL editada
+        # à mão não deixar a página num estado sem chip aceso.
+        # Vazio = default (ticket · Negociação+), resolvido por `_legal_env` /
+        # `_legal_coh` no uso. NÃO resolve aqui de propósito: `ctx.filters` entra
+        # em todo url_for do site, e gravar o default faria cada link de cada aba
+        # carregar ?env=ticket&coh=neg sem nunca ter passado pela aba Legal.
+        "env":       (request.args.get("env", "")
+                      if request.args.get("env") in _LEGAL_ENVS else ""),
+        "coh":       (request.args.get("coh", "")
+                      if request.args.get("coh") in _LEGAL_COHORTS else ""),
     }
 
 
 def _money_mode() -> str:
-    """'arr' quando o filtro mestre de moeda está em ARR US$; senão 'mrr'."""
+    """'arr' quando o filtro mestre de moeda está em ARR US$; senão 'mrr'.
+
+    O México é SEMPRE ARR US$: o time é medido em dólar e um deal em peso não tem
+    leitura em real. Por isso lá o toggle nem aparece."""
     from flask import has_request_context
-    if has_request_context() and request.args.get("money") == "arr":
+    if not has_request_context():
+        return "mrr"
+    if _is_mx():
         return "arr"
-    return "mrr"
+    return "arr" if request.args.get("money") == "arr" else "mrr"
 
 
 def _parse_filter_date(v):
@@ -1566,14 +2506,18 @@ def _parquet_mtime(name: str) -> float:
 
 
 def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
-    """ae_performance + leader overrides + ALLOWED_LEADERS + HIDDEN_FROM_AE_VIEWS,
+    """[Chave de cache começa com _pl(): sem isso a 1ª requisição de um país
+    grava o frame e o outro país recebe o dado errado — o cache em memória não
+    sabia que o mesmo nome de função agora lê dois funis.]
+
+    ae_performance + leader overrides + ALLOWED_LEADERS + HIDDEN_FROM_AE_VIEWS,
     pré-computado com quarter (date) e quarter_end. Cacheado em memória —
     invalidação via mtime do parquet ou force=True."""
     df_raw = bq.ae_performance(force_refresh=force)
     # Chave versionada: o mtime do parquet só detecta dado novo, não CÓDIGO novo —
     # o sufixo garante que nenhum frame montado por uma versão anterior da curada
     # (sem a linha sintética do roster) sobreviva a um reload a quente.
-    key = ("ae_perf_clean_v3", _parquet_mtime("ae_performance"))
+    key = (_pl(), "ae_perf_clean_v2", _parquet_mtime("ae_performance"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1582,11 +2526,30 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
     df = df_raw.copy()
     df["quarter"] = pd.to_datetime(df["quarter"]).dt.date
     df["quarter_end"] = df["quarter"].map(_quarter_end_of)
+    if _is_mx():
+        # MÉXICO: a fronteira do país é a REGIÃO, não o líder. Diferente do Brasil
+        # de propósito, e é o que faz o PASSADO existir: 30 vendedores mexicanos
+        # têm linha desde 2024, e quase todos os que SAÍRAM estão gravados como
+        # "No leader assigned" — filtrar por líder apagaria o histórico inteiro
+        # (sobravam 8 dos 30).
+        #
+        # Depois de recortar a região, todo mundo recebe o gestor do país: o MX
+        # não tem camada intermediária, então o rollup por líder é um só. É a
+        # "outra estrutura, mesmas premissas" que o usuário pediu.
+        #
+        # NÃO passa por apply_q3_roster_curated nem inject_roster_missing_curated:
+        # os dois são a lista curada do BRASIL e injetariam brasileiro aqui.
+        _mx = merge_ae_quarter_dups(canon_ae_names(df[df["region"] == "MX"].copy()))
+        _mx["leader"] = MX_LEADER
+        _mx = _mx.reset_index(drop=True)
+        with _DATA_CACHE_LOCK:
+            _DATA_CACHE[key] = _mx
+        return _mx
     # Nome canônico ANTES do roster: é o rename que faz a linha órfã do AE casar
-    # com o Q3_ROSTER, e a fusão evita a quota sair dobrada.
+    # com o roster, e a fusão evita a quota sair dobrada.
     df = merge_ae_quarter_dups(canon_ae_names(df))
     df = apply_leader_overrides(df)
-    df = apply_q3_roster_curated(df)        # time do roster em Q3+ ; quota só no Q3
+    df = apply_q3_roster_curated(df)        # time/quota Q3 autoritativos (só linhas Q3)
     # Depois do overwrite (a linha sintética já nasce com leader/region/quota do
     # roster, então passar por ele seria no-op) e ANTES dos três gates: a linha
     # sintética tem de enfrentar o MESMO gauntlet de visibilidade de uma real —
@@ -1605,7 +2568,7 @@ def _get_unit_price_events(force: bool = False) -> pd.DataFrame:
     """Eventos de venda validada de Smart Trac (registro de venda) — base do
     Unit Price do Sales Overtime. event_date vira date; números coeridos."""
     raw = bq.unit_price_events(force_refresh=force)
-    key = ("unit_price_events_v1", _parquet_mtime("unit_price_events_v1"))
+    key = (_pl(), "unit_price_events_v1", _parquet_mtime("unit_price_events_v1"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1634,7 +2597,7 @@ def _get_quota_history(force: bool = False) -> pd.DataFrame:
     `leader` é anexado só pra permitir o filtro opcional por líder; fica None pra
     quem não está na curated (não afeta o total)."""
     raw = bq.quota_history(force_refresh=force)
-    key = ("quota_history_v3", _parquet_mtime("quota_history_v2"))  # v3: leader do roster vale Q3+
+    key = (_pl(), "quota_history_v2", _parquet_mtime("quota_history_v2"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1656,7 +2619,8 @@ def _get_quota_history(force: bool = False) -> pd.DataFrame:
         if not ae or pd.isna(ae):
             return None
         return (lmap.get((ae, row["quarter"]))
-                or (Q3_ROSTER[ae]["leader"] if ae in Q3_ROSTER else None)
+                or (_roster_of(row["quarter"] if row["quarter"] in ROSTERS_BR else None)
+                    .get(ae) or ROSTER.get(ae) or {}).get("leader")
                 or cur_leader.get(ae))
     df["leader"] = df.apply(_ld, axis=1) if len(df) else None
     df = df.reset_index(drop=True)
@@ -1676,7 +2640,7 @@ def _current_leader_by_ae(force: bool = False) -> dict:
     """{account_executive: líder atual} — roster Q3 primeiro, senão o snapshot
     mais recente da curated. Usado onde não há data pra atribuir o líder da época
     (ex.: coortes de funil, que atravessam vários quarters)."""
-    out = {ae: v["leader"] for ae, v in Q3_ROSTER.items()}
+    out = {ae: v["leader"] for ae, v in ROSTER.items()}
     for r in _get_clean_ae_perf(force=force).sort_values("quarter").itertuples(index=False):
         out.setdefault(r.account_executive, r.leader)
     return out
@@ -1685,8 +2649,8 @@ def _current_leader_by_ae(force: bool = False) -> dict:
 def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     """Pivot deal × estágio → timestamp da 1ª entrada, uma coluna por número de
     estágio (s1..s7). Base das coortes de conversão do funil."""
-    raw = bq.funnel_stage_entries(force_refresh=force)
-    key = ("funnel_entries_v6", _parquet_mtime("funnel_stage_entries_v5"))
+    raw = bq.funnel_stage_entries(force_refresh=force, pipeline=_pl())
+    key = (_pl(), "funnel_entries_v6", _parquet_mtime("funnel_stage_entries_v5"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1799,7 +2763,7 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     e on-hold dos AEs E das vendas diretas dos gestores. new_mrr do gestor é a
     venda direta dele (independe do time), então não duplica."""
     df_raw = bq.ae_performance(force_refresh=force)
-    key = ("ae_perf_mgrs_v3", _parquet_mtime("ae_performance"))  # ver nota da chave em _get_clean_ae_perf
+    key = (_pl(), "ae_perf_mgrs_v2", _parquet_mtime("ae_performance"))  # ver nota da chave em _get_clean_ae_perf
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1809,10 +2773,10 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     df["quarter"] = pd.to_datetime(df["quarter"]).dt.date
     df["quarter_end"] = df["quarter"].map(_quarter_end_of)
     # Nome canônico ANTES do roster: é o rename que faz a linha órfã do AE casar
-    # com o Q3_ROSTER, e a fusão evita a quota sair dobrada.
+    # com o roster, e a fusão evita a quota sair dobrada.
     df = merge_ae_quarter_dups(canon_ae_names(df))
     df = apply_leader_overrides(df)
-    df = apply_q3_roster_curated(df)        # time do roster em Q3+ ; quota só no Q3
+    df = apply_q3_roster_curated(df)        # time/quota Q3 autoritativos (só linhas Q3)
     # Mesma posição do outro loader, pelo mesmo motivo. Aqui o único gate é o
     # drop_departed_from (este loader não aplica ALLOWED_LEADERS/HIDDEN de
     # propósito, pra somar a venda direta dos gestores) — e a reatribuição de gestor
@@ -1820,7 +2784,24 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     df = inject_roster_missing_curated(df)
     mgr = df["account_executive"].isin(NON_AE_USERS)
     df.loc[mgr, "leader"] = df.loc[mgr, "account_executive"]
+    # Quem está em DEPARTED_FROM_KEEP_WON mantém a linha a partir do corte: é nela
+    # que mora o `total_mrr_on_hold_brl` que identifica a venda dele em validação
+    # financeira (sem ela a Crown aparecia como "validado"). Entra como GESTOR
+    # (líder = ele mesmo) e com quota zerada — a quota da curada não vale pra ele.
+    _kw = pd.Series(False, index=df.index)
+    for ae in DEPARTED_FROM_KEEP_WON:
+        cut = DEPARTED_FROM.get(ae)
+        if cut is not None:
+            _kw |= (df["account_executive"] == ae) & (df["quarter"] >= cut)
+    kept = df[_kw].copy()
+    if len(kept):
+        kept["leader"] = kept["account_executive"]
+        for c in ("quota_in_brl", "new_logos_quota"):
+            if c in kept.columns:
+                kept[c] = 0
     df = drop_departed_from(df, "quarter")
+    if len(kept):
+        df = pd.concat([df, kept], ignore_index=True)
     with _DATA_CACHE_LOCK:
         _DATA_CACHE[key] = df
     return df
@@ -1831,31 +2812,102 @@ def _get_demand_deals(force: bool = False) -> pd.DataFrame:
     pré-computados. Substitui as queries por (date_from, date_to, grain) — todo
     slice/agregação acontece em pandas (sub-millisegundo) ao invés de 15-25s
     BQ por combinação."""
-    raw = bq.demand_deals_raw(force_refresh=force)
-    key = ("demand_deals", _parquet_mtime("demand_deals_raw_v3"))
+    raw = bq.demand_deals_raw(force_refresh=force, pipeline=_pl())
+    # mtime da chave acompanha a versão da query (v5 = + coluna motion; v6 = +
+    # estágio ao vivo e reached_scoping), senão um frame montado sobre o
+    # parquet antigo sobreviveria a um reload a quente.
+    # O nome do parquet leva o sufixo do funil (`_pk`): sem isso o frame do
+    # México só era invalidado quando o parquet do BRASIL mudava — e o refresher
+    # roda fora de request, ou seja, só aquece o BR. Dado novo do MX ficava preso
+    # em memória até alguém reiniciar o processo.
+    key = (_pl(), "demand_deals_v4",
+           _parquet_mtime(bq._pk("demand_deals_raw_v6", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
         if cached is not None:
             return cached
     df = canon_ae_names(raw)
+    if _is_mx():
+        # MÉXICO: só os 7 vendedores do organograma do Mauricio (MX_ROSTER).
+        #
+        # É a ÚNICA tela do MX que recorta assim, e é de propósito. O resto do
+        # país roda com "o roster é o funil inteiro" porque mede ESTOQUE (o
+        # pipeline aberto e o histórico de quem construiu ele existem mesmo
+        # depois que a pessoa sai). Geração de demanda mede ESFORÇO da semana:
+        # sem o corte, o gráfico ganhava 35 barras de gente que não trabalha
+        # mais aqui — o funil MX tem 42 nomes desde 2024 contra os 7 de hoje —
+        # e a meta de 3 opps/semana ficava ilegível no meio delas.
+        #
+        # O gestor fica fora junto (não está no MX_ROSTER, e NON_AE_USERS_MX já
+        # o esconderia): ele fecha deal próprio mas não é vendedor.
+        df = df[df["account_executive"].isin(MX_ROSTER)].copy()
     df["created_date"] = pd.to_datetime(df["created_date"])
+    # BOOL do BQ com NULL vira object no pandas; o filtro da tela precisa de bool.
+    df["reached_scoping"] = df["reached_scoping"].fillna(False).astype(bool)
 
-    is_auto = df["sdr_id"].isna() | (df["sdr_id"] == df["account_executive_id"])
     df["source"] = pd.Series("received", index=df.index)
-    df.loc[is_auto, "source"] = "auto"
+    df.loc[df["sdr_id"].isna() | (df["sdr_id"] == df["account_executive_id"]), "source"] = "auto"
 
+    # ------------------------------------------------------------------ canal
+    # Classificador: propriedade `motion` do HubSpot, não mais `deal_source_agg`.
+    #
+    # Por quê (auditoria de 02/09/2026): `deal_source_agg` é derivada no dbt de
+    # `source`, e chama de Outbound exatamente 5 valores — Outbound, Recovery,
+    # Referral, LinkedIn, Linkedin Networking. O time parou de gravar
+    # source='Outbound' em 17/06/2026 e migrou pra Cold Call / Cold Email /
+    # Unattributed (ou deixou vazio), valores que caem no `else` = Inbound. Em
+    # ago/2026 as 224 recebidas de aquisição viraram 100% Inbound: o gráfico
+    # mostrava 0 outbound onde `motion` aponta 185. No ano, 888 contra 1.856.
+    #
+    # `motion` só está bem preenchida a partir de 2025 (em 2024, 71% dos deals
+    # do funil estão sem valor), então sem motion cai de volta na regra antiga —
+    # é o que preserva o histórico de 2024 em vez de jogá-lo todo em Inbound.
+    # ------------------------------------------- mudança de motion no tempo
+    # As duas faixas destacadas do gráfico são os deals em que a PRÓPRIA
+    # propriedade motion mudou de lado depois de gravada — não a diferença
+    # entre a regra velha e a nova. Vem das cópias diárias do BI (ver
+    # bq.motion_history): a coluna motion entrou nelas em 16/04/2026, então
+    # deal criado antes disso pode ter mudado sem aparecer aqui.
+    hist = bq.motion_history(force_refresh=force)
+    if len(hist):
+        hist = hist[["deal_id", "motion_first", "n_changes", "motion_changed_at"]].copy()
+        hist["deal_id"] = hist["deal_id"].astype(str)
+        df["deal_id"] = df["deal_id"].astype(str)
+        df = df.merge(hist, on="deal_id", how="left")
+    else:
+        df["motion_first"], df["n_changes"], df["motion_changed_at"] = pd.NA, 0, pd.NaT
+    df["n_changes"] = pd.to_numeric(df["n_changes"], errors="coerce").fillna(0).astype(int)
+
+    # As máscaras vêm todas DEPOIS do merge: ele devolve um frame novo, e uma
+    # Series montada antes traria o índice velho pro mask().
+    has_motion = df["motion"].notna() & (df["motion"].astype(str).str.strip() != "")
+    is_outb = (df["motion"] == "Outbound") | (~has_motion & (df["deal_source_agg"] == "Outbound"))
+    df["is_outbound"] = is_outb
+
+    # Mudou de lado = saiu de um canal e terminou no outro. Quem oscilou e
+    # voltou pro mesmo valor fica na faixa normal (n_changes registra isso).
+    df["moved_to_in"]  = (df["motion_first"] == "Outbound") & (df["motion"] == "Inbound")
+    df["moved_to_out"] = (df["motion_first"] == "Inbound")  & (df["motion"] == "Outbound")
+    moved = df["moved_to_in"] | df["moved_to_out"]
+    df["moved"] = moved
+
+    is_auto = df["source"] == "auto"
     is_acq  = df["deal_type"] == "Aquisition"
     is_exp  = df["deal_type"] == "Up & cross sell"
-    is_outb = df["deal_source_agg"] == "Outbound"
 
-    # Bucket canônico (5 + other) — mesmo set usado por by_ae e by_grain.
+    # Bucket canônico (7 + other) — mesmo set usado por by_ae e by_grain.
+    # As recebidas de Aquisição abrem em 4: as duas normais e as duas em que a
+    # propriedade motion do deal trocou de canal depois de gravada.
     bucket = pd.Series("other", index=df.index)
     bucket = bucket.mask(is_auto  & is_acq, "auto_acq")
     bucket = bucket.mask(is_auto  & is_exp, "auto_exp")
     bucket = bucket.mask(~is_auto & is_exp, "rcv_exp")
-    bucket = bucket.mask(~is_auto & is_acq &  is_outb, "rcv_outbound")
-    bucket = bucket.mask(~is_auto & is_acq & ~is_outb, "rcv_inbound")
+    rcv_acq = ~is_auto & is_acq
+    bucket = bucket.mask(rcv_acq &  is_outb & ~moved, "rcv_outbound")
+    bucket = bucket.mask(rcv_acq & ~is_outb & ~moved, "rcv_inbound")
+    bucket = bucket.mask(rcv_acq & df["moved_to_out"], "rcv_moved_out")
+    bucket = bucket.mask(rcv_acq & df["moved_to_in"],  "rcv_moved_in")
     df["bucket"] = bucket
 
     # Mapeia kind no shape antigo (acq/exp pra demand_generation; inbound/outbound/exp pra grain).
@@ -1874,6 +2926,15 @@ def _get_demand_deals(force: bool = False) -> pd.DataFrame:
     df = df.merge(ae_meta, on="account_executive", how="left")
 
     df = apply_roster_leader(df)
+    if _is_mx():
+        # Time do MX DEPOIS do merge, nunca antes: `ae_meta` também traz uma
+        # coluna `leader`, e com ela já no frame o merge devolvia leader_x /
+        # leader_y — a coluna `leader` que sobrava vinha do roster (BR) e
+        # era nula pra quase todo mundo, então o gate `leader in
+        # ALLOWED_LEADERS` da tela varria o México inteiro e o gráfico saía
+        # VAZIO, sem erro nenhum. Um gestor só pro país (ver ORG_CHART).
+        df["leader"] = MX_LEADER
+        df["region"] = "MX"
     df = drop_departed_from(df, "created_date")
     with _DATA_CACHE_LOCK:
         _DATA_CACHE[key] = df
@@ -1885,7 +2946,7 @@ def _get_visits(force: bool = False) -> pd.DataFrame:
     MESMA atribuição de time do resto do app (snapshot ae_performance + roster Q3).
     Colunas: account_executive, start_date, category ('field'|'ia_center'), leader, region."""
     raw = bq.visits_raw(force_refresh=force)
-    key = ("visits", _parquet_mtime("visits_raw_v2"))
+    key = (_pl(), "visits", _parquet_mtime("visits_raw_v2"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -1911,7 +2972,9 @@ def _demand_by_ae_pd(deals: pd.DataFrame, date_from: date, date_to: date) -> pd.
     """Pandas equivalent de bq.demand_generation: per-AE bucket counts.
     Output idêntico em colunas/semântica ao retorno do BQ."""
     cols = ["account_executive","leader","region",
-            "auto_acq","auto_exp","rcv_outbound","rcv_inbound","rcv_exp","total_generated"]
+            "auto_acq","auto_exp","rcv_outbound","rcv_inbound",
+            "rcv_moved_out","rcv_moved_in","rcv_exp",
+            "rcv_outbound_all","rcv_inbound_all","total_generated"]
     if len(deals) == 0:
         return pd.DataFrame(columns=cols)
     mask = ((deals["created_date"] >= pd.Timestamp(date_from)) &
@@ -1922,20 +2985,48 @@ def _demand_by_ae_pd(deals: pd.DataFrame, date_from: date, date_to: date) -> pd.
         return pd.DataFrame(columns=cols)
     pivot = (d.groupby(["account_executive","leader","region","bucket"], dropna=False)
               .size().unstack(fill_value=0).reset_index())
-    for col in ["auto_acq","auto_exp","rcv_outbound","rcv_inbound","rcv_exp"]:
+    for col in ["auto_acq","auto_exp","rcv_outbound","rcv_inbound",
+                "rcv_moved_out","rcv_moved_in","rcv_exp"]:
         if col not in pivot.columns:
             pivot[col] = 0
+    # Os 4 buckets de recebida-aquisição são disjuntos (a barra empilha os 4 sem
+    # dupla contagem); `_all` é o consolidado por canal, pros números-resumo.
+    pivot["rcv_outbound_all"] = pivot["rcv_outbound"] + pivot["rcv_moved_out"]
+    pivot["rcv_inbound_all"]  = pivot["rcv_inbound"]  + pivot["rcv_moved_in"]
     pivot["total_generated"] = (pivot["auto_acq"] + pivot["auto_exp"]
-                                + pivot["rcv_outbound"] + pivot["rcv_inbound"] + pivot["rcv_exp"])
+                                + pivot["rcv_outbound"] + pivot["rcv_inbound"]
+                                + pivot["rcv_moved_out"] + pivot["rcv_moved_in"]
+                                + pivot["rcv_exp"])
     return (pivot[pivot["total_generated"] > 0]
             .sort_values("total_generated", ascending=False)
             .reset_index(drop=True))
 
 
+def _txt_cel(v, dash: str = "—") -> str:
+    """Valor de texto pra célula de drill, com NaN virando travessão.
+
+    `r.get("x") or "—"` NÃO resolve: `float('nan')` é TRUTHY, então o NaN passava
+    inteiro pro `jsonify`, que escreve `NaN` cru — e isso é JSON inválido. O
+    `JSON.parse` do navegador aborta a resposta TODA, então a modal do drill
+    morria com "Erro ao carregar" em qualquer lista que tivesse um único deal
+    sem histórico de motion. Vale pro Brasil também: o bug entrou junto com as
+    colunas de motion (02/09/2026) e vivia nas duas regiões."""
+    if v is None:
+        return dash
+    try:
+        if pd.isna(v):
+            return dash
+    except (TypeError, ValueError):
+        pass
+    t = str(v).strip()
+    return t if t and t.lower() not in ("nan", "nat", "none") else dash
+
+
 def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
                        name: str = None, grain: str = "ae",
                        leader: str = None, region: str = None,
-                       source: str = None) -> list:
+                       source: str = None, bucket: str = None,
+                       scoping: bool = False) -> list:
     """Drill-down de demanda no MESMO universo das contagens (criados na janela,
     bucket != other). Cada linha traz nome, tipo, qualification owner (SDR; ou o
     próprio AE quando auto), estágio, valor e data de criação.
@@ -1947,7 +3038,8 @@ def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
       · sem `name`              → TOTAL, com filtros opcionais de líder/região.
 
     `source='auto'|'received'` restringe à origem — usado pelos gráficos que
-    contam só um dos lados, pra lista explodida fechar com o número da barra."""
+    contam só um dos lados, pra lista explodida fechar com o número da barra.
+    `scoping=True` fica só com os que chegaram ao estágio 3 (`reached_scoping`)."""
     if len(deals) == 0:
         return []
     mask = ((deals["created_date"] >= pd.Timestamp(date_from)) &
@@ -1955,21 +3047,27 @@ def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
             (deals["bucket"] != "other"))
     if source in ("auto", "received"):
         mask &= (deals["source"] == source)
+    if scoping:
+        mask &= deals["reached_scoping"]
+    # `bucket` fecha a lista com UM segmento da barra (ex.: só os que passaram a
+    # Inbound). Aceita vários separados por vírgula.
+    if bucket:
+        # Pedido sem nenhum segmento válido (ex.: todos os chips da legenda
+        # desligados) é lista VAZIA, nunca "todos".
+        wanted = {b.strip() for b in bucket.split(",") if b.strip() in _BUCKET_TO_SOURCE_KIND}
+        mask &= deals["bucket"].isin(wanted)
     d = deals.loc[mask]
-    if name and grain == "ae":
-        d = d[d["account_executive"] == name]
-    else:
-        # Líder ou total: aplica o recorte permitido antes, senão o time de um
-        # líder poderia arrastar AE desligado/escondido.
-        d = d[d["leader"].isin(ALLOWED_LEADERS)]
-        d = d[~d["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
-        if name and grain == "leader":
-            d = d[d["leader"].isin(expand_leader(name))]
-        else:
-            if region:
-                d = d[d["region"] == region]
-            if leader:
-                d = d[d["leader"].isin(expand_leader(leader))]
+    # O gate de visibilidade vem ANTES do split de grão, e não só no `else`.
+    # Antes ele existia apenas no ramo de líder/total: pedir um `name` de AE
+    # pulava a fronteira inteira, e um drill do Brasil com nome de vendedor
+    # mexicano devolvia 222 deals do México rotulados em R$. Achado por auditoria
+    # em 24/08/2026. O `name` vem de querystring, ou seja é entrada do usuário —
+    # gate que depende do grão pedido não é gate.
+    d = d[d["leader"].isin(ALLOWED_LEADERS)]
+    d = d[~d["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    # Clique (AE/líder) + filtros de quem da tela por cima — o mesmo recorte de
+    # todo drill (`_entity_filter`).
+    d = _entity_filter(d, name, grain, leader, region)
     d = d.sort_values("created_date", ascending=False)
     out = []
     for _, r in d.iterrows():
@@ -1978,23 +3076,59 @@ def _demand_deals_rows(deals: pd.DataFrame, date_from: date, date_to: date,
             "deal_id":      str(r.get("deal_id") or ""),
             "deal_url":     _hs_deal_url(r.get("deal_id")),
             "ae":           r["account_executive"],
-            "deal_name":    r.get("deal_name") or "—",
-            "deal_type":    r.get("deal_type") or "—",
-            "qual_owner":   r.get("sdr") or r["account_executive"],
-            "stage":        stage_display(r.get("stage_label")),
+            "deal_name":    _txt_cel(r.get("deal_name")),
+            "deal_type":    _txt_cel(r.get("deal_type")),
+            "qual_owner":   _txt_cel(r.get("sdr"), r["account_executive"]),
+            "stage":        stage_display(_demand_stage_ref(r)),
             "amount":       float(r.get("amount") or 0),
             "created_date": cd.date().isoformat() if pd.notna(cd) else "",
+            "scoping_date": (str(r.get("scoping_reached_date"))[:10]
+                             if pd.notna(r.get("scoping_reached_date")) else ""),
+            # Rastro da classificação de canal, pra conferência deal a deal.
+            "motion":       _txt_cel(r.get("motion")),
+            "motion_first": _txt_cel(r.get("motion_first")),
+            "motion_changed_at": (str(r.get("motion_changed_at"))[:10]
+                                  if pd.notna(r.get("motion_changed_at")) else ""),
+            "n_changes":    int(r.get("n_changes") or 0),
+            "hs_source":    _txt_cel(r.get("deal_source_agg")),
+            "canal":        _CANAL_LABEL.get(r.get("bucket"), "—"),
         })
     return out
 
 
+def _demand_stage_ref(r):
+    """Estágio do deal no drill de demanda: o AO VIVO (`dealstage`, da view que
+    mescla as fontes) quando é um estágio conhecido; senão o rótulo da curated,
+    que só enxerga a legada (parada desde 11/10/2026). Sem isso, deal contado
+    como "chegou a Scoping" pelo estágio atual aparecia como Qualifying."""
+    live = r.get("dealstage")
+    if isinstance(live, str) and (live in _STAGE_BY_ID or live.lower() in _STAGE_TERMINAL_LABELS):
+        return live
+    return r.get("stage_label")
+
+
+# Rótulo humano do bucket, mostrado no drill-down. Os dois "passou a" são os
+# deals em que a troca de deal_source_agg → motion mudou o lado da conta.
+_CANAL_LABEL = {
+    "auto_acq":      "Próprio · Aquisição",
+    "auto_exp":      "Próprio · Expansão",
+    "rcv_exp":       "Expansão",
+    "rcv_outbound":  "Outbound",
+    "rcv_inbound":   "Inbound",
+    "rcv_moved_out": "Motion virou Outbound",
+    "rcv_moved_in":  "Motion virou Inbound",
+}
+
+
 # Mapa bucket canônico → (source, kind) no shape esperado pela rota grain.
 _BUCKET_TO_SOURCE_KIND = {
-    "auto_acq":     ("auto",     "acq"),
-    "auto_exp":     ("auto",     "exp"),
-    "rcv_exp":      ("received", "exp"),
-    "rcv_outbound": ("received", "outbound"),
-    "rcv_inbound":  ("received", "inbound"),
+    "auto_acq":      ("auto",     "acq"),
+    "auto_exp":      ("auto",     "exp"),
+    "rcv_exp":       ("received", "exp"),
+    "rcv_outbound":  ("received", "outbound"),
+    "rcv_inbound":   ("received", "inbound"),
+    "rcv_moved_out": ("received", "moved_out"),
+    "rcv_moved_in":  ("received", "moved_in"),
 }
 
 
@@ -2043,7 +3177,7 @@ def _demand_last_week(deals: pd.DataFrame, f: dict):
     semana passada. Já os filtros de líder/região/AE valem, pra cada gestor ver
     só o seu time.
 
-    Universo = Q3_ROSTER (time atual) ∪ quem gerou na semana. Vem do roster, e
+    Universo = ROSTER (time vigente) ∪ quem gerou na semana. Vem do roster, e
     não do `by_ae` da tela, justamente pra que o filtro de data da página não
     mexa em quantos AEs aparecem aqui. AE que gerou zero entra com barra 0 — é
     quem a gestão precisa cobrar. Retorna (rows, stats, max_y)."""
@@ -2068,12 +3202,12 @@ def _demand_last_week(deals: pd.DataFrame, f: dict):
     # Roster do quarter, sujeito aos MESMOS filtros de líder/região/AE.
     leaders_ok = expand_leader(f["leader"]) if f["leader"] else None
     roster = {}
-    for ae_name, cfg in Q3_ROSTER.items():
+    for ae_name, cfg in ROSTER.items():
         if ae_name in HIDDEN_FROM_AE_VIEWS:
             continue
         if f["ae"] and ae_name != f["ae"]:
             continue
-        if f["region"] and f["region"] != Q3_ROSTER_REGION:
+        if f["region"] and f["region"] != _roster_region():
             continue
         if leaders_ok is not None and cfg["leader"] not in leaders_ok:
             continue
@@ -2261,6 +3395,12 @@ _STALLED_THRESHOLDS = {
     "87188634":              14,  # Stage 5 - Decision (ex-Consensus)
     "65917881":              21,  # Stage 6 - Procurement
 }
+# Inatividade (dias sem RETORNO do cliente): limite ÚNICO em todos os estágios.
+# Decisão do Pedro em 09/10/2026: "todo deal que tenha mais de 7 dias sem
+# interação significativa com o cliente entre no dado". Antes a Inatividade
+# usava os mesmos SLAs do Stale (14/21 por estágio). O Stale (dias NO estágio)
+# segue com os SLAs acima — são perguntas diferentes.
+ACTIVITY_SLA_DAYS = 7
 # Ordem de exibição do stalled (Negotiation antes de Decision, igual ao funil).
 _STALLED_STAGE_ORDER  = ["contractsent", "93878633",
                          "decisionmakerboughtin", "87188634", "65917881"]
@@ -2293,6 +3433,17 @@ _STALLED_STAGE_INKS = {
     "65917881":              "#C2410C",  # laranja 11
 }
 
+# A Inatividade cobre também o Stage 1 - Scheduled (09/10/2026, pedido do Pedro:
+# "todo deal com mais de 7 dias sem interação"). O Stale segue só com os 5
+# estágios de SLA (_STALLED_STAGE_ORDER). As tabelas de chave/rótulo/cor ganham
+# o Stage 1 sem mudar a ordem do Stale — quem itera é a ORDEM de cada tela.
+_STALLED_STAGE_KEYS["appointmentscheduled"]   = "sched"
+_STALLED_STAGE_LABELS["appointmentscheduled"] = _STAGE_BY_ID["appointmentscheduled"]["label"]
+_STALLED_STAGE_COLORS["appointmentscheduled"] = "#8B8D98"   # slate 9 — neutro, estágio de entrada
+_STALLED_STAGE_INKS["appointmentscheduled"]   = "#60646C"   # slate 11
+_ACTIVITY_STAGE_ORDER = ["appointmentscheduled"] + _STALLED_STAGE_ORDER
+_ACTIVITY_THRESHOLDS = {sid: ACTIVITY_SLA_DAYS for sid in _ACTIVITY_STAGE_ORDER}
+
 # Ordem do funil de vendas Sales BR — usado em /pipeline/funnel pra mostrar
 # WoW por estágio (qtd e amount). Derivado do STAGE_REGISTRY (ordem canônica).
 _FUNNEL_STAGES     = [(s["id"], s["label"]) for s in STAGE_REGISTRY]
@@ -2314,11 +3465,39 @@ FORECAST_CATEGORY_PCT = {
     "COMMIT": 1.00, "BEST_CASE": 0.75, "PROBABLE": 0.50,
     "PIPELINE": 0.25, "CLOSED": 1.00, "OMIT": 0.0,
 }
+# Fator de correção aplicado a TODA projeção do MODELO DOS DIRETORES — o
+# ponderado por `hs_manual_forecast_category`. Cada peso vira peso × 0,90 (10% a
+# menos, relativo), mesma ideia e mesmo tamanho do MODEL_SAFETY_FACTOR do Modelo
+# Analytics. Vale igual no trimestre corrente e em TODA a série histórica: as
+# duas leem desta mesma tabela, e o histórico é RECALCULADO a cada request a
+# partir de amount + forecast category CRUS (materialized_data_source e
+# pepeuhacker.forecast_snapshots guardam o fato, nunca o ponderado) — então não
+# existe número gravado pra corrigir, e nem risco de passado e presente
+# discordarem. Muda aqui p/ ajustar.
+DIR_FORECAST_FACTOR = 0.90
+# Peso EFETIVO por categoria: é ESTE que multiplica o amount em qualquer
+# projeção. A tabela crua acima continua existindo pros RÓTULOS (100/75/50/25%),
+# que são o parâmetro do HubSpot e não mudam com o fator. Won não passa por
+# aqui: é receita realizada (`amount` cheio), não previsão.
+FORECAST_CATEGORY_PCT_EFF = {k: v * DIR_FORECAST_FACTOR
+                             for k, v in FORECAST_CATEGORY_PCT.items()}
+# Global de template: toda tela que mostra ponderado dos diretores diz o fator na
+# cara, do mesmo jeito que `forecast_model.html` diz o desconto de segurança do
+# Modelo Analytics. Um número que sai 10% menor sem aviso vira dúvida de bug.
+app.jinja_env.globals["dir_factor"] = DIR_FORECAST_FACTOR
 # Categorias previstas, da maior confiança pra menor (ordem de segmentos/tabela).
 FORECAST_CATEGORY_ORDER = ["COMMIT", "BEST_CASE", "PROBABLE", "PIPELINE"]
+# Rótulo = o PESO, não o nome do HubSpot (pedido em 24/08/2026). "Commit" e
+# "Best Case" só significam alguma coisa pra quem decorou a tabela do modelo; o
+# número já é a informação — e é o mesmo número que multiplica o amount no
+# ponderado. `OMIT` (Not forecasted) vira "0%" porque é peso zero de verdade;
+# "sem categoria" continua por extenso em _PT_DIMS, porque ausência de valor NÃO
+# é peso 0 e a distinção sustenta a linha de cobertura do ponderado.
+# CLOSED fica por extenso: é deal ganho, não um bucket de probabilidade — "100%"
+# ali colidiria com Commit e leria como previsão.
 FORECAST_CATEGORY_LABEL = {
-    "COMMIT": "Commit", "BEST_CASE": "Best Case", "PROBABLE": "Probable",
-    "PIPELINE": "Funnel", "OMIT": "Not forecasted", "CLOSED": "Closed won",
+    "COMMIT": "100%", "BEST_CASE": "75%", "PROBABLE": "50%",
+    "PIPELINE": "25%", "OMIT": "0%", "CLOSED": "Closed won",
 }
 FORECAST_CATEGORY_COLOR = {   # preenchimento (barra/ponto) — rampa clara→escura
     "COMMIT": "#047857", "BEST_CASE": "#10B981",
@@ -2382,11 +3561,22 @@ FORECAST_MODEL_PROB = {
 MODEL_SAFETY_FACTOR = 0.90
 
 
-def _model_prob(leader, dealstage, deal_type) -> float:
+# México: o MESMO modelo, com o segmento do VENDEDOR (tier do MX_ROSTER) no lugar
+# do segmento do líder — lá um gestor só cobre os três segmentos, e sem isto
+# todo deal mexicano pesava 0 e o Modelo Analytics do México zerava.
+_MX_TIER_SEGMENT = {"Enterprise": "enterprise", "Mid Market": "midmarket",
+                    "Account Executive": "commercial"}
+
+
+def _mx_ae_segment(ae):
+    return _MX_TIER_SEGMENT.get(MX_ROSTER.get(ae, {}).get("tier"))
+
+
+def _model_prob(leader, dealstage, deal_type, ae=None) -> float:
     """Probabilidade do modelo p/ um deal aberto, já com o desconto de segurança de
     10% (× MODEL_SAFETY_FACTOR). 0 se fora do escopo (estágio não modelado — só
     Negotiation/Decision/Procurement —, tipo desconhecido ou líder sem segmento)."""
-    seg = LEADER_SEGMENT.get(leader)
+    seg = _mx_ae_segment(ae) if _is_mx() else LEADER_SEGMENT.get(leader)
     st = MODEL_STAGE.get(dealstage)
     kind = ("acq" if deal_type == "Aquisition"
             else "exp" if deal_type == "Up & cross sell" else None)
@@ -2433,8 +3623,8 @@ def _pipeline_bucket(stage_id: str) -> str:
 def _get_pipeline_deals(force: bool = False) -> pd.DataFrame:
     """Todos os deals do funil Sales BR com bucket (early/late/other), is_open,
     hs_closedate (close date do HubSpot raw) e leader/region. Memoizado por mtime."""
-    raw = bq.pipeline_deals_raw(force_refresh=force)
-    key = ("pipeline_deals", _parquet_mtime("pipeline_deals_raw_v5"))
+    raw = bq.pipeline_deals_raw(force_refresh=force, pipeline=_pl())
+    key = (_pl(), "pipeline_deals", _parquet_mtime("pipeline_deals_raw_v6"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -2470,8 +3660,8 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     """Deals dos estágios 1-6 com close date, amount, forecast category e o
     ponderado (amount × pct da categoria). leader/region do snapshot mais recente
     de ae_performance. Memoizado por mtime do parquet."""
-    raw = bq.forecast_deals_raw(force_refresh=force)
-    key = ("forecast_deals", _parquet_mtime("forecast_deals_raw_v5"))
+    raw = bq.forecast_deals_raw(force_refresh=force, pipeline=_pl())
+    key = (_pl(), "forecast_deals_v2", _parquet_mtime("forecast_deals_raw_v6"))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -2485,10 +3675,18 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     # Data de validação do won = data de emissão do PO; cai pro close date se vazia.
     # É ela (priorizada sobre o close date do HubSpot) que define o quarter do won.
     df["valid_date"] = df["po_emission_date"].fillna(df["close_date"])
+    # Datas da RECEITA REALIZADA (extensão de fechamento aplicada, ver
+    # REALIZED_QUARTER_EXTENSIONS). Colunas NOVAS de propósito: po_emission_date
+    # e valid_date seguem no calendário real para contagem, ticket, ciclo e new
+    # logos. Toda janela/quarter/líder do realizado lê `rev_po`/`rev_date`.
+    df["rev_po"] = _rev_date(df["po_emission_date"])
+    df["rev_date"] = _rev_date(df["valid_date"])
     df["forecast_category"] = df["forecast_category"].fillna("(None)")
     df["is_won"] = df["dealstage"] == "closedwon"  # PO Won = realizado
     # Ponderado só faz sentido pro pipeline aberto; closedwon não está no PCT → 0.
-    df["pct"] = df["forecast_category"].map(FORECAST_CATEGORY_PCT).fillna(0.0)
+    # Peso EFETIVO (já com DIR_FORECAST_FACTOR) — o realizado sai de `amount`,
+    # nunca daqui, então o fator não toca no Won.
+    df["pct"] = df["forecast_category"].map(FORECAST_CATEGORY_PCT_EFF).fillna(0.0)
     df["weighted"] = df["amount"] * df["pct"]
 
     # leader/region do snapshot mais recente de ae_performance (igual pipeline).
@@ -2511,15 +3709,33 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     df.loc[mgr_mask, "region"] = "BR"
     df["is_manager_sale"] = mgr_mask
 
-    # Corte de saída: won conta pela data de validação, aberto pela close date.
-    # Data efetiva >= cutoff → some (mantém histórico anterior). NaT fica.
+    # Corte de saída: won conta pela data da receita (validação, com extensão),
+    # aberto pela close date. Data efetiva >= cutoff → some (mantém histórico
+    # anterior). NaT fica.
     if DEPARTED_FROM:
-        eff = df["valid_date"].where(df["is_won"], df["close_date"])
+        eff = df["rev_date"].where(df["is_won"], df["close_date"])
         eff = pd.to_datetime(eff, errors="coerce").dt.date
         drop = pd.Series(False, index=df.index)
         for ae, cutoff in DEPARTED_FROM.items():
-            drop |= (df["account_executive"] == ae) & eff.notna() & (eff >= cutoff)
+            m = (df["account_executive"] == ae) & eff.notna() & (eff >= cutoff)
+            if ae in DEPARTED_FROM_KEEP_WON:
+                m &= ~df["is_won"]              # venda fechada fica (ver a constante)
+            drop |= m
         df = df[~drop]
+    # Venda fechada de quem está em DEPARTED_FROM_KEEP_WON é venda de gestor:
+    # líder = ele mesmo (sem isso o leader vinha do snapshot cru e o deal caía
+    # fora do ALLOWED_LEADERS / do pod dele).
+    if DEPARTED_FROM_KEEP_WON:
+        _eff = pd.to_datetime(df["rev_date"], errors="coerce").dt.date
+        _kw = pd.Series(False, index=df.index)
+        for _ae in DEPARTED_FROM_KEEP_WON:
+            _cut = DEPARTED_FROM.get(_ae)
+            if _cut is not None:
+                _kw |= (df["is_won"] & (df["account_executive"] == _ae)
+                        & _eff.notna() & (_eff >= _cut))
+        df.loc[_kw, "leader"] = df.loc[_kw, "account_executive"]
+        df.loc[_kw, "region"] = "BR"
+        df.loc[_kw, "is_manager_sale"] = True
 
     with _DATA_CACHE_LOCK:
         _DATA_CACHE[key] = df
@@ -2595,6 +3811,19 @@ def get_filter_options(df: pd.DataFrame, f: dict = None):
     aes = sorted(aes_df["account_executive"].dropna().unique().tolist())
     # Esconde AEs desligados do dropdown (mas mantém o histórico nos charts).
     aes = [a for a in aes if a not in HIDDEN_FROM_AE_VIEWS]
+    # Geração de Demanda do México: o dropdown segue o MESMO universo da tela —
+    # os 7 vendedores do organograma do Mauricio (ver o ramo MX de
+    # _get_demand_deals). Sem isto o select listava os 38 nomes que o funil
+    # mexicano acumulou desde 2024, e escolher qualquer um dos outros 31
+    # devolvia um gráfico vazio sem dizer por quê.
+    # A lista sai do MX_ROSTER, e não do que sobrou do frame: a curada
+    # `account_executives_performance` ainda não tem linha pra quem entrou
+    # agora (a Sabina Diaz é o caso de hoje), e intersectar deixaria de fora
+    # justamente uma vendedora que APARECE no gráfico — 63 opps no Q3.
+    if _is_mx() and _rota_base(request.path) == "/demand":
+        aes = sorted(MX_ROSTER)
+        if f.get("ae") and f["ae"] not in aes:
+            aes = sorted(aes + [f["ae"]])
 
     if f.get("leader") and f["leader"] not in leaders:
         leaders.append(f["leader"])
@@ -2657,10 +3886,18 @@ def build_active_chips(filters: dict, current_path: str) -> list[dict]:
         "date_from": "De", "date_to": "Até", "region": "Região",
         "leader":    "Líder", "ae": "AE",    "role": "Role",
         "dtype": "Deal Type", "source": "Source", "fcat": "Forecast",
+        "prod": "Product",
     }
     # Nas telas de janela fixa (PoP Early/Late) as datas são IGNORADAS, então um
     # chip "De: …" vindo de link antigo/salvo mentiria sobre o que está na tela.
-    _skip = {"date_from", "date_to"} if current_path in WOW_PATHS else set()
+    _skip = ({"date_from", "date_to"}
+             if _rota_base(current_path) in WOW_PATHS + WOW_HIST_PATHS
+             + PIPELINE_DOD_PATHS else set())
+    # Mesmo motivo, outro filtro: os links das sub-abas viajam com `**ctx.filters`,
+    # então escolher "Aquisição" no Forecast levava o chip junto pro Histórico e
+    # pro Modelo Analytics — telas que ignoram o corte e mostram o time inteiro.
+    if _rota_base(current_path) in FORECAST_NO_DTYPE_PATHS:
+        _skip = _skip | {"dtype"}
     for k, v in filters.items():
         if not v or k not in labels or k in _skip: continue  # 'money' não vira chip (é o toggle mestre)
         remaining = {kk: vv for kk, vv in filters.items() if vv and kk != k}
@@ -2670,7 +3907,7 @@ def build_active_chips(filters: dict, current_path: str) -> list[dict]:
         # o chip mostra o rótulo de negócio ("Aquisição"), não a chave.
         shown = v
         if k in _PT_DIMS:
-            shown = next((lbl for kk, _raw, lbl, *_ in _PT_DIMS[k]["values"] if kk == v), v)
+            shown = _pt_dim_label(k, v) or v
         chips.append({"label": f"{labels[k]}: {shown}", "remove_url": url})
     return chips
 
@@ -2679,13 +3916,22 @@ def _extra_filters_for_path(path: str) -> list:
     """Selects extra da barra de filtros, POR ABA — filtro é por aba, não global
     (Deal Type não significa nada no Overview, então lá os campos nem existem).
 
-    Pipeline Total pede as 3 dimensões; o Funil II só Deal Type, porque expansão
+    Pipeline Total pede as 4 dimensões; o Funil II só Deal Type, porque expansão
     converte numa ordem de grandeza diferente de aquisição e misturar as duas na
     mesma taxa esconde isso. Fora dessas abas, lista vazia."""
-    if path in PIPELINE_TOTAL_PATHS:
+    if _rota_base(path) in PIPELINE_TOTAL_PATHS:
         return [{"key": k, "label": v["label"], "opts": _pt_dim_meta(k)}
                 for k, v in _PT_DIMS.items()]
-    if path in FUNNEL2_PATHS:
+    # Funil II e WoW pedem só Deal Type. No WoW o motivo é o mesmo do Funil II:
+    # aquisição e expansão se movimentam em ritmos diferentes, e a série somada
+    # esconde isso — expansão entra e fecha rápido, aquisição fica semanas no
+    # funil, então uma semana ruim de uma pode aparecer como semana boa do total.
+    # Pipeline do MX usa o registro MX_DIMS (valores próprios do México).
+    if path == "/mx/pipeline":
+        return [{"key": k, "label": v["label"], "opts": _mx_dim_meta(k)}
+                for k, v in MX_DIMS.items()]
+    if (_rota_base(path) in FUNNEL2_PATHS + WOW_PATHS + WOW_HIST_PATHS
+            + FORECAST_WOW_PATHS + FORECAST_PATHS + PIPELINE_DOD_PATHS):
         return [{"key": "dtype", "label": _PT_DIMS["dtype"]["label"],
                  "opts": _pt_dim_meta("dtype")}]
     return []
@@ -2700,10 +3946,10 @@ def base_context():
     # `opts` não olha data (só region/leader), então pode vir antes do pin abaixo.
     opts = get_filter_options(df_all, f)
     presets = filter_presets_for_path(build_presets(opts["quarters"]), request.path)
-    period_label = PERIOD_LABEL_BY_PATH.get(request.path, "Período")
+    period_label = PERIOD_LABEL_BY_PATH.get(_rota_base(request.path), "Período")
     # No Funil II o que o período recorta é escolhido no chip da página, então o
     # rótulo do filtro segue o chip em vez de ser fixo por rota.
-    if request.path in FUNNEL2_PATHS and request.args.get("base") == "created":
+    if _rota_base(request.path) in FUNNEL2_PATHS and request.args.get("base") == "created":
         period_label = "Criação do deal"
     active_preset = request.args.get("preset", "")
 
@@ -2715,10 +3961,10 @@ def base_context():
     # WoW abre pré-fixado no último domingo vs o anterior. Só marca o preset — as
     # datas seguem vazias de propósito, pra `_wow_window` continuar derivando os
     # domingos de hoje (e não congelar num par de datas na URL).
-    if request.path in WOW_PATHS and not f["date_from"] and not f["date_to"]:
+    if _rota_base(request.path) in WOW_PATHS and not f["date_from"] and not f["date_to"]:
         active_preset = active_preset or "wow_1w"
 
-    if request.path in COVERAGE_PATHS and not (f["date_from"] and f["date_to"]):
+    if _rota_base(request.path) in COVERAGE_PATHS and not (f["date_from"] and f["date_to"]):
         _cur_q = next((p for p in presets if p["key"] == "current_q"), None)
         if _cur_q:
             if not f["date_from"] and not f["date_to"]:
@@ -2745,6 +3991,8 @@ def base_context():
         view = "leaders"
     elif request.path.startswith("/sdr/"):
         view = "sdr"
+    elif request.path.startswith("/mx/"):
+        view = "mx"
     else:
         view = "ae"
 
@@ -2764,6 +4012,18 @@ def base_context():
         view_url_ae      = "/demand" + base_qs
         view_url_leaders = "/leaders/demand" + base_qs
         view_url_sdr     = request.path + base_qs
+    elif view == "mx":
+        # Paridade de telas desde 12/10/2026: voltar pro BR cai na MESMA tela
+        # quando ela existe no AE (o DoD/WoW do México vêm do Leaders do BR, aí
+        # o AE cai na raiz da aba). Senão, no Overview.
+        _br = _MX_PATH_TO_BR.get(request.path, "")
+        _tab = request.path[len("/mx/"):].split("/")[0]
+        if _br and not _br.startswith("/leaders/"):
+            view_url_ae = _br + base_qs
+        else:
+            view_url_ae = "/" + (_tab if _tab in LEADER_TABS else "overview") + base_qs
+        view_url_leaders = "/leaders/" + (_tab if _tab in LEADER_TABS else "overview") + base_qs
+        view_url_sdr     = "/sdr/effort" + base_qs
     else:
         # 1º segmento do path (ex.: /overview/ae → 'overview', /pipeline/funnel → 'pipeline')
         cur_tab = (request.path.lstrip("/").split("/")[0]) or "demand"
@@ -2786,21 +4046,35 @@ def base_context():
         # PoP Early/Late não têm filtro de período: a janela é fixa em domingo vs
         # domingo anterior, pra as 2 telas serem sempre comparáveis entre si.
         # base.html esconde o date-picker quando isto é True. Ver _wow_fixed_pair.
-        "period_locked": request.path in WOW_PATHS,
+        "period_locked": _rota_base(request.path) in (WOW_PATHS + WOW_HIST_PATHS
+                                                      + PIPELINE_DOD_PATHS),
         "extra_filters": _extra_filters_for_path(request.path),
         "period_text": _format_period(f, presets, active_preset),
         "view": view,
         "view_url_ae": view_url_ae,
         "view_url_leaders": view_url_leaders,
         "view_url_sdr": view_url_sdr,
+        "view_url_mx": _mx_equivalente(request.path) + base_qs,
+        # Nome do funil pra texto de tela ("Sales BR" / "Sales MX").
+        "pipeline_label": _pl(),
+        # Símbolo da moeda ativa pra rótulo fixo de template ("R$" / "US$").
+        "money_sym": "US$" if _money_mode() == "arr" else "R$",
         "leader_tabs": LEADER_TABS,
         "sdr_tabs": SDR_TABS,
         "usd_rate": USD_BRL_RATE,
         "months_per_year": MONTHS_PER_YEAR,
+        # Selo de frescor: de QUANDO é o dado que está na tela. Ver
+        # `source_freshness` — idade da fonte, nunca idade do cache.
+        "freshness": source_freshness(),
         # Filtro de PERÍODO mutável por aba: 'quarter' (Sales Overtime) troca o
         # date-range por presets de N trimestres + intervalo aberto quarter→quarter.
         **_period_widget_ctx(),
-        "money_mode": ("arr" if request.args.get("money") == "arr" else "mrr"),
+        # Chama _money_mode() em vez de reler a querystring: a regra do México
+        # ("sempre ARR US$") mora lá, e a cópia daqui não a tinha. O efeito era
+        # o pior tipo de erro — o MESMO card em duas moedas: o subtítulo do drill
+        # vinha do servidor em US$ ARR e as linhas, formatadas pelo JS com este
+        # valor, saíam em R$ MRR. Doze vezes de diferença dentro do mesmo modal.
+        "money_mode": _money_mode(),
         "money_url_mrr": request.path + "?" + urllib.parse.urlencode(
             {**{k: v for k, v in request.args.items() if k not in ("money", "refresh") and v}, "money": "mrr"}),
         "money_url_arr": request.path + "?" + urllib.parse.urlencode(
@@ -2911,8 +4185,7 @@ def overview_funnel_stages():
     # URL do 2º nível: mesmos filtros da tabela + o estágio clicado.
     _carry = {k: v for k, v in request.args.items() if v and k != "money"}
     def _stage_url(stage):
-        return (url_for("overview_funnel_stage_deals") + "?" +
-                urllib.parse.urlencode({**_carry, "stage": str(stage)}))
+        return url_for("overview_funnel_stage_deals", **{**_carry, "stage": str(stage)})
 
     # ACUMULADO no funil (snapshot/coorte): um deal conta no estágio N se estava
     # ATIVO nele em algum momento do trimestre — entrou até o fim do trimestre e
@@ -3134,18 +4407,28 @@ def _sales_overtime_page(grain="ae"):
     if f["ae"]:
         dd = dd[dd["account_executive"] == f["ae"]]
     won = dd[dd["is_won"] & dd["po_emission_date"].notna()].copy()
+    # Dois recortes do MESMO conjunto de won: `won_rev` decide o quarter (e o
+    # líder) pela data da RECEITA (extensão de fechamento aplicada) e só alimenta
+    # o Realizado; `won` segue o calendário do PO para deals, new logos e ticket.
+    won_rev = won.copy()
     if len(won) and f["leader"]:
         # Só recorta por líder quando pedido — usando o líder do quarter do PO.
-        won["leader"] = _attr_deal_leader(won, "po_emission_date", _period_leader_map(force=force))
+        lmap_ot = _period_leader_map(force=force)
+        won["leader"] = _attr_deal_leader(won, "po_emission_date", lmap_ot)
         won = won[won["leader"].isin(expand_leader(f["leader"]))]
+        won_rev["leader"] = _attr_deal_leader(won_rev, "rev_po", lmap_ot)
+        won_rev = won_rev[won_rev["leader"].isin(expand_leader(f["leader"]))]
     if len(won):
         won["q"] = won["po_emission_date"].dt.date.map(_quarter_start_of)
         won["is_acq"] = won["deal_type"] == "Aquisition"
         won["is_exp"] = won["deal_type"] == "Up & cross sell"
+    if len(won_rev):
+        won_rev["q"] = won_rev["rev_po"].dt.date.map(_quarter_start_of)
 
     # ---- Janela de quarters ----
     cur_q = _quarter_start_of(_today())
-    universe = sorted({q for q in (set(qh["quarter"]) | (set(won["q"]) if len(won) else set()))
+    universe = sorted({q for q in (set(qh["quarter"]) | (set(won["q"]) if len(won) else set())
+                                   | (set(won_rev["q"]) if len(won_rev) else set()))
                        if q and _OVERTIME_MIN_Q <= q <= cur_q})
     q_from = _parse_quarter(request.args.get("q_from"))
     q_to = _parse_quarter(request.args.get("q_to"))
@@ -3162,7 +4445,7 @@ def _sales_overtime_page(grain="ae"):
 
     quota_by_q = qh.groupby("quarter")["quota_in_brl"].sum().to_dict() if len(qh) else {}
     nlq_by_q = qh.groupby("quarter")["new_logos_quota"].sum().to_dict() if len(qh) else {}
-    real_by_q = won.groupby("q")["amount"].sum().to_dict() if len(won) else {}
+    real_by_q = won_rev.groupby("q")["amount"].sum().to_dict() if len(won_rev) else {}
     deals_by_q = won.groupby("q").size().to_dict() if len(won) else {}
     nl_by_q = won[won["is_acq"]].groupby("q").size().to_dict() if len(won) else {}
 
@@ -3215,8 +4498,13 @@ def _sales_overtime_page(grain="ae"):
         if f["region"]:
             d["region"] = f["region"]
         if f["ae"]:
-            d["name"] = f["ae"]
-        return url_for("overview_deals") + "?" + urllib.parse.urlencode(d)
+            # Filtro de AE como filtro (`ae`), e o nome só no grão de AE: na tela
+            # de Leaders `name=<AE>` com grain=leader procurava um LÍDER com o
+            # nome do vendedor e a explosão voltava vazia.
+            d["ae"] = f["ae"]
+            if grain == "ae":
+                d["name"] = f["ae"]
+        return url_for("overview_deals", **d)
 
     items, items_nl, items_tk, items_up = [], [], [], []
     for q in qs:
@@ -3249,19 +4537,18 @@ def _sales_overtime_page(grain="ae"):
                          "quota": float(unit_exp_by_q.get(q, 0.0)),
                          "attainment": None,
                          "sensors": int(st_sensors_by_q.get(q, 0)),
-                         "modal_url": url_for("overview_unit_price_deals") + "?" +
-                                      urllib.parse.urlencode(_up_qs)})
+                         "modal_url": url_for("overview_unit_price_deals", **_up_qs)})
 
     rk = _build_rank_chart(items, {}, axis_mode="currency",
-                           drill_path="/overview/overtime") if items else None
+                           drill_path=_mx_path("/overview/overtime")) if items else None
     rk_nl = (_build_rank_chart(items_nl, {}, axis_mode="count",
-                               drill_path="/overview/overtime")
+                               drill_path=_mx_path("/overview/overtime"))
              if any(i["realized"] or i["quota"] for i in items_nl) else None)
     rk_tk = (_build_rank_chart(items_tk, {}, axis_mode="currency", show_line=False,
-                               drill_path="/overview/overtime")
+                               drill_path=_mx_path("/overview/overtime"))
              if any(i["realized"] or i["quota"] for i in items_tk) else None)
     rk_up = (_build_rank_chart(items_up, {}, axis_mode="currency", show_line=False,
-                               drill_path="/overview/overtime")
+                               drill_path=_mx_path("/overview/overtime"))
              if any(i["realized"] or i["quota"] for i in items_up) else None)
 
     tot_real = sum(i["realized"] for i in items)
@@ -3370,59 +4657,67 @@ def _overview_page(ov_tab, grain="ae"):
     # VALIDADO (realizado) = ganho COM PO emitido, EXCETO os que estão em hold
     # (um deal é validado OU em aprovação, nunca os dois) → quarter da data do PO.
     # HOLD = deals em aprovação → quarter do PO. Pipeline aberto → close date.
-    won  = dd[dd["is_won"] & dd["po_emission_date"].notna()
-              & ~dd["deal_id"].isin(hold_ids)
-              & (dd["po_emission_date"] >= lo) & (dd["po_emission_date"] <= hi)].copy()
+    # O realizado (`won`, e o hold, que vira realizado quando aprova) recorta pela
+    # data da RECEITA (`rev_po`, com a extensão de fechamento); `won_cal` é o mesmo
+    # conjunto no calendário do PO e alimenta SÓ deals, ticket, ciclo, new logos e
+    # nº de AEs — as métricas que não são receita seguem o calendário normal.
+    # REGRA (Pedro, 04/11/2026): venda fechada com PO em validação financeira
+    # (hold) CONTA no realizado, com o selo "em validação financeira". Por isso
+    # `_won_base` não exclui mais o hold; `hld` segue existindo só pra informar
+    # quanto do realizado ainda está em validação (card e selo do drill).
+    _won_base = dd["is_won"] & dd["po_emission_date"].notna()
+    won  = dd[_won_base & (dd["rev_po"] >= lo) & (dd["rev_po"] <= hi)].copy()
+    won_cal = dd[_won_base & (dd["po_emission_date"] >= lo)
+                 & (dd["po_emission_date"] <= hi)].copy()
     pipe = dd[(~dd["is_won"]) & dd["close_date"].notna()
               & (dd["close_date"] >= lo) & (dd["close_date"] <= hi)].copy()
     hld  = dd[dd["deal_id"].isin(hold_ids) & dd["po_emission_date"].notna()
-              & (dd["po_emission_date"] >= lo) & (dd["po_emission_date"] <= hi)].copy()
+              & (dd["rev_po"] >= lo) & (dd["rev_po"] <= hi)].copy()
 
     # Atribui o líder de CADA deal pelo quarter da sua data (won/hold→PO, pipe→close):
     # o realizado cai no MESMO líder que a quota daquele quarter. Depois aplica
     # ALLOWED_LEADERS + filtro de líder.
     lmap = _period_leader_map(force=force)
-    won["leader"]  = _attr_deal_leader(won,  "po_emission_date", lmap)
+    won["leader"]  = _attr_deal_leader(won,  "rev_po",           lmap)
+    won_cal["leader"] = _attr_deal_leader(won_cal, "po_emission_date", lmap)
     pipe["leader"] = _attr_deal_leader(pipe, "close_date",       lmap)
-    hld["leader"]  = _attr_deal_leader(hld,  "po_emission_date", lmap)
+    hld["leader"]  = _attr_deal_leader(hld,  "rev_po",           lmap)
     won  = won[won["leader"].isin(ALLOWED_LEADERS)]
+    won_cal = won_cal[won_cal["leader"].isin(ALLOWED_LEADERS)]
     pipe = pipe[pipe["leader"].isin(ALLOWED_LEADERS)]
     hld  = hld[hld["leader"].isin(ALLOWED_LEADERS)]
     if f["leader"]:
         _scope = expand_leader(f["leader"])
         won  = won[won["leader"].isin(_scope)]
+        won_cal = won_cal[won_cal["leader"].isin(_scope)]
         pipe = pipe[pipe["leader"].isin(_scope)]
         hld  = hld[hld["leader"].isin(_scope)]
     hold_by_ae = (hld.groupby("account_executive")["amount"].sum().to_dict()
                   if len(hld) else {})
 
-    # REGRA DE REALIZADO (decisão do VP de Vendas, 03/nov/2026): venda fechada com
-    # PO emitido CONTA no realizado mesmo em aprovação financeira (hold). Antes o
-    # hold ficava fora e sumia da tela — foi o caso da Crown Embalagens (Arthur,
-    # R$ 80k, closedwon 29/10/2026). `val` guarda só o validado (selo "validado" no
-    # drill); `won` passa a ser validado + hold e alimenta TODO número de realizado
-    # (cards, barras, atingimento, new logo, ticket, ciclo). `hold_by_ae` /
-    # kpis.hold viram a parcela "dos quais em aprovação" — informativa, não somada
-    # de novo.
-    val = won
-    won = pd.concat([val, hld], ignore_index=True) if len(hld) else val.copy()
-
     # Ciclo de vendas (dias) = validação − criação, só nos won com created_date.
-    won["cycle_days"] = (won["valid_date"] - won["created_date"]).dt.days
-    cyc = won.loc[won["cycle_days"].notna() & (won["cycle_days"] >= 0), "cycle_days"]
+    won_cal["cycle_days"] = (won_cal["valid_date"] - won_cal["created_date"]).dt.days
+    cyc = won_cal.loc[won_cal["cycle_days"].notna() & (won_cal["cycle_days"] >= 0), "cycle_days"]
 
-    def _stats(frame):
-        amt = float(frame["amount"].sum())
-        n = int(len(frame))
-        return {"mrr": amt, "deals": n, "ticket": (amt / n) if n else 0.0}
+    def _ticket_of(frame):
+        return (float(frame["amount"].sum()) / len(frame)) if len(frame) else 0.0
 
-    acq = _stats(won[won["deal_type"] == "Aquisition"])
-    exp = _stats(won[won["deal_type"] == "Up & cross sell"])
+    def _stats(rev, cal):
+        # Card "Total em …": R$ e o "N deals" embaixo dele são a MESMA população
+        # (a receita, que é o que o drill do card lista). O card "Ticket médio" é
+        # outra métrica e segue o calendário (drill com basis=cal).
+        return {"mrr": float(rev["amount"].sum()), "deals": int(len(rev)),
+                "ticket": _ticket_of(cal)}
+
+    acq = _stats(won[won["deal_type"] == "Aquisition"],
+                 won_cal[won_cal["deal_type"] == "Aquisition"])
+    exp = _stats(won[won["deal_type"] == "Up & cross sell"],
+                 won_cal[won_cal["deal_type"] == "Up & cross sell"])
 
     kpis = {
         "realized": float(won["amount"].sum()),
-        "deals_won": int(len(won)),
-        "ticket": (float(won["amount"].sum()) / len(won)) if len(won) else 0.0,
+        "deals_won": int(len(won_cal)),
+        "ticket": _ticket_of(won_cal),
         "cycle_avg": float(cyc.mean()) if len(cyc) else 0.0,
         "cycle_median": float(cyc.median()) if len(cyc) else 0.0,
         "cycle_n": int(len(cyc)),
@@ -3430,24 +4725,27 @@ def _overview_page(ov_tab, grain="ae"):
         "pipe_weighted": float(pipe["weighted"].sum()),
         "pipe_deals": int(len(pipe)),
         "projection": float(won["amount"].sum()) + float(pipe["weighted"].sum()),
-        "n_ae": int(won.loc[~won["account_executive"].isin(NON_AE_USERS),
-                            "account_executive"].nunique()),
+        "n_ae": int(won_cal.loc[~won_cal["account_executive"].isin(
+                                    _managers_in(_roster_window(from_d, to_d))),
+                                "account_executive"].nunique()),
     }
 
     # Quebra por líder: realizado, deals, ticket, ciclo médio, pipeline ponderado, projeção.
     by_leader = []
-    leaders = sorted(set(won["leader"].dropna()) | set(pipe["leader"].dropna()))
+    leaders = sorted(set(won["leader"].dropna()) | set(won_cal["leader"].dropna())
+                     | set(pipe["leader"].dropna()))
     for ld in leaders:
         w = won[won["leader"] == ld]
+        wc = won_cal[won_cal["leader"] == ld]
         p = pipe[pipe["leader"] == ld]
-        c = w.loc[w["cycle_days"].notna() & (w["cycle_days"] >= 0), "cycle_days"]
+        c = wc.loc[wc["cycle_days"].notna() & (wc["cycle_days"] >= 0), "cycle_days"]
         realized = float(w["amount"].sum())
         weighted = float(p["weighted"].sum())
         by_leader.append({
             "leader": ld,
             "realized": realized,
-            "deals": int(len(w)),
-            "ticket": (realized / len(w)) if len(w) else 0.0,
+            "deals": int(len(wc)),
+            "ticket": _ticket_of(wc),
             "cycle": float(c.mean()) if len(c) else None,
             "pipe_weighted": weighted,
             "projection": realized + weighted,
@@ -3455,25 +4753,29 @@ def _overview_page(ov_tab, grain="ae"):
     by_leader.sort(key=lambda r: r["projection"], reverse=True)
 
     # ----- Metas (quota) + meta de new logos por AE.
-    # Quando o período é o Q3/2026, a fonte da verdade é o Q3_ROSTER (time + quota
-    # + meta de new logos informados pela liderança). Fora do Q3, cai na quota da
-    # curated (quota_in_brl, MRR) somada nos quarters do período — sem meta de
-    # new logos (só existe pro Q3). Realizado (deal amount) é comparável à quota
+    # Quando o período cabe num trimestre com roster (Q3/2026, Q4/2026...), a
+    # fonte da verdade é o roster DELE (time + quota + meta de new logos
+    # informados pela liderança). Fora disso, cai na quota da curated
+    # (quota_in_brl, MRR) somada nos quarters do período — sem meta de new logos
+    # (só existe no roster). Realizado (deal amount) é comparável à quota
     # (mesma unidade MRR). -----
-    period_is_q3 = (from_d >= Q3_START and to_d <= Q3_END)
+    rq = _roster_window(from_d, to_d)
+    period_is_q3 = rq is not None          # nome antigo: "o período tem roster"
+    roster_q = _roster_of(rq)
 
-    # New logos REALIZADOS = deals de Aquisição ganhos no período, por AE.
-    newlogos_actual = (won[won["deal_type"] == "Aquisition"]
+    # New logos REALIZADOS = deals de Aquisição ganhos no período, por AE. É
+    # contagem, não receita: segue o calendário do PO (sem a extensão).
+    newlogos_actual = (won_cal[won_cal["deal_type"] == "Aquisition"]
                        .groupby("account_executive").size()
-                       if len(won) else pd.Series(dtype=int))
+                       if len(won_cal) else pd.Series(dtype=int))
 
-    newlogos_goal = {}          # meta de new logos por AE (só Q3)
+    newlogos_goal = {}          # meta de new logos por AE (só trimestre com roster)
     roster_meta = {}            # leader/region p/ AEs do roster sem deal no período
     if period_is_q3:
         scope = expand_leader(f["leader"]) if f["leader"] else None
         quota_by_ae = {}
-        for name, v in Q3_ROSTER.items():
-            if f["region"] and Q3_ROSTER_REGION != f["region"]:
+        for name, v in roster_q.items():
+            if f["region"] and (_roster_region() != f["region"]):
                 continue
             if scope is not None and v["leader"] not in scope:
                 continue
@@ -3481,7 +4783,7 @@ def _overview_page(ov_tab, grain="ae"):
                 continue
             quota_by_ae[name] = float(v["quota"])
             newlogos_goal[name] = int(v["new_logos"])
-            roster_meta[name] = {"leader": v["leader"], "region": Q3_ROSTER_REGION}
+            roster_meta[name] = {"leader": v["leader"], "region": _roster_region()}
     else:
         aep = _get_clean_ae_perf(force=force)
         aep = aep[(aep["quarter"] <= to_d) & (aep["quarter_end"] >= from_d)]
@@ -3510,18 +4812,20 @@ def _overview_page(ov_tab, grain="ae"):
     # ticket, ciclo, pipeline ponderado, projeção, meta (quota), attainment, new logos. -----
     by_ae = []
     ae_names = sorted(set(won["account_executive"].dropna())
+                      | set(won_cal["account_executive"].dropna())
                       | set(pipe["account_executive"].dropna())
                       | {a for a, q in quota_by_ae.items() if q > 0}
                       | {a for a, hv in hold_by_ae.items() if hv}
                       | set(newlogos_goal.keys()))
     for ae in ae_names:
         w = won[won["account_executive"] == ae]
+        wc = won_cal[won_cal["account_executive"] == ae]
         p = pipe[pipe["account_executive"] == ae]
-        c = w.loc[w["cycle_days"].notna() & (w["cycle_days"] >= 0), "cycle_days"]
+        c = wc.loc[wc["cycle_days"].notna() & (wc["cycle_days"] >= 0), "cycle_days"]
         realized = float(w["amount"].sum())
         weighted = float(p["weighted"].sum())
         # leader/region: primeiro won, senão pipeline, senão o snapshot/roster.
-        src = w if len(w) else p
+        src = w if len(w) else (wc if len(wc) else p)
         if len(src) and pd.notna(src["leader"].iloc[0]):
             leader = src["leader"].iloc[0]
             region = src["region"].iloc[0] if pd.notna(src["region"].iloc[0]) else None
@@ -3538,12 +4842,12 @@ def _overview_page(ov_tab, grain="ae"):
             "account_executive": ae,
             "leader": leader,
             "region": region,
-            "is_manager": ae in NON_AE_USERS,
-            "realized": realized,                       # Won c/ PO (validado + hold)
-            "hold": hold,                               # dos quais em aprovação financeira
-            "won_total": realized,                      # = realized (hold já incluso)
-            "deals": int(len(w)),
-            "ticket": (realized / len(w)) if len(w) else 0.0,
+            "is_manager": ae in _managers_in(rq),
+            "realized": realized,                       # Won c/ PO (validado + em validação)
+            "hold": hold,                               # dos quais em validação financeira
+            "won_total": realized,                      # hold já está no realizado
+            "deals": int(len(wc)),                      # contagem: calendário
+            "ticket": _ticket_of(wc),                   # ticket: calendário
             "cycle": float(c.mean()) if len(c) else None,
             "pipe_weighted": weighted,
             "pipe_deals": int(len(p)),
@@ -3574,16 +4878,22 @@ def _overview_page(ov_tab, grain="ae"):
         _lr = _leader_rollup(by_ae, f["leader"], ["realized", "quota"])
         for r in _lr:
             # Meta do líder = Board Target (planilha), não a soma das quotas do time.
-            r["quota"] = LEADER_BOARD_TARGET.get(r["leader"], r["quota"])
+            r["quota"] = _leader_targets(rq).get(r["leader"], r["quota"])
             r["attainment"] = (r["realized"] / r["quota"]) if r["quota"] else None
         _rev_items = [{"name": r["name"], "short": r["short"], "leader": r["leader"],
                        "realized": r["realized"], "quota": r["quota"],
                        "attainment": r["attainment"]} for r in _sort_att(_lr, "attainment")]
         rank = _build_rank_chart(_rev_items, _drill_base, axis_mode="currency",
-                                 drill_path=_rk_path, drill_key=_rk_key)
+                                 drill_path=_mx_path(_rk_path), drill_key=_rk_key)
         rank_nl = None
         if period_is_q3:
-            _lnl = [r for r in _leader_rollup(by_ae, f["leader"], ["nl_real", "nl_goal"])
+            # Só quem CARREGA meta de new logo entra no realizado do líder — a
+            # mesma população do card e do ranking por AE (e da explosão). Antes
+            # a venda direta do gestor (sem meta) somava aqui: no Q3/26 a barra
+            # do Gustavo dizia 13 e a lista explodida, 9.
+            _carriers = [{**r, "nl_real": (r["nl_real"] if r["nl_goal"] is not None else 0)}
+                         for r in by_ae]
+            _lnl = [r for r in _leader_rollup(_carriers, f["leader"], ["nl_real", "nl_goal"])
                     if r["nl_goal"] > 0]
             for r in _lnl:
                 r["attainment"] = (r["nl_real"] / r["nl_goal"]) if r["nl_goal"] else None
@@ -3592,7 +4902,7 @@ def _overview_page(ov_tab, grain="ae"):
                               "realized": int(r["nl_real"]), "quota": int(r["nl_goal"]),
                               "attainment": r["attainment"]} for r in _sort_att(_lnl, "attainment")]
                 rank_nl = _build_rank_chart(_nl_items, _drill_base, axis_mode="count",
-                                            drill_path=_rk_path, drill_key=_rk_key)
+                                            drill_path=_mx_path(_rk_path), drill_key=_rk_key)
     else:
         # Chart 1 — RECEITA: Realizado × Quota (R$) + % atingimento. Ordenado por
         # % de atingimento DECRESCENTE. Geometria pré-computada em _build_rank_chart.
@@ -3601,7 +4911,7 @@ def _overview_page(ov_tab, grain="ae"):
                        "leader": r["leader"], "realized": r["realized"], "quota": r["quota"],
                        "attainment": r["attainment"]} for r in _rev]
         rank = _build_rank_chart(_rev_items, _drill_base, axis_mode="currency",
-                                 drill_path="/overview/ae")
+                                 drill_path=_mx_path("/overview/ae"))
 
         # Chart 2 — NEW LOGOS: mesma estrutura, mas Realizado × Meta (contagem) +
         # % atingimento de new logos. Só quando há meta de new logos (Q3). População
@@ -3616,7 +4926,7 @@ def _overview_page(ov_tab, grain="ae"):
                           "leader": r["leader"], "realized": int(r["nl_real"] or 0),
                           "quota": int(r["nl_goal"] or 0), "attainment": r["nl_att"]} for r in _nl]
             rank_nl = _build_rank_chart(_nl_items, _drill_base, axis_mode="count",
-                                        drill_path="/overview/ae")
+                                        drill_path=_mx_path("/overview/ae"))
 
     # Totais de meta do time. IMPORTANTE: attainment compara MESMA população —
     # numerador (realizado) e denominador (quota) só dos AEs com meta (carriers de
@@ -3626,14 +4936,16 @@ def _overview_page(ov_tab, grain="ae"):
     total_quota = float(sum(r["quota"] for r in by_ae if not r["is_manager"]))  # soma das quotas individuais no escopo
     carrier_realized = float(sum(r["realized"] for r in quota_carriers))
     # Meta de RECEITA (card): no TIME INTEIRO usa a meta top-down FIXA
-    # (Q3_TEAM_REVENUE_META, direto no card). "Time inteiro" = sem filtro de AE/região
+    # do trimestre (TEAM_REVENUE_META[rq], direto no card). "Time inteiro" = sem filtro de AE/região
     # e sem líder OU com o líder = VP (Pedro Mendes), que expande p/ todo o time.
     # Ao filtrar por um líder/AE/região específico, cai na soma das quotas individuais
     # daquele escopo (quotas individuais ficam como estão). Fora do Q3, usa a curated.
     is_whole_team = (not f["ae"] and not f["region"]
                      and f["leader"] in ("", "Pedro Mendes"))
-    if period_is_q3 and is_whole_team:
-        meta_receita = float(Q3_TEAM_REVENUE_META)
+    # TEAM_REVENUE_META é a meta top-down do BRASIL; no México a meta do time é
+    # a soma das quotas do roster (o painel do Mauricio).
+    if not _is_mx() and rq in TEAM_REVENUE_META and is_whole_team:
+        meta_receita = float(TEAM_REVENUE_META[rq])
     else:
         meta_receita = total_quota
     kpis["quota"] = meta_receita
@@ -3643,18 +4955,11 @@ def _overview_page(ov_tab, grain="ae"):
     kpis["hold"] = float(sum(r["hold"] for r in by_ae))     # em aprovação financeira (MRR)
     kpis["attainment"] = (carrier_realized / meta_receita) if meta_receita else None
     kpis["gap"] = max(meta_receita - carrier_realized, 0.0)
-    # New logos (meta vs realizado). No Q3 (há meta) o numerador é restrito aos AEs
-    # com meta de new logos (mesma população da meta 87). Fora do Q3 NÃO existe
-    # meta, logo não existe "carrier" pra recortar: o realizado é toda aquisição
-    # validada no escopo — antes o recorte por carrier zerava o card no Q4 mesmo
-    # com new logo ganho (ex.: Crown Embalagens, Arthur Tkotz, PO 26/10/2026).
-    # Mesma régua do drill (`_newlogo_goal_aes` devolve None fora do Q3).
+    # New logos (meta vs realizado) — só quando há meta (período Q3). Numerador
+    # restrito aos AEs com meta de new logos (mesma população da meta 87).
     kpis["has_newlogos"] = period_is_q3 and bool(newlogos_goal)
     kpis["nl_goal"] = int(sum(v for v in newlogos_goal.values()))
-    if period_is_q3:
-        kpis["nl_real"] = int(sum(r["nl_real"] for r in by_ae if r["nl_goal"] is not None))
-    else:
-        kpis["nl_real"] = int(newlogos_actual.sum()) if len(newlogos_actual) else 0
+    kpis["nl_real"] = int(sum(r["nl_real"] for r in by_ae if r["nl_goal"] is not None))
     kpis["nl_att"] = (kpis["nl_real"] / kpis["nl_goal"]) if kpis["nl_goal"] else None
     # % da meta de receita no nível do time (receita total realizada ÷ meta distribuída).
     kpis["rev_att"] = (kpis["realized"] / meta_receita) if meta_receita else None
@@ -3710,11 +5015,14 @@ def _overview_page(ov_tab, grain="ae"):
                     "mrr": float(r["amount"] or 0.0),
                     "kind": kind,
                     "status": status,
+                    "rev_tag": _rev_tag(r["po_emission_date"]),
                     "date": (r["po_emission_date"].strftime("%d/%m/%Y")
                              if pd.notna(r["po_emission_date"]) else "—"),
                 })
             return out
-        deal_rows = _mk_deals(val, "validado") + _mk_deals(hld, "aprovação")
+        _hold_set = set(hld["deal_id"])
+        deal_rows = (_mk_deals(won[~won["deal_id"].isin(_hold_set)], "validado")
+                     + _mk_deals(won[won["deal_id"].isin(_hold_set)], "aprovação"))
         deal_rows.sort(key=lambda x: x["mrr"], reverse=True)
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
@@ -3759,12 +5067,23 @@ def demand():
 
     by_ae = by_ae.sort_values("total_generated", ascending=False).reset_index(drop=True)
     by_ae["auto_total"] = by_ae["auto_acq"] + by_ae["auto_exp"]
-    # Recebidas total agora soma os 3 buckets (Inbound + Outbound + Expansão).
-    by_ae["rcv_total"]  = by_ae["rcv_inbound"] + by_ae["rcv_outbound"] + by_ae["rcv_exp"]
+    # Recebidas total = Inbound + Outbound (já com os reclassificados) + Expansão.
+    by_ae["rcv_total"]  = by_ae["rcv_inbound_all"] + by_ae["rcv_outbound_all"] + by_ae["rcv_exp"]
     by_ae["pct_auto"]   = by_ae.apply(
         lambda r: (r["auto_total"] / r["total_generated"] * 100) if r["total_generated"] else 0,
         axis=1,
     )
+
+    # Geradas pelo próprio AE que JÁ chegaram ao estágio 3 (Scoping). Mesmo
+    # universo de AEs do gráfico de cima (merge no by_ae já filtrado), então
+    # quem gerou e não avançou nada aparece com barra zerada.
+    scop = _demand_by_ae_pd(deals[deals["reached_scoping"]], from_d, to_d)
+    scop = (scop.groupby("account_executive")[["auto_acq", "auto_exp"]].sum()
+                .rename(columns={"auto_acq": "scop_acq", "auto_exp": "scop_exp"})
+                .reset_index())
+    by_ae = by_ae.merge(scop, on="account_executive", how="left")
+    by_ae[["scop_acq", "scop_exp"]] = by_ae[["scop_acq", "scop_exp"]].fillna(0).astype(int)
+    by_ae["scop_total"] = by_ae["scop_acq"] + by_ae["scop_exp"]
 
     # Meta semanal por AE: 3 opps × semanas decorridas no período
     weekly_goal = _weekly_ae_goal(from_d, to_d)
@@ -3774,20 +5093,26 @@ def demand():
     _rcv_max  = by_ae["rcv_total"].max()  if len(by_ae) else 0
     max_auto = max(int(_auto_max) if pd.notna(_auto_max) else 0, weekly_goal, 1)
     max_rcv  = max(int(_rcv_max)  if pd.notna(_rcv_max)  else 0, 1)
+    max_scop = max(int(by_ae["scop_total"].max()) if len(by_ae) else 0, 1)
 
     totals = {
         "n_ae": len(by_ae),
         "total_generated": int(by_ae["total_generated"].sum()),
         "auto_total":  int(by_ae["auto_acq"].sum() + by_ae["auto_exp"].sum()),
-        "rcv_total":   int(by_ae["rcv_inbound"].sum() + by_ae["rcv_outbound"].sum() + by_ae["rcv_exp"].sum()),
-        "acq_total":   int(by_ae["auto_acq"].sum() + by_ae["rcv_inbound"].sum() + by_ae["rcv_outbound"].sum()),
+        "rcv_total":   int(by_ae["rcv_inbound_all"].sum() + by_ae["rcv_outbound_all"].sum() + by_ae["rcv_exp"].sum()),
+        "acq_total":   int(by_ae["auto_acq"].sum() + by_ae["rcv_inbound_all"].sum() + by_ae["rcv_outbound_all"].sum()),
         "exp_total":   int(by_ae["auto_exp"].sum() + by_ae["rcv_exp"].sum()),
         "auto_acq":    int(by_ae["auto_acq"].sum()),
         "auto_exp":    int(by_ae["auto_exp"].sum()),
-        "rcv_inbound": int(by_ae["rcv_inbound"].sum()),
-        "rcv_outbound":int(by_ae["rcv_outbound"].sum()),
+        "rcv_inbound": int(by_ae["rcv_inbound_all"].sum()),
+        "rcv_outbound":int(by_ae["rcv_outbound_all"].sum()),
         "rcv_exp":     int(by_ae["rcv_exp"].sum()),
+        # Reclassificados pela troca de deal_source_agg → motion (02/09/2026).
+        "rcv_moved_out": int(by_ae["rcv_moved_out"].sum()),
+        "rcv_moved_in":  int(by_ae["rcv_moved_in"].sum()),
+        "scop_total":    int(by_ae["scop_total"].sum()),
     }
+    totals["scop_pct"] = (totals["scop_total"] / totals["auto_total"] * 100) if totals["auto_total"] else 0
 
     week_rows, week_stats, max_week = _demand_last_week(deals, f)
 
@@ -3807,11 +5132,14 @@ def demand():
         gr["bucket"] = gr["source"] + "_" + gr["kind"]
         gp = gr.pivot_table(index="period", columns="bucket", values="n",
                             aggfunc="sum").fillna(0).reset_index()
-        # 5 buckets agora: auto_acq, auto_exp, received_inbound, received_outbound, received_exp
-        for col in ["auto_acq","auto_exp","received_inbound","received_outbound","received_exp"]:
+        # 7 buckets: auto_acq, auto_exp, received_{inbound,outbound,moved_out,moved_in,exp}
+        for col in ["auto_acq","auto_exp","received_inbound","received_outbound",
+                    "received_moved_out","received_moved_in","received_exp"]:
             if col not in gp.columns: gp[col] = 0
         gp["total"] = (gp["auto_acq"] + gp["auto_exp"]
-                       + gp["received_inbound"] + gp["received_outbound"] + gp["received_exp"])
+                       + gp["received_inbound"] + gp["received_outbound"]
+                       + gp["received_moved_out"] + gp["received_moved_in"]
+                       + gp["received_exp"])
         gp["period"] = pd.to_datetime(gp["period"])
 
         # Label do eixo X conforme o grão
@@ -3851,7 +5179,7 @@ def demand():
         trend=trend_pivot,
         grain=grain, grain_urls=grain_urls,
         totals=totals,
-        max_auto=max_auto, max_rcv=max_rcv,
+        max_auto=max_auto, max_rcv=max_rcv, max_scop=max_scop,
         weekly_goal=weekly_goal,
         week_rows=week_rows, week_stats=week_stats, max_week=max_week,
         range_from=from_d.isoformat(), range_to=to_d.isoformat(),
@@ -3909,17 +5237,97 @@ def _deal_type_map():
     return dict(zip(d["deal_id"].astype(str), d["deal_type"]))
 
 
+# ---- Explosão respeita TODOS os filtros da tela (21/10/2026) ----
+# Antes, cada link de drill listava à mão o que levava (quase sempre só líder,
+# região e datas) e cada rota aplicava o que lembrava: filtrar um AE e explodir
+# qualquer número trazia deals do time inteiro, e o clique numa linha de líder
+# ignorava o filtro de AE/região da tela. Agora são duas peças, num lugar só:
+#   1) `_drill_carry` (chamado pelo `url_for` acima): todo link pra uma rota de
+#      drill herda os filtros de QUEM da tela (ae, líder, região) e os cortes da
+#      própria aba (Deal Type, Source, Product…), quando o link não diz outro;
+#   2) `_drill_who`: a rota aplica esses filtros por cima do que foi clicado
+#      (interseção). `_entity_filter` já chama, então quem usa ele herda.
+_DRILL_WHO_KEYS = ("ae", "leader", "region")
+# Rotas de explosão que não terminam em "deals".
+_DRILL_EXTRA_RULES = {"/overview/funnel-stages", "/pipeline/funnel/moves",
+                      "/pipeline/wow/quarter/cobertura",
+                      "/leaders/pipeline/wow/quarter/cobertura"}
+_DRILL_ENDPOINTS: set = set()
+
+
+def _drill_endpoint_set() -> set:
+    if not _DRILL_ENDPOINTS:
+        for r in app.url_map.iter_rules():
+            if r.rule.endswith("deals") or _rota_base(r.rule) in _DRILL_EXTRA_RULES:
+                _DRILL_ENDPOINTS.add(r.endpoint)
+    return _DRILL_ENDPOINTS
+
+
+def _page_slice_keys(path: str) -> list:
+    """Cortes próprios da aba (além de quem/período) que a tela aplica e que o
+    drill tem que repetir. Saem do mesmo registro da barra de filtros, mais os
+    que a barra carrega escondidos (close date/customer owner no Pipeline Total;
+    envolvimento/coorte na Legal)."""
+    keys = [x["key"] for x in _extra_filters_for_path(path)]
+    base = _rota_base(path)
+    if base in PIPELINE_TOTAL_PATHS:
+        keys += ["cdate", "cown"]
+    if base in LEGAL_PATHS:
+        keys += ["env", "coh"]
+    return keys
+
+
+def _drill_carry(endpoint, values: dict) -> dict:
+    """Completa a URL de um drill com os filtros ativos da requisição atual que o
+    link não trouxe. Não mexe no que o link já define (nem vazio de propósito com
+    valor: só preenche chave ausente ou vazia). Período fica de fora: cada tela
+    resolve o seu (pin de trimestre, domingos, janela aberta) e o link já leva
+    as datas certas."""
+    from flask import has_request_context
+    if not has_request_context() or endpoint not in _drill_endpoint_set():
+        return values
+    keys = list(_DRILL_WHO_KEYS)
+    if request.endpoint not in _drill_endpoint_set():
+        keys += _page_slice_keys(request.path)
+    out = dict(values)
+    for k in keys:
+        v = request.args.get(k)
+        if v and out.get(k) in (None, ""):
+            out[k] = v
+    return out
+
+
+def _drill_who(df, ae_col="account_executive", leader_col="leader", region_col="region"):
+    """Aplica os filtros de QUEM da requisição (ae, líder, região) num frame de
+    deals do drill. É interseção com o que foi clicado: na tela filtrada por um
+    AE, explodir o líder dele mostra só os deals daquele AE."""
+    from flask import has_request_context
+    if not has_request_context() or df is None or not len(df):
+        return df
+    ae = (request.args.get("ae") or "").strip()
+    leader = (request.args.get("leader") or "").strip()
+    region = (request.args.get("region") or "").strip()
+    if ae and ae_col in df.columns:
+        df = df[df[ae_col] == ae]
+    if leader and leader_col in df.columns:
+        df = df[df[leader_col].isin(expand_leader(leader))]
+    if region and region_col in df.columns:
+        df = df[df[region_col] == region]
+    return df
+
+
 def _entity_filter(df, name, grain, leader=None, region=None):
     """Filtro do drill-down: com `name` → um AE/líder; sem `name` → TOTAL (todos
-    os AEs, respeitando filtros opcionais de líder/região da página). Assume que
-    ALLOWED_LEADERS/HIDDEN já foram aplicados pelo caller."""
+    os AEs). Por cima, sempre, os filtros de quem da tela (`_drill_who`) — antes
+    eles só valiam no total, e o filtro de AE não valia em lugar nenhum. Assume
+    que ALLOWED_LEADERS/HIDDEN já foram aplicados pelo caller."""
     if name:
-        return _filter_entity(df, name, grain)
-    if region:
+        df = _filter_entity(df, name, grain)
+    if region and "region" in df.columns:
         df = df[df["region"] == region]
     if leader:
         df = df[df["leader"].isin(expand_leader(leader))]
-    return df
+    return _drill_who(df)
 
 
 def _with_ae_col(columns, grain):
@@ -3952,14 +5360,26 @@ def demand_deals():
     # `source=auto` (ex.: gráfico da semana passada) → só as auto-geradas, pra
     # lista bater com o número da barra em vez de somar as recebidas também.
     src = (request.args.get("source") or "").strip() or None
+    # `bucket=` vem do clique num segmento da barra (ex.: a faixa "passou a
+    # Inbound"), pra lista mostrar exatamente aqueles deals.
+    bkt = (request.args.get("bucket") or "").strip() or None
+    # `scoping=1` vem do gráfico "chegaram a Scoping": só os deals que já
+    # entraram no estágio 3 ou além.
+    scop = request.args.get("scoping") == "1"
     deals = _get_demand_deals(force=request.args.get("refresh") == "1")
     rows = _demand_deals_rows(
         deals, from_d, to_d,
         name=None if is_total else name, grain=grain,
         leader=request.args.get("leader"), region=request.args.get("region"),
-        source=src,
+        source=src, bucket=bkt, scoping=scop,
     )
     title = "Geração de Demanda — total" if is_total else name
+    if scop:
+        title += " · chegaram a Scoping"
+    if bkt:
+        labels = [_CANAL_LABEL.get(b.strip(), b.strip()) for b in bkt.split(",") if b.strip()]
+        if labels:
+            title += " · " + " + ".join(labels)
     amount = float(sum(r["amount"] for r in rows))
     cols = [
         {"key": "deal_name",  "label": "Deal", "wrap": True, "link": "deal_url"},
@@ -3969,6 +5389,18 @@ def demand_deals():
         {"key": "amount",     "label": "Valor",     "type": "money"},
         {"key": "created_date", "label": "Criado em", "type": "date"},
     ]
+    # Nos recortes de canal, mostra o rastro da classificação — o que a regra
+    # antiga (source) dizia e o que a `motion` diz — pra conferência na hora.
+    if bkt or src == "received":
+        cols = cols[:1] + [
+            {"key": "canal",              "label": "Canal"},
+            {"key": "motion_first",       "label": "motion (1º)"},
+            {"key": "motion",             "label": "motion (hoje)"},
+            {"key": "motion_changed_at",  "label": "Mudou em", "type": "date"},
+            {"key": "n_changes",          "label": "Trocas", "type": "int"},
+        ] + cols[1:]
+    if scop:
+        cols.append({"key": "scoping_date", "label": "Chegou a Scoping", "type": "date"})
     # Total e visão de líder juntam vários AEs → mostra de quem é cada deal.
     if is_total or grain == "leader":
         cols = _with_ae_col(cols, "leader")
@@ -4011,19 +5443,55 @@ def _stalled_stage_ids_arg():
         return None
     key2id = {v: k for k, v in _STALLED_STAGE_KEYS.items()}
     ids = {key2id[k] for k in raw.split(",") if k in key2id}
-    return ids or None
+    # Pedido sem nenhum estágio válido (todos os chips desligados) = nada, e
+    # não "todos": um id que não casa com deal nenhum.
+    return ids or {"__nenhum__"}
+
+
+def _stalled_stage_title(base: str) -> str:
+    """Título do drill com o(s) estágio(s) pedido(s) — clicar no pedaço Decision
+    da barra abre "Fulano · Decision", e não um título igual ao da barra."""
+    ids = _stalled_stage_ids_arg()
+    if not ids:
+        return base
+    labels = [_STALLED_STAGE_LABELS[s] for s in _STALLED_STAGE_LABELS if s in ids]
+    return f"{base} · {' + '.join(labels)}" if labels else base
+
+
+def _last_return_label(r) -> str:
+    """"dd/mm · canal" do último retorno de contato (drill da Inatividade).
+    "—" quando o deal nunca teve retorno na janela (a contagem caiu na data de
+    entrada no stage). Frames sem as colunas de canal (Stale) devolvem ""."""
+    if "last_activity_at" not in r:
+        return ""
+    la = pd.to_datetime(r.get("last_activity_at"), errors="coerce", utc=True)
+    if pd.isna(la):
+        return "—"
+    canal = []
+    for col, nome in (("last_whatsapp_at", "WhatsApp"), ("last_gong_at", "reunião Gong"),
+                      ("last_email_at", "e-mail"), ("last_call_at", "ligação")):
+        v = pd.to_datetime(r.get(col), errors="coerce", utc=True)
+        if pd.notna(v) and v.date() == la.date():
+            canal.append(nome)
+    # Retorno de outro ano leva o ano: "29/10" de 2025 lido em out/2026 parecia
+    # data futura no drill.
+    quando = f"{la:%d/%m}" if la.year == _today().year else f"{la:%d/%m/%y}"
+    return f"{quando} · {' + '.join(canal) or '—'}"
 
 
 def _stalled_drill(df, name, grain, days_col, stage_ids_col="stage_curr",
                    subtitle_suffix="parado", leader=None, region=None, title=None,
-                   stage_ids=None):
+                   stage_ids=None, thresholds=None, keep_managers=False):
     """Payload do drill-down de inatividade. Com `name` → um AE/líder; sem `name`
     → TOTAL (todos os AEs). Marca stalled pelo threshold do stage e devolve só os
     parados, ordenados por dias desc. Mostra a coluna AE no total e na visão líder.
     `stage_ids` (dos chips da legenda) restringe aos estágios selecionados."""
     df = _apply_roster_current(df)
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
-    df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    # Inatividade (09/10/2026): deal de GESTOR entra no total e na visão de
+    # Líderes; só quem saiu da empresa fica fora.
+    df = (drop_departed_people(df) if keep_managers
+          else df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)])
     df = _entity_filter(df, name, grain, leader, region)
     if stage_ids:
         df = df[df[stage_ids_col].isin(stage_ids)]
@@ -4031,7 +5499,8 @@ def _stalled_drill(df, name, grain, days_col, stage_ids_col="stage_curr",
     if len(df):
         tmap = _deal_type_map()
         df = df.copy()
-        df = df[df.apply(lambda r: _STALLED_THRESHOLDS.get(r[stage_ids_col], 999) < r[days_col],
+        _th = thresholds or _STALLED_THRESHOLDS
+        df = df[df.apply(lambda r: bool(pd.notna(r[days_col]) and _th.get(r[stage_ids_col], 999) < r[days_col]),
                          axis=1)]
         df = df.sort_values(days_col, ascending=False)
         rows = [{
@@ -4042,6 +5511,7 @@ def _stalled_drill(df, name, grain, days_col, stage_ids_col="stage_curr",
             "stage":     _STALLED_STAGE_LABELS.get(r[stage_ids_col], r[stage_ids_col]),
             "amount":    float(r["amount"] or 0),
             "days":      int(r[days_col]),
+            "last_ret":  _last_return_label(r),
         } for _, r in df.iterrows()]
     amount = sum(x["amount"] for x in rows)
     show_ae = "leader" if (grain == "leader" or not name) else "ae"
@@ -4058,16 +5528,17 @@ def pipeline_stalled_deals():
     grain = "leader" if request.args.get("grain") == "leader" else "ae"
     if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
         return jsonify(_empty_drill(name))
-    payload = _stalled_drill(bq.pipeline_stalled(force_refresh=request.args.get("refresh") == "1"),
+    payload = _stalled_drill(bq.pipeline_stalled(force_refresh=request.args.get("refresh") == "1", pipeline=_pl()),
                              name, grain, days_col="days_stalled",
                              subtitle_suffix="parado (sem mudança de stage)",
                              leader=request.args.get("leader"), region=request.args.get("region"),
-                             title=name or "Stale — total",
+                             title=_stalled_stage_title(name or "Stale — total"),
                              stage_ids=_stalled_stage_ids_arg())
     return jsonify(payload)
 
 
-def _stale_wow_deals_payload(dw, prev_sun, last_sun, title_all, days_label):
+def _stale_wow_deals_payload(dw, prev_sun, last_sun, title_all, days_label, thresholds=None,
+                             keep_managers=False):
     """Payload compartilhado do drill de Movimentação WoW (Stale e Stale ·
     Atividade): deals que SAÍRAM da inatividade (estavam parados no domingo
     anterior e destravaram) e que ENTRARAM (cruzaram o threshold na semana).
@@ -4082,16 +5553,20 @@ def _stale_wow_deals_payload(dw, prev_sun, last_sun, title_all, days_label):
 
     dw = _apply_roster_current(dw)
     dw = dw[dw["leader"].isin(ALLOWED_LEADERS)]
-    dw = dw[~dw["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    dw = (drop_departed_people(dw) if keep_managers
+          else dw[~dw["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)])
     dw = _entity_filter(dw, name, grain,
                         request.args.get("leader"), request.args.get("region"))
 
     def _stalled_at(stage, days):
-        th = _STALLED_THRESHOLDS.get(stage)
-        return th is not None and days is not None and days > th
+        th = (thresholds or _STALLED_THRESHOLDS).get(stage)
+        # bool() + notna: deal que fechou na semana vem com dias NULOS; sem
+        # isso a coluna virava 'object' e o ~ do pandas (bitwise em bool do
+        # Python: ~False = -1) marcava TODO parado anterior como 'saiu'.
+        return bool(th is not None and pd.notna(days) and days > th)
     dw = dw.copy()
-    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1)
-    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1)
+    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1).astype(bool)
+    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1).astype(bool)
 
     tmap = _deal_type_map()
     rows = []
@@ -4144,7 +5619,7 @@ def pipeline_stalled_wow_deals():
     """Drill da Movimentação WoW da página Stale (inatividade por tempo no stage)."""
     last_sun, prev_sun = _last_two_sundays()
     dw = bq.pipeline_stalled_wow(f"{last_sun.isoformat()} 15:00:00 UTC",
-                                 f"{prev_sun.isoformat()} 15:00:00 UTC")
+                                 f"{prev_sun.isoformat()} 15:00:00 UTC", pipeline=_pl())
     return jsonify(_stale_wow_deals_payload(dw, prev_sun, last_sun,
                                             "Movimentação WoW · Stale", "Dias parado"))
 
@@ -4156,10 +5631,11 @@ def pipeline_activity_wow_deals():
     rótulo de tela mudou, pra não quebrar links salvos."""
     last_sun, prev_sun = _last_two_sundays()
     dw = bq.pipeline_activity_wow(f"{last_sun.isoformat()} 15:00:00 UTC",
-                                  f"{prev_sun.isoformat()} 15:00:00 UTC")
+                                  f"{prev_sun.isoformat()} 15:00:00 UTC", pipeline=_pl())
     return jsonify(_stale_wow_deals_payload(dw, prev_sun, last_sun,
                                             "Movimentação WoW · Inatividade",
-                                            "Dias sem retorno"))
+                                            "Dias sem retorno",
+                                            thresholds=_ACTIVITY_THRESHOLDS, keep_managers=True))
 
 
 @app.route("/pipeline/stalled-activity/deals")
@@ -4170,18 +5646,20 @@ def pipeline_activity_deals():
     grain = "leader" if request.args.get("grain") == "leader" else "ae"
     if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
         return jsonify(_empty_drill(name))
-    payload = _stalled_drill(bq.pipeline_activity(force_refresh=request.args.get("refresh") == "1"),
+    payload = _stalled_drill(bq.pipeline_activity(force_refresh=request.args.get("refresh") == "1", pipeline=_pl()),
                              name, grain, days_col="days_since_activity",
                              subtitle_suffix="sem retorno de contato",
                              leader=request.args.get("leader"), region=request.args.get("region"),
-                             title=name or "Inatividade — total",
-                             stage_ids=_stalled_stage_ids_arg())
+                             title=_stalled_stage_title(name or "Inatividade — total"),
+                             stage_ids=_stalled_stage_ids_arg(),
+                             thresholds=_ACTIVITY_THRESHOLDS, keep_managers=True)
     payload["columns"] = _with_ae_col([
         {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
         {"key": "deal_type", "label": "Tipo"},
         {"key": "stage",     "label": "Estágio"},
         {"key": "amount",    "label": "Valor",              "type": "money"},
         {"key": "days",      "label": "Dias sem atividade", "type": "int"},
+        {"key": "last_ret",  "label": "Último retorno"},
     ], "leader" if (grain == "leader" or not name) else "ae")
     return jsonify(payload)
 
@@ -4288,27 +5766,60 @@ def forecast_deals():
     if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
         return jsonify(_empty_drill(name))
     lo, hi = _forecast_window(request.args)
-    dd = _get_forecast_deals()
+    # MESMA base de `_forecast_page`: só quem saiu da empresa fica de fora — a
+    # venda direta de gestor está no total e na barra do líder dele. Antes o
+    # drill tirava HIDDEN_FROM_AE_VIEWS (gestores inclusive) e o total explodido
+    # não fechava com o card.
+    dd = apply_leader_overrides(_get_forecast_deals().copy())
+    dd = dd[~dd["account_executive"].isin(DEPARTED_AES)]
     dd = dd[dd["leader"].isin(ALLOWED_LEADERS)]
-    dd = dd[~dd["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
     dd = _entity_filter(dd, name, grain, request.args.get("leader"), request.args.get("region"))
+    # Deal Type vem na URL do card/barra clicado, não de `get_filters()`: este
+    # drill também serve o Overview, que não tem esse corte na barra — lendo o
+    # filtro global, um chip herdado de outra aba recortaria a lista explodida
+    # de uma tela que mostra o total. Quem passa o dtype é quem o aplica.
+    dd = _pt_apply_dim_filter(dd, "dtype", (request.args.get("dtype") or "").strip())
 
-    won = dd[dd["is_won"] & dd["po_emission_date"].notna()
-             & (dd["po_emission_date"] >= lo) & (dd["po_emission_date"] <= hi)]
+    # Realizado pela data da RECEITA — `rev_date` (PO, ou close date quando o
+    # deal ganho ainda não tem PO), com a extensão de fechamento. É a régua do
+    # card; com `rev_po` o won sem PO entrava na tela e sumia da explosão.
+    won = dd[dd["is_won"] & dd["rev_date"].notna()
+             & (dd["rev_date"] >= lo) & (dd["rev_date"] <= hi)]
     pipe = dd[(~dd["is_won"]) & dd["close_date"].notna()
               & (dd["close_date"] >= lo) & (dd["close_date"] <= hi)]
+    # Chips da legenda do gráfico (`cat` = realized + chaves das categorias,
+    # ver `_fc_key`): com algum desligado, a explosão leva só os ligados — e o
+    # pipe sem categoria (peso 0) sai, porque não compõe nenhum segmento.
+    _cat = (request.args.get("cat") or "").strip()
+    if _cat:
+        _want = {x.strip().lower() for x in _cat.split(",")}
+        if "realized" not in _want:
+            won = won.iloc[0:0]
+        pipe = pipe[pipe["forecast_category"].map(
+            lambda c: _fc_key(c) if isinstance(c, str) else "").isin(_want)]
 
     rows = []
     for _, r in won.iterrows():
         amt = float(r["amount"] or 0)
+        _tag = _rev_tag(r["po_emission_date"])
+        _dt = r["po_emission_date"] if pd.notna(r["po_emission_date"]) else r.get("close_date")
         rows.append({"deal_name": r.get("deal_name") or "—", "deal_url": _hs_deal_url(r.get("deal_id")),
                      "ae": r["account_executive"], "deal_type": r.get("deal_type") or "—",
-                     "categoria": "Won (realizado)", "amount": amt, "ponderado": amt,
-                     "data": r["po_emission_date"].date().isoformat() if pd.notna(r["po_emission_date"]) else ""})
+                     "categoria": (f"Won (realizado · {_tag})" if _tag else
+                                   "Won (realizado)" if pd.notna(r["po_emission_date"]) else
+                                   "Won (realizado · sem PO)"),
+                     "amount": amt, "ponderado": amt,
+                     "data": _dt.date().isoformat() if pd.notna(_dt) else ""})
     for _, r in pipe.iterrows():
         rows.append({"deal_name": r.get("deal_name") or "—", "deal_url": _hs_deal_url(r.get("deal_id")),
                      "ae": r["account_executive"], "deal_type": r.get("deal_type") or "—",
-                     "categoria": r.get("forecast_category") or "Pipeline", "amount": float(r["amount"] or 0),
+                     # Valor CRU do HubSpot ("COMMIT", "BEST_CASE") vazava pro
+                     # drill: a tela mostrava o peso e a lista explodida ainda
+                     # mostrava o nome. Passa pelo mesmo mapa de rótulos das
+                     # telas, então os dois sempre dizem a mesma coisa.
+                     "categoria": FORECAST_CATEGORY_LABEL.get(
+                         r.get("forecast_category"), "Sem categoria"),
+                     "amount": float(r["amount"] or 0),
                      "ponderado": float(r.get("weighted") or 0),
                      "data": r["close_date"].date().isoformat() if pd.notna(r["close_date"]) else ""})
     rows.sort(key=lambda x: x["data"], reverse=True)
@@ -4316,24 +5827,24 @@ def forecast_deals():
     return jsonify({
         "title": name or "Forecast — total",
         "subtitle": (f"{len(won)} realizado(s) + {len(pipe)} em pipeline · "
-                     f"valor bruto R$ {round(amount):,}".replace(",", ".")),
+                     f"valor bruto {fmt_money(amount)}"),
         "columns": _with_ae_col(_DRILL_FORECAST_COLUMNS, "leader" if (grain == "leader" or not name) else "ae"),
         "rows": rows,
     })
 
 
 def _newlogo_goal_aes(from_d, to_d, region=None, leader=None, ae=None):
-    """AEs que CARREGAM meta de new logo no período (Q3_ROSTER). Espelha
-    `newlogos_goal` de _overview_page: no Q3 o KPI 'Realizado de new logo' só soma
-    esses AEs, então o drill-down precisa do mesmo recorte pra a contagem bater com
-    o card. Fora do Q3 não existe meta → devolve None = SEM recorte (o card conta
-    toda aquisição validada do escopo). Devolver set() ali zerava o drill."""
-    if not (from_d >= Q3_START and to_d <= Q3_END):
-        return None
+    """AEs que CARREGAM meta de new logo no período (roster do trimestre). Fora dele não
+    existe meta → conjunto vazio. Espelha `newlogos_goal` de _overview_page: o KPI
+    'Realizado de new logo' só soma esses AEs, então o drill-down precisa do mesmo
+    recorte pra a contagem bater com o card."""
+    rq = _roster_window(from_d, to_d)
+    if rq is None:
+        return set()
     scope = expand_leader(leader) if leader else None
     out = set()
-    for nm, v in Q3_ROSTER.items():
-        if region and Q3_ROSTER_REGION != region:
+    for nm, v in _roster_of(rq).items():
+        if region and _roster_region() != region:
             continue
         if scope is not None and v["leader"] not in scope:
             continue
@@ -4372,12 +5883,16 @@ def overview_deals():
     _region = request.args.get("region")
     if _region:
         dd = dd[dd["region"] == _region]
-    # Filtro global de AE da página (os cards de KPI mandam `ae`): sem ele o drill
-    # do card abria o time inteiro enquanto o card mostrava só o AE selecionado.
-    _ae = (request.args.get("ae") or "").strip()
-    if _ae:
-        dd = dd[dd["account_executive"] == _ae]
-    in_win = dd["po_emission_date"].notna() & (dd["po_emission_date"] >= lo) & (dd["po_emission_date"] <= hi)
+    # Data que decide se o deal está no período. Receita (Realizado, Total em
+    # aquisição/expansão) → `rev_po`, com a extensão de fechamento; contagens e
+    # ticket (kind=ticket/newlogo, o acq do Overtime, que é new logo, e
+    # basis=cal dos cards de ticket) → o PO no calendário normal. Precisa bater
+    # com o card/barra que abriu o drill.
+    kind = (request.args.get("kind") or "").strip()
+    use_cal = (kind in ("ticket", "newlogo") or (kind == "acq" and scope_all)
+               or request.args.get("basis") == "cal")
+    dcol = "po_emission_date" if use_cal else "rev_po"
+    in_win = dd["po_emission_date"].notna() & (dd[dcol] >= lo) & (dd[dcol] <= hi)
     if scope_all:
         won = dd[dd["is_won"] & in_win].copy()
         hld = dd.iloc[0:0].copy()
@@ -4385,8 +5900,8 @@ def overview_deals():
         won = dd[dd["is_won"] & in_win & ~dd["deal_id"].isin(hold_ids)].copy()
         hld = dd[in_win & dd["deal_id"].isin(hold_ids)].copy()
     lmap = _period_leader_map()
-    won["leader"] = _attr_deal_leader(won, "po_emission_date", lmap)
-    hld["leader"] = _attr_deal_leader(hld, "po_emission_date", lmap)
+    won["leader"] = _attr_deal_leader(won, dcol, lmap)
+    hld["leader"] = _attr_deal_leader(hld, dcol, lmap)
     if not scope_all:
         won = won[won["leader"].isin(ALLOWED_LEADERS)]
         hld = hld[hld["leader"].isin(ALLOWED_LEADERS)]
@@ -4399,26 +5914,30 @@ def overview_deals():
     if name:
         won = _filter_entity(won, name, grain)
         hld = _filter_entity(hld, name, grain)
+    # Filtro de AE da tela por cima do clique (líder e região já foram acima,
+    # com o líder do trimestre do PO).
+    _ae = (request.args.get("ae") or "").strip()
+    if _ae:
+        won = won[won["account_executive"] == _ae]
+        hld = hld[hld["account_executive"] == _ae]
 
     def _mk(frame, status):
         out = []
         for _, r in frame.iterrows():
+            _tag = "" if use_cal else _rev_tag(r["po_emission_date"])
             out.append({"deal_name": r.get("deal_name") or "—", "deal_url": _hs_deal_url(r.get("deal_id")),
                         "ae": r["account_executive"], "deal_type": r.get("deal_type") or "—",
-                        "amount": float(r["amount"] or 0), "status": status,
+                        "amount": float(r["amount"] or 0),
+                        "status": f"{status} · {_tag}" if _tag else status,
                         "data": r["po_emission_date"].date().isoformat() if pd.notna(r["po_emission_date"]) else ""})
         return out
-
-    kind = (request.args.get("kind") or "").strip()
 
     # Ticket médio (Sales Overtime): TODOS os deals ganhos do trimestre, com o
     # tipo — a barra de aquisição e a de expansão saem da mesma população.
     if kind == "ticket":
         _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
         rows = []
-        # Hold conta como venda (regra de realizado, ver _overview_page).
-        _tk_base = pd.concat([won, hld], ignore_index=True) if len(hld) else won
-        for _, r in _tk_base.iterrows():
+        for _, r in (pd.concat([won, hld], ignore_index=True) if len(hld) else won).iterrows():
             rows.append({
                 "deal_name": r.get("deal_name") or "—",
                 "deal_url": _hs_deal_url(r.get("deal_id")),
@@ -4445,22 +5964,21 @@ def overview_deals():
             "rows": rows,
         })
 
-    # Recorte do card clicado. acq/exp/newlogo saem do validado + hold (hold conta
-    # como venda — regra de realizado em _overview_page), mesma base de
-    # _stats()/newlogos_actual, pra bater com os cards. O status diz qual é qual.
+    # Recorte do card clicado. acq/exp/newlogo saem SÓ do `won` (validado, sem
+    # hold) — mesma base de _stats()/newlogos_actual, pra bater com os cards.
     if kind in ("acq", "exp", "newlogo"):
         _dtype = "Up & cross sell" if kind == "exp" else "Aquisition"
-        sel_v = won[won["deal_type"] == _dtype]
+        sel = won[won["deal_type"] == _dtype]
+        # Hold conta como venda (regra do Overview): entra com o selo dele.
         sel_h = hld[hld["deal_type"] == _dtype]
         if kind == "newlogo":
             carriers = _newlogo_goal_aes(lo.date(), hi.date(),
                                          region=request.args.get("region"),
                                          leader=request.args.get("leader"),
-                                         ae=((name if grain == "ae" else None) or _ae or None))
-            if carriers is not None:                # None = período sem meta (fora do Q3)
-                sel_v = sel_v[sel_v["account_executive"].isin(carriers)]
-                sel_h = sel_h[sel_h["account_executive"].isin(carriers)]
-        rows = _mk(sel_v, "Validado") + _mk(sel_h, "Em validação financeira")
+                                         ae=(name if grain == "ae" else None))
+            sel = sel[sel["account_executive"].isin(carriers)]
+            sel_h = sel_h[sel_h["account_executive"].isin(carriers)]
+        rows = _mk(sel, "Validado") + _mk(sel_h, "Em validação financeira")
         rows.sort(key=lambda x: x["data"], reverse=True)
         amount = float(sum(x["amount"] for x in rows))
         _titles = {"acq": "Deals de aquisição", "exp": "Deals de expansão",
@@ -4468,8 +5986,11 @@ def overview_deals():
         cols = [{"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
                 {"key": "ae",        "label": "AE"},
                 {"key": "amount",    "label": "MRR",   "type": "money"},
-                {"key": "status",    "label": "Status"},
                 {"key": "data",      "label": "PO em", "type": "date"}]
+        if len(sel_h) or any(" · " in x["status"] for x in rows):
+            # Há deal cuja receita foi para outro quarter pela extensão: sem a
+            # coluna, o "PO em 01/10" apareceria no Q3 sem explicação.
+            cols.insert(3, {"key": "status", "label": "Status"})
         return jsonify({
             "title": _titles[kind] + (f" · {name}" if name else ""),
             "subtitle": _drill_money_subtitle(len(rows), amount) + " no período",
@@ -4518,6 +6039,9 @@ def leaders_demand():
 
     if f["region"]: by_ae = by_ae[by_ae["region"] == f["region"]]
     if f["leader"]: by_ae = by_ae[by_ae["leader"].isin(expand_leader(f["leader"]))]
+    # Filtro de AE da barra (antes ignorado aqui: a barra do líder seguia com o
+    # time inteiro enquanto a explosão já recortava o AE).
+    if f["ae"]:     by_ae = by_ae[by_ae["account_executive"] == f["ae"]]
 
     # AGREGAÇÃO POR LÍDER — taxonomia organizacional:
     # Diretor = AEs diretos + AEs do(s) gerente(s) que respondem a ele
@@ -4542,14 +6066,19 @@ def leaders_demand():
             "goal": team_size * weekly_goal_per_ae,
             "auto_acq":     int(subset["auto_acq"].sum()),
             "auto_exp":     int(subset["auto_exp"].sum()),
-            "rcv_inbound":  int(subset["rcv_inbound"].sum()),
-            "rcv_outbound": int(subset["rcv_outbound"].sum()),
-            "rcv_exp":      int(subset["rcv_exp"].sum()),
+            "rcv_inbound":   int(subset["rcv_inbound"].sum()),
+            "rcv_outbound":  int(subset["rcv_outbound"].sum()),
+            "rcv_moved_out": int(subset["rcv_moved_out"].sum()),
+            "rcv_moved_in":  int(subset["rcv_moved_in"].sum()),
+            "rcv_exp":       int(subset["rcv_exp"].sum()),
         })
     by_leader = pd.DataFrame(rows)
     if len(by_leader):
         by_leader["auto_total"] = by_leader["auto_acq"] + by_leader["auto_exp"]
-        by_leader["rcv_total"]  = by_leader["rcv_inbound"] + by_leader["rcv_outbound"] + by_leader["rcv_exp"]
+        by_leader["rcv_outbound_all"] = by_leader["rcv_outbound"] + by_leader["rcv_moved_out"]
+        by_leader["rcv_inbound_all"]  = by_leader["rcv_inbound"]  + by_leader["rcv_moved_in"]
+        by_leader["rcv_total"]  = (by_leader["rcv_inbound_all"] + by_leader["rcv_outbound_all"]
+                                   + by_leader["rcv_exp"])
         by_leader["total_generated"] = by_leader["auto_total"] + by_leader["rcv_total"]
         by_leader["pct_auto"]   = by_leader.apply(
             lambda r: (r["auto_total"] / r["total_generated"] * 100) if r["total_generated"] else 0,
@@ -4559,7 +6088,9 @@ def leaders_demand():
     else:
         by_leader = pd.DataFrame(columns=[
             "leader","account_executive","region","role","team_size","goal",
-            "auto_acq","auto_exp","rcv_inbound","rcv_outbound","rcv_exp",
+            "auto_acq","auto_exp","rcv_inbound","rcv_outbound",
+            "rcv_moved_out","rcv_moved_in","rcv_exp",
+            "rcv_inbound_all","rcv_outbound_all",
             "auto_total","rcv_total","total_generated"
         ])
 
@@ -4578,13 +6109,15 @@ def leaders_demand():
         "total_generated": int(by_leader["total_generated"].sum()),
         "auto_total":  int(by_leader["auto_total"].sum()),
         "rcv_total":   int(by_leader["rcv_total"].sum()),
-        "acq_total":   int(by_leader["auto_acq"].sum() + by_leader["rcv_inbound"].sum() + by_leader["rcv_outbound"].sum()),
+        "acq_total":   int(by_leader["auto_acq"].sum() + by_leader["rcv_inbound_all"].sum() + by_leader["rcv_outbound_all"].sum()),
         "exp_total":   int(by_leader["auto_exp"].sum() + by_leader["rcv_exp"].sum()),
         "auto_acq":    int(by_leader["auto_acq"].sum()),
         "auto_exp":    int(by_leader["auto_exp"].sum()),
-        "rcv_inbound": int(by_leader["rcv_inbound"].sum()),
-        "rcv_outbound":int(by_leader["rcv_outbound"].sum()),
+        "rcv_inbound": int(by_leader["rcv_inbound_all"].sum()),
+        "rcv_outbound":int(by_leader["rcv_outbound_all"].sum()),
         "rcv_exp":     int(by_leader["rcv_exp"].sum()),
+        "rcv_moved_out": int(by_leader["rcv_moved_out"].sum()),
+        "rcv_moved_in":  int(by_leader["rcv_moved_in"].sum()),
     }
 
     # Trend — aplica os mesmos filtros das barras (líder hierárquico, AE)
@@ -4603,10 +6136,13 @@ def leaders_demand():
         gr["bucket"] = gr["source"] + "_" + gr["kind"]
         gp = gr.pivot_table(index="period", columns="bucket", values="n",
                             aggfunc="sum").fillna(0).reset_index()
-        for col in ["auto_acq","auto_exp","received_inbound","received_outbound","received_exp"]:
+        for col in ["auto_acq","auto_exp","received_inbound","received_outbound",
+                    "received_moved_out","received_moved_in","received_exp"]:
             if col not in gp.columns: gp[col] = 0
         gp["total"] = (gp["auto_acq"] + gp["auto_exp"]
-                       + gp["received_inbound"] + gp["received_outbound"] + gp["received_exp"])
+                       + gp["received_inbound"] + gp["received_outbound"]
+                       + gp["received_moved_out"] + gp["received_moved_in"]
+                       + gp["received_exp"])
         gp["period"] = pd.to_datetime(gp["period"])
 
         def _grain_label(d, g=grain):
@@ -4681,21 +6217,23 @@ def _entity_only_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 
 def _quota_by_ae_for_window(df: pd.DataFrame, cov_from: date, cov_to: date,
                             f: dict) -> pd.DataFrame:
-    """Quota por AE numa janela. Na janela do Q3 a verdade é o Q3_ROSTER (inclui
+    """Quota por AE numa janela. Janela dentro de um trimestre com roster: a verdade
+    é o roster dele (inclui
     AE novo sem linha curada, que senão ficaria com quota 0 e sumiria do chart);
     fora dela soma a curada nos quarters que intersectam a janela."""
-    if cov_from >= Q3_START and cov_to <= Q3_END:
+    rq = _roster_window(cov_from, cov_to)
+    if rq is not None:
         scope = expand_leader(f["leader"]) if f["leader"] else None
         rows = []
-        for name, v in Q3_ROSTER.items():
-            if f["region"] and Q3_ROSTER_REGION != f["region"]:
+        for name, v in _roster_of(rq).items():
+            if f["region"] and (_roster_region() != f["region"]):
                 continue
             if scope is not None and v["leader"] not in scope:
                 continue
             if f["ae"] and name != f["ae"]:
                 continue
             rows.append({"account_executive": name, "quota_brl": float(v["quota"]),
-                         "leader": v["leader"], "region": Q3_ROSTER_REGION})
+                         "leader": v["leader"], "region": _roster_region()})
         return pd.DataFrame(rows, columns=["account_executive", "quota_brl", "leader", "region"])
     df_q = (df[(df["quarter"] <= cov_to) & (df["quarter_end"] >= cov_from)]
             if "quarter_end" in df.columns else df)
@@ -4710,19 +6248,21 @@ def _quota_by_ae_for_window(df: pd.DataFrame, cov_from: date, cov_to: date,
 def _validated_hold_by_ae(fdeals, hold_ids, lmap, lo, hi, f):
     """Realizado VALIDADO e ON-HOLD por AE numa janela, deal-level — mesma lógica
     do /overview (validado = won+PO fora do hold; hold = em aprovação; ambos pelo
-    quarter do PO). Devolve (validated, hold, acq, exp) como Series por AE."""
+    quarter do PO). Devolve (validated, hold, acq, exp) como Series por AE.
+    Tudo aqui é RECEITA: janela e líder pela data da receita (`rev_po`, com a
+    extensão de fechamento), que é o que abate a quota remanescente."""
     dd = fdeals[~fdeals["account_executive"].isin(DEPARTED_AES)].copy()
     if f["region"]:
         dd = dd[dd["region"] == f["region"]]
     if f["ae"]:
         dd = dd[dd["account_executive"] == f["ae"]]
-    po = dd["po_emission_date"]
+    po = dd["rev_po"]
     wonv = dd[dd["is_won"] & po.notna() & ~dd["deal_id"].isin(hold_ids)
               & (po >= lo) & (po <= hi)].copy()
     hldv = dd[dd["deal_id"].isin(hold_ids) & po.notna()
               & (po >= lo) & (po <= hi)].copy()
-    wonv["leader"] = _attr_deal_leader(wonv, "po_emission_date", lmap)
-    hldv["leader"] = _attr_deal_leader(hldv, "po_emission_date", lmap)
+    wonv["leader"] = _attr_deal_leader(wonv, "rev_po", lmap)
+    hldv["leader"] = _attr_deal_leader(hldv, "rev_po", lmap)
     wonv = wonv[wonv["leader"].isin(ALLOWED_LEADERS)]
     hldv = hldv[hldv["leader"].isin(ALLOWED_LEADERS)]
     if f["leader"]:
@@ -4767,12 +6307,14 @@ def _pipeline_page(grain="ae"):
     if f["ae"]:
         pipe_by_ae = pipe_by_ae[pipe_by_ae["account_executive"] == f["ae"]]
 
-    # ---- Janela da cobertura = TRIMESTRE VIGENTE (Q3) por padrão. Cobertura olha
+    # ---- Janela da cobertura = TRIMESTRE VIGENTE por padrão. Cobertura olha
     # pra frente: quanto da quota DESTE trimestre ainda falta. Se o usuário escolher
-    # um período, respeita; senão Q3. (Sem isso, o df cai em TODOS os quarters e a
-    # quota/realizado somam o histórico inteiro → remaining ~0 → cobertura estoura.)
-    cov_from = pipe_from or Q3_START
-    cov_to   = pipe_to   or Q3_END
+    # um período, respeita; senão o trimestre de hoje. (Sem isso, o df cai em TODOS
+    # os quarters e a quota/realizado somam o histórico inteiro → remaining ~0 →
+    # cobertura estoura.) Até 08/10/2026 isto era o Q3 FIXO: a tela sem filtro
+    # seguia medindo a cobertura contra a quota do Q3 já no Q4.
+    cov_from = pipe_from or _quarter_start_of(_today())
+    cov_to   = pipe_to   or _quarter_end_of(_today())
     _lo, _hi = pd.to_datetime(cov_from), pd.to_datetime(cov_to)
 
     # ---- Realizado VALIDADO + HOLD por AE, DEAL-LEVEL — MESMA lógica do /overview
@@ -4787,8 +6329,8 @@ def _pipeline_page(grain="ae"):
     validated_by_ae, hold_by_ae, acq_by_ae, exp_by_ae = _validated_hold_by_ae(
         _fdeals, _hold_ids, _lmap, _lo, _hi, f)
 
-    # ---- Quota por AE. MESMA fonte do /overview: na janela do Q3, a verdade é o
-    # Q3_ROSTER (inclui AEs novos SEM linha curada — ex Breno/Diego/Gabriel — que de
+    # ---- Quota por AE. MESMA fonte do /overview: na janela de um trimestre com
+    # roster, a verdade é o roster dele (inclui AEs novos SEM linha curada — ex Breno/Diego/Gabriel — que de
     # outro modo ficariam com quota 0 e sumiriam do chart). Fora do Q3, soma a curated
     # nos quarters que intersectam a janela (recorte evita somar TODO o histórico).
     quota_by_ae = _quota_by_ae_for_window(df, cov_from, cov_to, f)
@@ -4820,10 +6362,14 @@ def _pipeline_page(grain="ae"):
 
     # Grain: 'ae' usa o by_ae direto; 'leader' agrega por líder (soma do time).
     if grain == "leader":
-        rank_src = _pipe_leader_df(by_ae, f["leader"])
+        rank_src = _pipe_leader_df(by_ae, f["leader"],
+                                   targets=_leader_targets(_roster_window(cov_from, cov_to)))
         pipe_path, drill_key = "/leaders/pipeline", "leader"
     else:
-        rank_src = by_ae
+        # Líder sem quota no trimestre (Arthur no Q4) não é barra de vendedor: o
+        # funil dele segue no total e no grain de líder, como o dos outros gestores.
+        rank_src = by_ae[~by_ae["account_executive"].isin(
+            _leaders_without_quota(_roster_window(cov_from, cov_to)))]
         pipe_path, drill_key = "/pipeline", "ae"
 
     # 2 populações: AEs/líderes com pipe early / late no período (barra amount > 0).
@@ -4924,12 +6470,13 @@ def _pipeline_page(grain="ae"):
     e_by_ae["late_deals"] = 0
 
     if grain == "leader":
-        # No M3 a janela é outro trimestre, então o Board Target (que é do
-        # corrente) não vale — soma a quota do time do trimestre-alvo.
+        # Meta do líder = Comp. Target do trimestre-alvo do Early (no M3 é o
+        # próximo); trimestre sem Comp. Target declarado soma a quota do time.
         e_rank_src = _pipe_leader_df(e_by_ae, f["leader"],
-                                     use_board_target=not early["use_full_quota"])
+                                     targets=_leader_targets(_roster_window(e_from, e_to)))
     else:
-        e_rank_src = e_by_ae
+        e_rank_src = e_by_ae[~e_by_ae["account_executive"].isin(
+            _leaders_without_quota(_roster_window(e_from, e_to)))]
     e_rows = e_rank_src[e_rank_src["early_amount"] > 0].reset_index(drop=True)
 
     early_goal_label = "Meta S" + str(early["week"]) + " · " + _fmt_mult(early["goal"])
@@ -4980,58 +6527,135 @@ def leaders_pipeline_activity():
     return _pipeline_activity_page("leader")
 
 
+def _wa_status(force: bool = False) -> dict:
+    """Frescor da carga de WhatsApp pra tela de Inatividade. `stale` = a última
+    carga tem mais de 8 dias. A rotina é SEMANAL (domingo 12h, pedido do Pedro
+    em 08/10/2026 — "pra segunda termos o dado correto") e roda no Mac dele;
+    se uma segunda passar sem rodar, a tela avisa. No meio da semana o
+    WhatsApp está até 7 dias atrás por desenho, e a frase "lido até" já diz isso."""
+    out = {"active": False, "stale": False, "until": None, "until_label": ""}
+    try:
+        fr = bq.wa_freshness(force_refresh=force)
+    except Exception as e:  # noqa: BLE001 — sem a tabela, a aba segue com email+call
+        app.logger.warning("wa_freshness indisponível: %s", e)
+        return out
+    if fr is None or not len(fr):
+        return out
+    until = pd.to_datetime(fr.iloc[0]["notes_until"], errors="coerce", utc=True)
+    if pd.isna(until):
+        return out
+    age_h = (pd.Timestamp.now(tz="UTC") - until).total_seconds() / 3600
+    loc = until.tz_convert(BRT)
+    out.update(active=True, stale=age_h > 8 * 24, until=until,
+               until_label=f"{loc:%d/%m} {loc:%H:%M}")
+    return out
+
+
+def _gong_status(force: bool = False) -> dict:
+    """Frescor das reuniões do Gong pra tela de Inatividade. Até 29/09/2026 elas
+    vêm da cópia da nekt; dali em diante, da carga semanal pelo conector
+    (tools/gong_ingest.py, na mesma rotina de domingo do WhatsApp). `until` é o
+    último dia carregado SEM buraco desde 29/09; `stale` = mais de 8 dias atrás
+    (uma rotina de domingo que não rodou)."""
+    out = {"active": False, "stale": False, "until_label": ""}
+    try:
+        fr = bq.gong_freshness(force_refresh=force)
+    except Exception as e:  # noqa: BLE001 — sem as tabelas, a aba segue sem o canal novo
+        app.logger.warning("gong_freshness indisponível: %s", e)
+        return out
+    if fr is None or not len(fr):
+        return out
+    r = fr.iloc[0]
+    until = pd.to_datetime(r["until_date"], errors="coerce")
+    gap = pd.to_datetime(r["first_gap"], errors="coerce")
+    if pd.notna(gap):
+        until = gap - pd.Timedelta(days=1)
+    if pd.isna(until):
+        return out
+    fim_do_dia = until.tz_localize("UTC") + pd.Timedelta(days=1)
+    age_d = (pd.Timestamp.now(tz="UTC") - fim_do_dia).total_seconds() / 86400
+    out.update(active=True, stale=age_d > 8, until_label=f"{until:%d/%m}")
+    return out
+
+
+# E-mail e ligação vêm de um sync da nekt que não é nosso. Sem atividade nova há
+# mais que isto, a tela avisa: fim de semana prolongado ainda passa calado.
+_EMAIL_CALL_STALE_DAYS = 3
+
+
+def _email_call_status(force: bool = False) -> list[dict]:
+    """Canais (e-mail, ligação) cujo sync parou — [] quando os dois estão em dia
+    ou quando não deu pra medir (aí a tela segue sem o aviso, como antes)."""
+    try:
+        fr = bq.email_call_freshness(force_refresh=force)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("email_call_freshness indisponível: %s", e)
+        return []
+    if fr is None or not len(fr):
+        return []
+    out = []
+    for col, nome in (("email_until", "e-mail"), ("call_until", "ligação")):
+        until = pd.to_datetime(fr.iloc[0][col], errors="coerce", utc=True)
+        if pd.isna(until):
+            continue
+        dias = (pd.Timestamp.now(tz="UTC") - until).total_seconds() / 86400
+        if dias > _EMAIL_CALL_STALE_DAYS:
+            out.append({"nome": nome, "until_label": f"{until.tz_convert(BRT):%d/%m}"})
+    return out
+
+
 def _pipeline_activity_page(grain="ae"):
     """Inatividade por ATIVIDADE (V2): mesma cara da página de inatividade por
     stage, mas o eixo de tempo é 'dias desde o último RETORNO de um contato do
-    deal' (email entrante / call conectada) em vez de 'dias no stage'. Reusa as
-    thresholds por stage pra as duas visões serem comparáveis lado a lado.
-    "Retorno" NÃO inclui reuniões — a tabela de meetings do BQ não tem
-    associação a deal (precisaria da API); ver bq.pipeline_activity()."""
+    deal' (email entrante / call conectada / WhatsApp) em vez de 'dias no stage'.
+    Limite único de ACTIVITY_SLA_DAYS (7) em todos os estágios desde 09/10/2026 —
+    antes reusava os SLAs por estágio do Stale. Desde a mesma data cobre também o
+    Stage 1 - Scheduled e conta os deals dos gestores (no total e em Líderes).
+    WhatsApp (fala do cliente nas notas do Sniper) conta como retorno desde 08/10/2026;
+    reunião gravada no Gong com um contato do deal, desde 19/10/2026 (pedido do
+    Pedro) — ver bq._activity_cte e sql/gong_meeting_contacts_live.sql."""
     ctx = base_context()
     f = ctx["filters"]
     force = request.args.get("refresh") == "1"
 
     # ----- 1) Estado atual (now) -----
-    df_now = bq.pipeline_activity(force_refresh=force)
+    df_now = bq.pipeline_activity(force_refresh=force, pipeline=_pl())
     df_now = _apply_roster_current(df_now)
     df_now = df_now[df_now["leader"].isin(ALLOWED_LEADERS)]
-    df_now = df_now[~df_now["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    # Deal de gestor entra (total + visão de Líderes); só quem saiu fica fora.
+    df_now = drop_departed_people(df_now)
     if f.get("region"):
         df_now = df_now[df_now["region"] == f["region"]]
     if f.get("leader"):
         df_now = df_now[df_now["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        df_now = df_now[df_now["account_executive"] == f["ae"]]
 
-    # Sinal extra: retorno de contato via WhatsApp (integrador grava como NOTE).
-    # Só quando o HubSpot está configurado (token via Private App); sem token é
-    # no-op e a aba segue com email+call. Nunca deixa o HubSpot derrubar a página.
-    n_wa_returns = 0
-    wa_active = hubspot.is_configured()
-    if wa_active and len(df_now):
-        try:
-            wa = hubspot.last_client_returns(
-                df_now["deal_id"].astype(str).tolist(), force_refresh=force)
-            if wa:
-                wa_ts = (df_now["deal_id"].astype(str).map(wa)
-                         .pipe(pd.to_datetime, errors="coerce", utc=True))
-                # last_activity efetivo = mais recente entre email/call e WhatsApp
-                prev = pd.to_datetime(df_now["last_activity_at"], errors="coerce", utc=True)
-                combined = prev.where(prev >= wa_ts, wa_ts)  # NaT-safe: pega o maior
-                combined = combined.fillna(prev).fillna(wa_ts)
-                df_now["last_activity_at"] = combined
-                df_now["has_activity"] = df_now["has_activity"] | wa_ts.notna()
-                n_wa_returns = int(wa_ts.notna().sum())
-                # Recalcula dias desde a atividade com a origem justa (entrada no stage)
-                base = combined.fillna(
-                    pd.to_datetime(df_now["stage_changed_at"], errors="coerce", utc=True))
-                today = pd.Timestamp.utcnow().normalize()
-                df_now["days_since_activity"] = (today - base.dt.normalize()).dt.days
-        except Exception as e:  # noqa: BLE001 — HubSpot fora não pode quebrar a aba
-            app.logger.warning("WhatsApp returns indisponível: %s", e)
-            wa_active = False
+    # WhatsApp já vem DENTRO da SQL (bq._activity_cte, canal 'whatsapp' lido de
+    # pepeuhacker.wa_deal_returns) — então a página, o drill e a Movimentação
+    # WoW contam o mesmo retorno. Até 08/10/2026 ele era somado aqui, via API do
+    # HubSpot, só na página e só com token; sem token (o caso desde agosto) o
+    # WhatsApp simplesmente não contava. A carga roda na rotina diária do
+    # Claude (tools/wa_ingest.py); aqui só se mede quanto ela está em dia.
+    wa = _wa_status(force)
+    gong = _gong_status(force)
+    sync_parado = _email_call_status(force)
+    wa_active = wa["active"]
+    _lw = (pd.to_datetime(df_now["last_whatsapp_at"], errors="coerce", utc=True)
+           if "last_whatsapp_at" in df_now.columns else pd.Series(pd.NaT, index=df_now.index))
+    _la = pd.to_datetime(df_now["last_activity_at"], errors="coerce", utc=True)
+    # Deals cujo retorno MAIS RECENTE foi no WhatsApp (sem ele, contariam mais dias).
+    n_wa_returns = int((_lw.notna() & (_lw >= _la)).sum()) if len(df_now) else 0
+    _lg = (pd.to_datetime(df_now["last_gong_at"], errors="coerce", utc=True)
+           if "last_gong_at" in df_now.columns else pd.Series(pd.NaT, index=df_now.index))
+    # Deals cujo retorno mais recente foi uma reunião do Gong.
+    n_gong_returns = int((_lg.notna() & (_lg >= _la)).sum()) if len(df_now) else 0
 
     # "Inativo por atividade" = dias sem retorno > threshold do stage
     df_now["is_stalled"] = df_now.apply(
-        lambda r: _STALLED_THRESHOLDS.get(r["stage_curr"], 999) < r["days_since_activity"], axis=1)
+        lambda r: bool(pd.notna(r["days_since_activity"])
+                       and _ACTIVITY_THRESHOLDS.get(r["stage_curr"], 999) < r["days_since_activity"]),
+        axis=1).astype(bool)
     stalled_now = df_now[df_now["is_stalled"]].copy()
 
     if len(stalled_now) > 0:
@@ -5039,32 +6663,42 @@ def _pipeline_activity_page(grain="ae"):
                                      values="deal_id", aggfunc="count", fill_value=0)
     else:
         ct = pd.DataFrame(index=pd.Index([], name="account_executive"))
-    for st in _STALLED_STAGE_ORDER:
+    for st in _ACTIVITY_STAGE_ORDER:
         if st not in ct.columns:
             ct[st] = 0
-    ct["total"] = ct[_STALLED_STAGE_ORDER].sum(axis=1)
+    ct["total"] = ct[_ACTIVITY_STAGE_ORDER].sum(axis=1)
     ct = ct.sort_values("total", ascending=False)
 
     _ae_lead = dict(zip(df_now["account_executive"], df_now["leader"]))
-    _nkeys = [f"n_{_STALLED_STAGE_KEYS[s]}" for s in _STALLED_STAGE_ORDER]
+    _nkeys = [f"n_{_STALLED_STAGE_KEYS[s]}" for s in _ACTIVITY_STAGE_ORDER]
     rows_now = [{
         "account_executive": ae,
         "leader": _ae_lead.get(ae, ""),
         "total": int(ct.loc[ae, "total"]),
-        **{f"n_{_STALLED_STAGE_KEYS[s]}": int(ct.loc[ae, s]) for s in _STALLED_STAGE_ORDER},
+        **{f"n_{_STALLED_STAGE_KEYS[s]}": int(ct.loc[ae, s]) for s in _ACTIVITY_STAGE_ORDER},
     } for ae in ct.index]
+    _mgrs = _nao_vendedores()
+    n_mgr_stalled = int(stalled_now["account_executive"].isin(_mgrs).sum()) if len(stalled_now) else 0
     if grain == "leader":
         rows_now = _leader_rollup(rows_now, f.get("leader"), ["total"] + _nkeys)
+        for r in rows_now:                      # o rollup soma em float ("201.0" na barra)
+            for k in ["total"] + _nkeys:
+                r[k] = int(r[k])
         rows_now.sort(key=lambda r: r["total"], reverse=True)
+    else:
+        # Gestor não vira barra de vendedor (regra de 24/08/2026), mas o deal
+        # dele está no card de estágio e no Total — que somam por estágio, e
+        # não as barras.
+        rows_now = [r for r in rows_now if r["account_executive"] not in _mgrs]
 
     summary_by_stage = [{
         "key":   _STALLED_STAGE_KEYS[s],
         "label": _STALLED_STAGE_LABELS[s],
         "color": _STALLED_STAGE_COLORS[s],
         "ink":   _STALLED_STAGE_INKS[s],
-        "threshold": _STALLED_THRESHOLDS[s],
+        "threshold": _ACTIVITY_THRESHOLDS[s],
         "n_deals": int(ct[s].sum()) if len(ct) else 0,
-    } for s in _STALLED_STAGE_ORDER]
+    } for s in _ACTIVITY_STAGE_ORDER]
 
     max_total_now = max([r["total"] for r in rows_now], default=0)
     total_stalled = int(ct["total"].sum())   if len(ct) else 0
@@ -5077,28 +6711,33 @@ def _pipeline_activity_page(grain="ae"):
     last_sun, prev_sun = _last_two_sundays()
     t_curr_iso = f"{last_sun.isoformat()} 15:00:00 UTC"
     t_prev_iso = f"{prev_sun.isoformat()} 15:00:00 UTC"
-    dw = bq.pipeline_activity_wow(t_curr_iso, t_prev_iso, force_refresh=force)
+    dw = bq.pipeline_activity_wow(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl())
     dw = _apply_roster_current(dw)
     dw = dw[dw["leader"].isin(ALLOWED_LEADERS)]
-    dw = dw[~dw["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    dw = drop_departed_people(dw)
     if f.get("region"):
         dw = dw[dw["region"] == f["region"]]
     if f.get("leader"):
         dw = dw[dw["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        dw = dw[dw["account_executive"] == f["ae"]]
 
     def _stalled_at(stage, days):
-        th = _STALLED_THRESHOLDS.get(stage)
-        return th is not None and days is not None and days > th
+        th = _ACTIVITY_THRESHOLDS.get(stage)
+        # bool() + notna: deal que fechou na semana vem com dias NULOS; sem
+        # isso a coluna virava 'object' e o ~ do pandas (bitwise em bool do
+        # Python: ~False = -1) marcava TODO parado anterior como 'saiu'.
+        return bool(th is not None and pd.notna(days) and days > th)
 
-    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1)
-    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1)
+    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1).astype(bool)
+    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1).astype(bool)
     dw_saiu   = dw[(dw["parado_prev"]) & (~dw["parado_curr"])]
     dw_entrou = dw[(~dw["parado_prev"]) & (dw["parado_curr"])]
 
     # Breakdown por estágio-âncora — mesmos chips/recompute da página Stale.
     saiu_stage   = _stale_wow_by_stage(dw_saiu, "stage_prev")
     entrou_stage = _stale_wow_by_stage(dw_entrou, "stage_curr")
-    _skeys = [_STALLED_STAGE_KEYS[s] for s in _STALLED_STAGE_ORDER]
+    _skeys = [_STALLED_STAGE_KEYS[s] for s in _ACTIVITY_STAGE_ORDER]
 
     saiu_by_ae   = dw_saiu.groupby("account_executive")["deal_id"].count()
     entrou_by_ae = dw_entrou.groupby("account_executive")["deal_id"].count()
@@ -5118,7 +6757,11 @@ def _pipeline_activity_page(grain="ae"):
                       + [f"entrou_{k}" for k in _skeys])
         rows_wow = _leader_rollup(rows_wow, f.get("leader"), _roll_keys)
         for r in rows_wow:
+            for k in _roll_keys:
+                r[k] = int(r[k])
             r["net"] = int(r["saiu"]) - int(r["entrou"])
+    else:
+        rows_wow = [r for r in rows_wow if r["account_executive"] not in _mgrs]
     rows_wow.sort(key=lambda r: r["net"], reverse=True)
 
     wow_y_max = max([max(r["saiu"], r["entrou"]) for r in rows_wow], default=1)
@@ -5133,10 +6776,19 @@ def _pipeline_activity_page(grain="ae"):
         n_with_activity=n_with_activity,
         wa_active=wa_active,
         n_wa_returns=n_wa_returns,
+        wa=wa, sync_parado=sync_parado,
+        gong=gong, n_gong_returns=n_gong_returns,
         rows_wow=rows_wow,
         wow_y_max=wow_y_max,
-        wow_total_saiu=int(sum(r["saiu"]   for r in rows_wow)),
-        wow_total_entrou=int(sum(r["entrou"] for r in rows_wow)),
+        # Totais por DEAL, não soma de barras: na visão de Líderes o diretor
+        # engloba o gerente e a soma contava o time do gerente duas vezes.
+        wow_total_saiu=int(len(dw_saiu)),
+        wow_total_entrou=int(len(dw_entrou)),
+        wow_stage_totals={_STALLED_STAGE_KEYS[st]: {
+            "saiu": int((dw_saiu["stage_prev"] == st).sum()),
+            "entrou": int((dw_entrou["stage_curr"] == st).sum())} for st in _ACTIVITY_STAGE_ORDER},
+        n_mgr_stalled=n_mgr_stalled,
+        sla_days=ACTIVITY_SLA_DAYS,
         snap_curr_label=_fmt_date_short(last_sun) + " · 12h",
         snap_prev_label=_fmt_date_short(prev_sun) + " · 12h",
         grain=grain,
@@ -5157,7 +6809,7 @@ def _pipeline_stalled_page(grain="ae"):
     force = request.args.get("refresh") == "1"
 
     # ----- 1) Estado atual (now) -----
-    df_now = bq.pipeline_stalled(force_refresh=force)
+    df_now = bq.pipeline_stalled(force_refresh=force, pipeline=_pl())
     df_now = _apply_roster_current(df_now)   # roster Q3 + remove quem saiu (BQ traz líder cru)
     df_now = df_now[df_now["leader"].isin(ALLOWED_LEADERS)]
     df_now = df_now[~df_now["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
@@ -5165,10 +6817,14 @@ def _pipeline_stalled_page(grain="ae"):
         df_now = df_now[df_now["region"] == f["region"]]
     if f.get("leader"):
         df_now = df_now[df_now["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        df_now = df_now[df_now["account_executive"] == f["ae"]]
 
     # Marca cada linha como "parado" segundo a threshold do stage
     df_now["is_stalled"] = df_now.apply(
-        lambda r: _STALLED_THRESHOLDS.get(r["stage_curr"], 999) < r["days_stalled"], axis=1)
+        lambda r: bool(pd.notna(r["days_stalled"])
+                       and _STALLED_THRESHOLDS.get(r["stage_curr"], 999) < r["days_stalled"]),
+        axis=1).astype(bool)
     stalled_now = df_now[df_now["is_stalled"]].copy()
 
     # Pivot AE × stage (n deals)
@@ -5193,6 +6849,9 @@ def _pipeline_stalled_page(grain="ae"):
     } for ae in ct.index]
     if grain == "leader":
         rows_now = _leader_rollup(rows_now, f.get("leader"), ["total"] + _nkeys)
+        for r in rows_now:                      # o rollup soma em float ("201.0" na barra)
+            for k in ["total"] + _nkeys:
+                r[k] = int(r[k])
         rows_now.sort(key=lambda r: r["total"], reverse=True)
 
     # Resumo total por stage
@@ -5212,7 +6871,7 @@ def _pipeline_stalled_page(grain="ae"):
     last_sun, prev_sun = _last_two_sundays()
     t_curr_iso = f"{last_sun.isoformat()} 15:00:00 UTC"
     t_prev_iso = f"{prev_sun.isoformat()} 15:00:00 UTC"
-    dw = bq.pipeline_stalled_wow(t_curr_iso, t_prev_iso, force_refresh=force)
+    dw = bq.pipeline_stalled_wow(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl())
     dw = _apply_roster_current(dw)           # roster Q3 + remove quem saiu (BQ traz líder cru)
     dw = dw[dw["leader"].isin(ALLOWED_LEADERS)]
     dw = dw[~dw["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
@@ -5220,13 +6879,18 @@ def _pipeline_stalled_page(grain="ae"):
         dw = dw[dw["region"] == f["region"]]
     if f.get("leader"):
         dw = dw[dw["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        dw = dw[dw["account_executive"] == f["ae"]]
 
     def _stalled_at(stage, days):
         th = _STALLED_THRESHOLDS.get(stage)
-        return th is not None and days is not None and days > th
+        # bool() + notna: deal que fechou na semana vem com dias NULOS; sem
+        # isso a coluna virava 'object' e o ~ do pandas (bitwise em bool do
+        # Python: ~False = -1) marcava TODO parado anterior como 'saiu'.
+        return bool(th is not None and pd.notna(days) and days > th)
 
-    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1)
-    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1)
+    dw["parado_curr"] = dw.apply(lambda r: _stalled_at(r["stage_curr"], r["days_curr"]), axis=1).astype(bool)
+    dw["parado_prev"] = dw.apply(lambda r: _stalled_at(r["stage_prev"], r["days_prev"]), axis=1).astype(bool)
     dw_saiu   = dw[(dw["parado_prev"]) & (~dw["parado_curr"])]   # estavam parados, saíram
     dw_entrou = dw[(~dw["parado_prev"]) & (dw["parado_curr"])]   # cruzaram threshold
 
@@ -5254,6 +6918,8 @@ def _pipeline_stalled_page(grain="ae"):
                       + [f"entrou_{k}" for k in _skeys])
         rows_wow = _leader_rollup(rows_wow, f.get("leader"), _roll_keys)
         for r in rows_wow:
+            for k in _roll_keys:
+                r[k] = int(r[k])
             r["net"] = int(r["saiu"]) - int(r["entrou"])
     rows_wow.sort(key=lambda r: r["net"], reverse=True)
 
@@ -5267,8 +6933,12 @@ def _pipeline_stalled_page(grain="ae"):
         total_stalled=total_stalled,
         rows_wow=rows_wow,
         wow_y_max=wow_y_max,
-        wow_total_saiu=int(sum(r["saiu"]   for r in rows_wow)),
-        wow_total_entrou=int(sum(r["entrou"] for r in rows_wow)),
+        # Totais por DEAL, não soma de barras (em Líderes o diretor engloba o gerente).
+        wow_total_saiu=int(len(dw_saiu)),
+        wow_total_entrou=int(len(dw_entrou)),
+        wow_stage_totals={_STALLED_STAGE_KEYS[st]: {
+            "saiu": int((dw_saiu["stage_prev"] == st).sum()),
+            "entrou": int((dw_entrou["stage_curr"] == st).sum())} for st in _STALLED_STAGE_ORDER},
         snap_curr_label=_fmt_date_short(last_sun) + " · 12h",
         snap_prev_label=_fmt_date_short(prev_sun) + " · 12h",
         grain=grain,
@@ -5278,8 +6948,8 @@ def _pipeline_stalled_page(grain="ae"):
 # ============================================================
 # Pipeline Total — todo o dinheiro do funil, cortado por qualquer eixo
 # ============================================================
-# Eixo X = estágio do funil (onde o dinheiro ESTÁ). Os 3 cortes de negócio
-# (deal type, source, forecast category) funcionam como filtro E como
+# Eixo X = estágio do funil (onde o dinheiro ESTÁ). Os 4 cortes de negócio
+# (deal type, source, product, forecast category) funcionam como filtro E como
 # empilhamento do gráfico — o mesmo registro alimenta os dois, então adicionar
 # uma dimensão nova é uma entrada aqui e nada mais.
 #
@@ -5291,6 +6961,13 @@ def _pipeline_stalled_page(grain="ae"):
 # vira atributo `data-<chave>` no template e é lida via `dataset[<chave>]` no JS —
 # underscore/hífen ali viram outra coisa na conversão camelCase do dataset.
 _PT_DIM_NONE = "nocat"
+
+# Bucket do deal com MAIS DE UM produto marcado. Existe porque `product_of_deal`
+# é multi-select no HubSpot: sem um bucket próprio, um deal Smart Trac + TracOS
+# teria que ser contado nas duas colunas, e aí a soma dos segmentos passaria a
+# ser MAIOR que a barra (~6% dos deals abertos têm mais de um produto). O
+# empilhamento é por deal, não por produto, então cada deal cai num lugar só.
+_PT_MULTI = "__multi__"
 
 _PT_DIMS = {
     "dtype": {
@@ -5308,6 +6985,33 @@ _PT_DIMS = {
             ("expansion", "Expansion", "Expansion", "#0891B2", "#0E7490"),
         ],
     },
+    # Propriedade "Product" do HubSpot. `multi: True` avisa o resto do módulo
+    # que a coluna guarda uma LISTA serializada com ';' — filtro e empilhamento
+    # têm caminho próprio (ver `_pt_apply_dim_filter` / `_pt_series_key`).
+    #
+    # Filtrar por um produto = "o deal INCLUI esse produto" (Smart Trac também
+    # traz os Smart Trac + TracOS), que é a pergunta de negócio real. Empilhar
+    # por produto = "o deal é SÓ esse produto", com os combinados em
+    # Multiprodutos — as duas semânticas diferem de propósito, porque só a
+    # segunda fecha com o total da barra.
+    #
+    # Ordem = tamanho no funil Sales BR (Smart Trac 11.668 deals · Band Trac 7),
+    # e o vocabulário é fechado: são estes 8 valores no HubSpot, nada mais.
+    "prod": {
+        "col": "product", "label": "Product", "multi": True,
+        "values": [
+            ("smarttrac",   "Smart Trac",    "Smart Trac",    "#2563EB", "#1D4ED8"),
+            ("tracos",      "TracOS",        "TracOS",        "#7C3AED", "#6D28D9"),
+            ("energytrac",  "Energy Trac",   "Energy Trac",   "#F59E0B", "#B45309"),
+            ("smarttracex", "Smart Trac EX", "Smart Trac EX", "#0EA5E9", "#0369A1"),
+            ("oeetrac",     "OEE Trac",      "OEE Trac",      "#DB2777", "#BE185D"),
+            ("unitrac",     "Uni Trac",      "Uni Trac",      "#0891B2", "#0E7490"),
+            ("omnitrac",    "Omni Trac",     "Omni Trac",     "#10B981", "#047857"),
+            ("bandtrac",    "Band Trac",     "Band Trac",     "#65A30D", "#4D7C0F"),
+            ("multi",      _PT_MULTI, "Multiprodutos", "#64748B", "#334155"),
+            (_PT_DIM_NONE,  None,     "Sem produto",   "#94A3B8", "#475569"),
+        ],
+    },
     "fcat": {
         "col": "forecast_category", "label": "Forecast Category",
         # Ordem do mais comprometido pro menos. `OMIT` = "Not forecasted" e o
@@ -5315,11 +7019,15 @@ _PT_DIMS = {
         # nenhuma), então precisam existir como opção — se ficassem de fora o
         # gráfico empilhado não fecharia com o total e o número pareceria errado.
         "values": [
-            ("commit",    "COMMIT",     "Commit",         "#047857", "#065F46"),
-            ("bestcase",  "BEST_CASE",  "Best Case",      "#10B981", "#047857"),
-            ("probable",  "PROBABLE",   "Probable",       "#2563EB", "#1D4ED8"),
-            ("funnel",    "PIPELINE",   "Funnel",         "#93C5FD", "#1E40AF"),
-            ("omit",      "OMIT",       "Not forecasted", "#F59E0B", "#B45309"),
+            # Rótulo = peso do modelo. Vem escrito aqui e em
+            # FORECAST_CATEGORY_LABEL, que é a mesma lista em dois lugares desde
+            # antes — se mudar um, mudar o outro, senão as duas abas passam a
+            # chamar a mesma categoria de nomes diferentes.
+            ("commit",    "COMMIT",     "100%",           "#047857", "#065F46"),
+            ("bestcase",  "BEST_CASE",  "75%",            "#10B981", "#047857"),
+            ("probable",  "PROBABLE",   "50%",            "#2563EB", "#1D4ED8"),
+            ("funnel",    "PIPELINE",   "25%",            "#93C5FD", "#1E40AF"),
+            ("omit",      "OMIT",       "0%",             "#F59E0B", "#B45309"),
             (_PT_DIM_NONE, None,        "Sem categoria",  "#94A3B8", "#475569"),
         ],
     },
@@ -5329,10 +7037,13 @@ _PT_DIMS = {
 def _pt_dim_meta(dim: str) -> list[dict]:
     """Valores de uma dimensão como dicts prontos pro template (chip + segmento).
 
-    Em `fcat`, anexa o PESO do modelo de forecast (`FORECAST_CATEGORY_PCT`, a
-    mesma fonte da aba Forecast: Funnel 25 · Probable 50 · Best Case 75 ·
-    Commit 100). Vem de lá e não de uma cópia local justamente pra as duas abas
-    nunca discordarem sobre quanto vale um Best Case."""
+    Em `fcat`, anexa o PESO EFETIVO do modelo de forecast
+    (`FORECAST_CATEGORY_PCT_EFF`: 100 · 75 · 50 · 25 · 0 já × DIR_FORECAST_FACTOR),
+    a mesma fonte da aba Forecast. Vem de lá e não de uma cópia local justamente
+    pra as duas abas nunca discordarem sobre quanto vale uma categoria. Aqui
+    `pct` é só PESO — o número que multiplica o amount, no Python e no JS da
+    barra. O RÓTULO é o `label`, que segue sendo o parâmetro cru do HubSpot
+    ("75%"); por isso o pct nunca deve ser colado atrás dele — daria "75% · 67,5%"."""
     out = []
     for k, raw, lbl, c, ink in _PT_DIMS[dim]["values"]:
         item = {"key": k, "raw": raw, "label": lbl, "color": c, "ink": ink}
@@ -5340,9 +7051,30 @@ def _pt_dim_meta(dim: str) -> list[dict]:
             # OMIT é 0% no modelo; "sem categoria" não tem peso definido (None) —
             # os dois são explicitamente NÃO ponderáveis, e a página diz isso em
             # vez de fingir que valem 0 ou 100.
-            item["pct"] = FORECAST_CATEGORY_PCT.get(raw) if raw is not None else None
+            item["pct"] = (FORECAST_CATEGORY_PCT_EFF.get(raw)
+                           if raw is not None else None)
         out.append(item)
     return out
+
+
+def _pt_multi_list(s: pd.Series) -> pd.Series:
+    """Coluna multi-select do HubSpot → lista de valores por linha.
+
+    O HubSpot serializa multi-select como 'Smart Trac;TracOS'. Separar em lista
+    aqui (e não comparar a string) é o que evita os dois bugs óbvios: filtrar
+    por 'Smart Trac' com `==` perderia todo deal combinado, e filtrar com
+    `str.contains` casaria 'Smart Trac EX' junto — dois produtos diferentes
+    somados calados. Com a lista, a comparação é por valor INTEIRO."""
+    return (s.fillna("").astype(str)
+             .map(lambda v: [x.strip() for x in v.split(";") if x.strip()]))
+
+
+def _pt_dim_label(dim: str, sel: str) -> str:
+    """Chave curta da URL → rótulo de negócio ("acq" → "Aquisição"). Chave vazia
+    ou desconhecida devolve "" — quem chama trata como "sem corte"."""
+    if not sel:
+        return ""
+    return next((lbl for k, _raw, lbl, *_ in _PT_DIMS[dim]["values"] if k == sel), "")
 
 
 def _pt_apply_dim_filter(df: pd.DataFrame, dim: str, sel: str) -> pd.DataFrame:
@@ -5354,6 +7086,18 @@ def _pt_apply_dim_filter(df: pd.DataFrame, dim: str, sel: str) -> pd.DataFrame:
     if entry is None:
         return df
     col, raw = _PT_DIMS[dim]["col"], entry[1]
+    if _PT_DIMS[dim].get("multi"):
+        # Dimensão multi-valor: filtrar por um produto quer dizer "o deal INCLUI
+        # esse produto", não "o deal é exatamente esse produto" — quem pergunta
+        # "quanto de pipe tem Smart Trac" quer os combinados dentro também.
+        vals = _pt_multi_list(df[col])
+        if raw is _PT_MULTI:
+            mask = vals.map(len) > 1
+        elif raw is None:
+            mask = vals.map(len) == 0
+        else:
+            mask = vals.map(lambda xs: raw in xs)
+        return df[mask]
     if raw is None:                      # bucket "vazio no HubSpot"
         return df[df[col].isna() | (df[col].astype(str).str.strip() == "")]
     return df[df[col] == raw]
@@ -5363,24 +7107,48 @@ def _pt_series_key(df: pd.DataFrame, dim: str) -> pd.Series:
     """Coluna crua → chave curta da dimensão, com tudo que não mapeia caindo no
     bucket vazio. Garante que a soma dos segmentos == total da barra."""
     col = _PT_DIMS[dim]["col"]
-    lookup = {raw: k for k, raw, *_ in _PT_DIMS[dim]["values"] if raw is not None}
+    lookup = {raw: k for k, raw, *_ in _PT_DIMS[dim]["values"]
+              if raw is not None and raw is not _PT_MULTI}
+    if _PT_DIMS[dim].get("multi"):
+        # Aqui a semântica é a do EMPILHAMENTO, não a do filtro: cada deal cai em
+        # UM segmento, senão a soma das cores estouraria a altura da barra. Deal
+        # com 2+ produtos vai pro bucket Multiprodutos em vez de ser rateado —
+        # ratear exigiria dividir o amount, e o HubSpot não diz quanto do valor é
+        # de cada produto.
+        multi_key = next(k for k, raw, *_ in _PT_DIMS[dim]["values"]
+                         if raw is _PT_MULTI)
+
+        def _key(xs):
+            if not xs:
+                return _PT_DIM_NONE
+            if len(xs) > 1:
+                return multi_key
+            return lookup.get(xs[0], _PT_DIM_NONE)
+
+        return _pt_multi_list(df[col]).map(_key)
     return df[col].map(lookup).fillna(_PT_DIM_NONE)
 
 
 def _pt_filtered_frame(f: dict, force: bool = False):
     """Universo do Pipeline Total já filtrado: deals ABERTOS do Sales BR com
     roster aplicado + todos os cortes da página (região, líder, AE, close date,
-    deal type, source, forecast category).
+    deal type, source, product, forecast category).
+
+    O corte de close date tem DUAS partes independentes: a presença (`cdate`:
+    todos · com · sem) e a janela de datas da barra do topo. Ver o bloco marcado
+    lá embaixo pra por que uma desliga a outra.
 
     Compartilhado pelo gráfico e pelo drill-down DE PROPÓSITO: se cada um
     montasse seu próprio filtro, a lista explodida passaria a discordar da barra
     no primeiro ajuste — é o bug clássico de drill. Devolve (df, n_sem_close),
     onde n_sem_close = deals descartados por não ter close date quando há janela.
     """
-    df = bq.pipeline_total_raw(force_refresh=force)
+    df = bq.pipeline_total_raw(force_refresh=force, pipeline=_pl())
     df = _apply_roster_current(df)
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
-    df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    # Gestor FICA: aqui o eixo é o estágio do funil, não a pessoa, então o deal
+    # dele entra no total e na visão do líder sem virar barra de vendedor.
+    df = drop_departed_people(df)
 
     # Só funil aberto. amount nulo (363 deals) = 0, pra o deal continuar sendo
     # contado na quantidade sem inventar dinheiro que o HubSpot não tem.
@@ -5394,10 +7162,30 @@ def _pt_filtered_frame(f: dict, force: bool = False):
     if f.get("ae"):
         df = df[df["account_executive"] == f["ae"]]
 
-    # ---- Close date (opcional) ----
+    # ---- Close date: PRESENÇA (filtro da página) + JANELA (barra de datas) ----
+    #
+    # O filtro de presença vem primeiro porque ele decide se a janela faz sentido.
+    # "Sem close date" e janela de datas são mutuamente excludentes POR DEFINIÇÃO:
+    # deal sem data nunca cai num intervalo. Se as duas fossem aplicadas juntas o
+    # resultado seria sempre vazio, e a tela pareceria quebrada em vez de
+    # contraditória — então a janela é IGNORADA quando o usuário pede o bucket sem
+    # data, e a página diz que ignorou (`cdate_ignora_janela`). Metade do pipe
+    # aberto não tem close date preenchido no HubSpot, então esse bucket é grande
+    # demais pra só existir como "ficaram de fora" no subtítulo.
+    cdate = f.get("cdate", "")
+    if cdate in ("com", "sem"):
+        _cd = pd.to_datetime(df["close_date"], errors="coerce")
+        df = df[_cd.isna() if cdate == "sem" else _cd.notna()]
+
+    # Presença de Customer Owner (CS). id vazio/NaN = sem dono de conta.
+    cown = f.get("cown", "")
+    if cown in ("com", "sem"):
+        _co = df["customer_owner_id"].astype("string").str.strip().replace("", pd.NA)
+        df = df[_co.isna() if cown == "sem" else _co.notna()]
+
     lo, hi = _parse_filter_date(f.get("date_from")), _parse_filter_date(f.get("date_to"))
     n_sem_close = 0
-    if lo or hi:
+    if (lo or hi) and cdate != "sem":
         cd = pd.to_datetime(df["close_date"], errors="coerce")
         sem_close = cd.isna()
         n_sem_close = int(sem_close.sum())
@@ -5432,6 +7220,77 @@ def _pt_filtered_frame(f: dict, force: bool = False):
     return df, n_sem_close
 
 
+def _pt_combo_key(xs: list[str]) -> str:
+    """Combinação de produtos de um deal, com a ordem NORMALIZADA.
+
+    O HubSpot guarda o multi-select na ordem em que o vendedor clicou, então a
+    mesma combinação aparece gravada de formas diferentes: 'Smart Trac;TracOS'
+    (16 deals) e 'TracOS;Smart Trac' (1) são a MESMA coisa. Sem ordenar, o
+    detalhamento quebraria uma combinação em duas linhas e a maior delas
+    apareceria menor do que é — hoje são 26 strings cruas para 17 combinações
+    reais. `set` também remove produto repetido na mesma string."""
+    return " + ".join(sorted(set(xs)))
+
+
+def _pt_prod_breakdown(df: pd.DataFrame, total_amount: float):
+    """Abre a dimensão Product nas duas leituras que a barra empilhada não dá.
+
+    A barra é EXCLUSIVA (cada deal num segmento só), então ela responde "quanto
+    do pipe é só Smart Trac" e joga todo deal combinado num bucket Multiprodutos
+    opaco. Faltam duas perguntas, e são as que se faz de verdade:
+
+      `presence`  quanto de pipe TEM cada produto, sozinho ou acompanhado — é a
+                  mesma semântica do filtro Product do topo. As linhas somam
+                  MAIS que o total de propósito: um deal Smart Trac + TracOS
+                  conta nas duas, e é isso que se quer saber aqui.
+      `combos`    o que exatamente tem dentro de Multiprodutos: uma linha por
+                  combinação real, com ordem normalizada (ver `_pt_combo_key`).
+
+    Devolve ([], []) fora da dimensão Product ou com frame vazio."""
+    if not len(df):
+        return [], []
+    lists = _pt_multi_list(df["product"])
+    n = lists.map(len)
+
+    presence = []
+    for v in _pt_dim_meta("prod"):
+        raw = v["raw"]
+        if raw is None or raw is _PT_MULTI:   # buckets, não produtos
+            continue
+        has = lists.map(lambda xs, _r=raw: _r in xs)
+        if not has.any():
+            continue
+        alone, with_others = has & (n == 1), has & (n > 1)
+        amt = float(df.loc[has, "amount"].sum())
+        presence.append({
+            **v,
+            "deals": int(has.sum()), "amount": amt,
+            "share": (amt / total_amount) if total_amount else 0.0,
+            "deals_alone": int(alone.sum()),
+            "amount_alone": float(df.loc[alone, "amount"].sum()),
+            "deals_with": int(with_others.sum()),
+            "amount_with": float(df.loc[with_others, "amount"].sum()),
+        })
+    presence.sort(key=lambda r: r["amount"], reverse=True)
+
+    combos = []
+    multi = df[n > 1]
+    if len(multi):
+        keys = _pt_multi_list(multi["product"]).map(_pt_combo_key)
+        multi_amount = float(multi["amount"].sum())
+        for k, g in multi.groupby(keys, sort=False):
+            amt = float(g["amount"].sum())
+            combos.append({
+                "key": k, "label": k, "deals": int(len(g)), "amount": amt,
+                "n_prod": len(k.split(" + ")),
+                # % DO multiproduto, não do pipe: a pergunta aqui é a composição
+                # de dentro do bucket.
+                "share": (amt / multi_amount) if multi_amount else 0.0,
+            })
+        combos.sort(key=lambda r: r["amount"], reverse=True)
+    return presence, combos
+
+
 def _pt_stage_ids(df: pd.DataFrame) -> pd.Series:
     """stage_label cru → dealstage_id canônico. No Show tem id próprio; o que não
     resolve cai em '_outros' em vez de sumir da soma."""
@@ -5462,6 +7321,10 @@ _DRILL_PT_COLUMNS = [
     {"key": "weighted",  "label": "Ponderado", "type": "money"},
     {"key": "deal_type", "label": "Tipo"},
     {"key": "source",    "label": "Origem"},
+    # Product vem cru (com os ';' do multi-select) de propósito: no drill a
+    # pergunta é "que produto ESTE deal tem", e agrupar em "Multiprodutos" aqui
+    # esconderia justamente a resposta.
+    {"key": "product",   "label": "Product", "wrap": True},
     {"key": "close",     "label": "Close date"},
     {"key": "age",       "label": "Idade (d)",  "type": "int"},
 ]
@@ -5480,6 +7343,12 @@ def pipeline_total_deals():
     sid = (request.args.get("stage") or "").strip()
     by  = request.args.get("by", "")
     seg = (request.args.get("seg") or "").strip()
+    # Recortes do detalhamento de Product. Vêm em parâmetros PRÓPRIOS, e não
+    # reescrevendo o `prod` da página, porque são aplicados POR CIMA dos filtros
+    # (como `stage` e `seg`): sobrescrever `prod` faria a lista explodida ignorar
+    # o filtro do topo e discordar da tabela que foi clicada.
+    has   = (request.args.get("has") or "").strip()
+    combo = (request.args.get("combo") or "").strip()
 
     title_bits = []
     if len(df):
@@ -5487,10 +7356,30 @@ def pipeline_total_deals():
         if sid:
             df = df[df["_sid"] == sid]
             title_bits.append(_pt_stage_label(sid))
+        if has:
+            # "Inclui o produto X" — mesma semântica do filtro Product, então
+            # reusa a função dele em vez de reimplementar o casamento por token.
+            entry = next((v for v in _PT_DIMS["prod"]["values"] if v[0] == has), None)
+            if entry is not None:
+                df = _pt_apply_dim_filter(df, "prod", has)
+                title_bits.append(f"inclui {entry[2]}")
+        if combo:
+            keys = _pt_multi_list(df["product"]).map(_pt_combo_key)
+            df = df[keys == combo]
+            title_bits.append(combo)
         if by in _PT_DIMS and seg:
-            df = df[_pt_series_key(df, by) == seg]
-            lbl = next((v["label"] for v in _pt_dim_meta(by) if v["key"] == seg), seg)
-            title_bits.append(lbl)
+            # `seg` pode vir com VÁRIAS chaves separadas por vírgula: a legenda do
+            # gráfico deixa o usuário ligar/desligar segmentos em qualquer
+            # combinação, e o drill tem que explodir exatamente o que sobrou na
+            # tela — um único valor faria a lista discordar da barra clicada.
+            lbls = {v["key"]: v["label"] for v in _pt_dim_meta(by)}
+            # Chave desconhecida é descartada, não filtrada (mesma política de
+            # `_pt_apply_dim_filter`): URL editada à mão não pode virar lista
+            # vazia sem explicação.
+            keys = [k for k in (x.strip() for x in seg.split(",")) if k in lbls]
+            if keys:
+                df = df[_pt_series_key(df, by).isin(keys)]
+                title_bits.append(" + ".join(lbls[k] for k in keys))
 
     # Peso da forecast category por deal (mesma fonte da aba Forecast).
     pct_by_raw = {v["raw"]: v.get("pct") for v in _pt_dim_meta("fcat")}
@@ -5516,13 +7405,15 @@ def pipeline_total_deals():
                 "ae":        r["account_executive"],
                 "stage":     _pt_stage_label(r["_sid"]),
                 "amount":    amt,
-                # Rótulo já com o peso ("Commit · 100%") — evita o leitor ter que
-                # lembrar a tabela do modelo pra interpretar o Ponderado.
-                "fcat":      (fcat_label.get(raw, "—")
-                              + (f" · {int(pct*100)}%" if pct is not None else "")),
+                # O rótulo JÁ É o peso ("75%"), então nada é anexado — antes o
+                # nome vinha do HubSpot e o peso era colado atrás.
+                "fcat":      fcat_label.get(raw, "—"),
                 "weighted":  (amt * pct) if pct is not None else None,
                 "deal_type": dtype_label.get(r.get("deal_type"), r.get("deal_type") or "—"),
                 "source":    r.get("deal_source_agg") or "—",
+                "product":   (str(r.get("product")).replace(";", " · ")
+                              if r.get("product") and not pd.isna(r.get("product"))
+                              else "—"),
                 "close":     closed.strftime("%d/%m/%Y") if pd.notna(closed) else "—",
                 "age":       int((today - created.date()).days) if pd.notna(created) else 0,
             })
@@ -5553,14 +7444,17 @@ def leaders_pipeline_total():
 
 def _pipeline_total_page(grain="ae"):
     """Amount em pipeline por estágio do funil, cortável por deal type, source,
-    forecast category, líder, AE e close date.
+    product, forecast category, líder, AE e close date.
 
     Universo = deals ABERTOS (nem won nem lost) do Sales BR: a pergunta é "quanto
     dinheiro tem no meu funil hoje", então deal fechado não entra.
 
     Sobre o close date: é OPCIONAL aqui (ver PIPELINE_TOTAL_PATHS). Metade dos
     deals abertos não tem a data preenchida no HubSpot; a página conta quantos
-    ficaram de fora quando há janela, em vez de encolher o total sem explicar."""
+    ficaram de fora quando há janela, em vez de encolher o total sem explicar.
+    O filtro `cdate` (todos · com · sem) transforma esse bucket em recorte de
+    primeira classe — dá pra olhar SÓ os deals sem data, que é o que estava
+    invisível antes."""
     ctx = base_context()
     f = ctx["filters"]
     df, n_sem_close = _pt_filtered_frame(f, force=request.args.get("refresh") == "1")
@@ -5572,6 +7466,13 @@ def _pipeline_total_page(grain="ae"):
     segs = _pt_dim_meta(by) if by else []
     if by and len(df):
         df["_seg"] = _pt_series_key(df, by)
+        # Segmento sem NENHUM deal no recorte sai da legenda. Ele já não aparecia
+        # na tabela de composição (que pula n==0), e como chip virava um filtro
+        # que não filtra nada — visível agora que Product tem 10 valores e o
+        # recorte típico usa 8. Some da legenda, não da conta: o bucket vazio
+        # contribui 0 pra qualquer soma, então nada muda nos totais.
+        _live = set(df["_seg"].unique())
+        segs = [s for s in segs if s["key"] in _live]
 
     # ---- Agregação por estágio (ordem do funil, não alfabética) ----
     # Usa _FUNNEL_ORDER_MAP pra No Show cair entre Scheduled e Qualifying; deals
@@ -5590,6 +7491,12 @@ def _pipeline_total_page(grain="ae"):
             }
             if by:
                 row["segs"] = {s["key"]: float(g.loc[g["_seg"] == s["key"], "amount"].sum())
+                               for s in segs}
+                # Contagem por segmento junto do amount: a legenda recalcula os
+                # dois no cliente, e sem isso o "N deals" embaixo da barra
+                # continuaria mostrando o estágio inteiro depois de desligar
+                # segmentos — número contradizendo o R$ logo acima.
+                row["segn"] = {s["key"]: int((g["_seg"] == s["key"]).sum())
                                for s in segs}
             rows.append(row)
         rows.sort(key=lambda r: _FUNNEL_ORDER_MAP.get(r["sid"], 99))
@@ -5633,20 +7540,546 @@ def _pipeline_total_page(grain="ae"):
                 "zero_pct":         (zero_weight / total_amount) if total_amount else 0.0,
             }
 
+    # Detalhamento da dimensão Product: presença por produto e o que tem dentro
+    # do bucket Multiprodutos. Só na dimensão Product — nas outras cada deal já
+    # tem um valor único e não há nada pra abrir.
+    prod_presence, prod_combos = ([], [])
+    if by == "prod":
+        prod_presence, prod_combos = _pt_prod_breakdown(df, total_amount)
+
     # Filtros ativos, sem as chaves vazias — é a base das URLs do switcher de
     # empilhamento. Montado aqui (e não no template) porque url_for com valor ""
     # emite `?dtype=&source=` na URL, que suja o link e vira chip fantasma.
     keep = {k: v for k, v in f.items() if v and k != "role"}
 
+    # Chips de presença de close date. Montados aqui pelo mesmo motivo do `keep`:
+    # url_for com valor "" emitiria `?cdate=` e viraria chip fantasma.
+    _cd_base = {k: v for k, v in keep.items() if k != "cdate"}
+    if by:
+        _cd_base["by"] = by
+    cdate_urls = {
+        "":    url_for(request.endpoint, **_cd_base),
+        "com": url_for(request.endpoint, cdate="com", **_cd_base),
+        "sem": url_for(request.endpoint, cdate="sem", **_cd_base),
+    }
+    _co_base = {k: v for k, v in keep.items() if k != "cown"}
+    if by:
+        _co_base["by"] = by
+    cown_urls = {
+        "":    url_for(request.endpoint, **_co_base),
+        "com": url_for(request.endpoint, cown="com", **_co_base),
+        "sem": url_for(request.endpoint, cown="sem", **_co_base),
+    }
+    # A janela de datas foi descartada por incompatibilidade, não por bug.
+    cdate_ignora_janela = bool(f.get("cdate") == "sem"
+                               and (f.get("date_from") or f.get("date_to")))
+
     return render_template(
         "pipeline_total.html", ctx=ctx, grain=grain,
+        cdate=f.get("cdate", ""), cdate_urls=cdate_urls,
+        cown=f.get("cown", ""), cown_urls=cown_urls,
+        cdate_ignora_janela=cdate_ignora_janela,
         rows=rows, segs=segs, by=by, seg_totals=seg_totals,
         total_amount=total_amount, total_deals=total_deals, max_amount=max_amount,
         ticket=(total_amount / total_deals if total_deals else 0.0),
         n_sem_close=n_sem_close, keep=keep, weighted_total=weighted_total,
         weighted_cov=weighted_cov,
+        prod_presence=prod_presence, prod_combos=prod_combos,
         dims=[{"key": k, "label": v["label"], "opts": _pt_dim_meta(k)}
               for k, v in _PT_DIMS.items()],
+    )
+
+
+# ============================================================
+# Aba Legal — o jurídico entrou no deal? mudou ticket médio e conversão?
+# ============================================================
+# Rótulos dos estágios ABERTOS do pipeline de ticket do jurídico (stageOrder
+# 0..4). Signed(5)/concluded(6) e Lost(7) não entram aqui porque não são "onde a
+# minuta está", são desfecho — viram `legal_status` logo abaixo.
+_LEGAL_OPEN_STAGE = {
+    0: "Requested",
+    1: "Minuta / análise",
+    2: "Revisão interna",
+    3: "Revisão do cliente",
+    4: "Enviado p/ assinatura",
+}
+
+# Definição de "jurídico envolvido". São três porque os dois sinais medem coisas
+# diferentes e não se contêm: o TICKET é o processo formal (o jurídico foi
+# acionado), o E-MAIL é a interação nominal das três caixas do time. Existem 240
+# deals fechados que chegaram a Negociação+ com e-mail do jurídico e ZERO ticket
+# — jurídico acionado por fora do processo, que a definição por ticket não vê.
+_LEGAL_ENVS = {
+    "ticket": {"label": "Ticket do jurídico",
+               "hint": "deal com ticket associado nos pipelines Legal BR / Legal NA"},
+    "mail":   {"label": "Interação nominal",
+               "hint": "e-mail com Ana Meneguelli, Luiza Daudt ou juridico@ na conversa do deal"},
+    "any":    {"label": "Ticket ou interação",
+               "hint": "qualquer um dos dois sinais"},
+}
+
+# Coorte da comparação. O padrão NÃO é "todos os fechados" de propósito: o
+# jurídico só é acionado quando o contrato entra em cena, ou seja no fim do
+# funil. Comparar contra a base inteira mede a ORDEM DOS EVENTOS (quem chegou
+# perto de fechar aciona o jurídico) e não o efeito do jurídico — dá ~84% de
+# conversão contra ~6%, um número que ninguém deveria levar pra reunião. Restrito
+# a quem pisou em Negociação ou além, onde acionar o jurídico era uma escolha de
+# verdade, a diferença cai pra ~86% contra ~27%: menor, e defensável.
+_LEGAL_COHORTS = {
+    "neg": {"label": "Chegaram a Negociação+", "min_stage": 4,
+            "hint": "deals que pisaram em Negociação, Decision ou Procurement — "
+                    "onde acionar o jurídico era uma escolha real"},
+    "all": {"label": "Todos os fechados", "min_stage": 0,
+            "hint": "base inteira; inflada pelo viés de etapa (ver aviso)"},
+}
+
+# Default de cada corte. Existe como dado (e não repetido em literal) porque o
+# valor aparece em três lugares — resolução, montagem de URL e o `keep` da
+# página — e divergir num deles faz o chip aceso discordar do número na tela.
+_LEGAL_DEFAULTS = {"env": "ticket", "coh": "neg"}
+
+
+def _legal_env(v: str) -> str:
+    return v if v in _LEGAL_ENVS else _LEGAL_DEFAULTS["env"]
+
+
+def _legal_coh(v: str) -> str:
+    return v if v in _LEGAL_COHORTS else _LEGAL_DEFAULTS["coh"]
+
+
+def _legal_frame(f: dict, force: bool = False):
+    """Universo da aba Legal: deals FECHADOS do Sales BR (won ou lost), com o
+    estado do jurídico anexado e todos os cortes da página aplicados.
+
+    Só deal fechado entra porque a pergunta central é conversão, e conversão
+    exige desfecho: deal aberto não é "não convertido", é "ainda não sabemos" —
+    ele no denominador puxaria a taxa dos dois grupos pra baixo em proporções
+    diferentes (o pipe aberto se concentra em quem ainda não chamou o jurídico).
+
+    Compartilhado pelos painéis e pelo drill-down DE PROPÓSITO, pela mesma razão
+    de `_pt_filtered_frame`: dois filtros paralelos divergem no primeiro ajuste.
+
+    Devolve (df, mail_ok). `mail_ok=False` quando a query de e-mail falhou, pra
+    a página DIZER que o sinal nominal está indisponível — sem isso ela mostraria
+    "zero interação" como se fosse um fato observado, e não falta de dado.
+    """
+    df = bq.legal_deals_raw(force_refresh=force, pipeline=_pl())
+    df = _apply_roster_current(df)
+    df = df[df["leader"].isin(ALLOWED_LEADERS)]
+    df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+
+    # Só deals com desfecho. `amount` nulo → 0: o deal continua contando na
+    # conversão (é o que ele responde) sem inventar dinheiro que o HubSpot não
+    # tem. Por isso o ticket médio só olha WON e ignora amount 0 (ver abaixo).
+    df = df[df["dealstage"].isin(("closedwon", "closedlost"))].copy()
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["is_won"] = df["dealstage"].eq("closedwon")
+
+    # Sinal de e-mail. Best-effort: se a query cara falhar, a aba continua de pé
+    # com a definição por ticket em vez de devolver 500.
+    mail_ok = True
+    try:
+        m = bq.legal_mail_touch_raw(force_refresh=force, pipeline=_pl())
+    except Exception as e:  # noqa: BLE001 — sinal opcional, aba não depende dele
+        print(f"pepeuhacker · legal_mail_touch indisponível: {e}", flush=True)
+        m, mail_ok = None, False
+    _mail_cols = ["mail_ana", "mail_luiza", "mail_juridico"]
+    if m is not None and len(m):
+        df = df.merge(m[["deal_id"] + _mail_cols], on="deal_id", how="left")
+    # A coluna pode NÃO EXISTIR (query de e-mail fora do ar) ou existir com NaN
+    # (deal sem e-mail do jurídico, do LEFT JOIN). O `in df.columns` é o que
+    # separa os dois: `df.get(col)` num frame sem a coluna devolve None, e
+    # `pd.to_numeric(None)` devolve um float escalar — não uma Series — então o
+    # `.fillna()` seguinte estouraria AttributeError e derrubaria a aba
+    # justamente no cenário que o try/except acima existe pra sobreviver.
+    for c in _mail_cols:
+        df[c] = (pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                 if c in df.columns else 0)
+
+    if f.get("region"):
+        df = df[df["region"] == f["region"]]
+    if f.get("leader"):
+        df = df[df["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+
+    # Janela de datas = CLOSE DATE (é a data do desfecho que estamos medindo).
+    # Normalizada em datetime64 dos dois lados pelo motivo documentado em
+    # `_pt_filtered_frame`: `.dt.date` sobre coluna toda-NaT devolve
+    # datetime64 e comparar com date levanta TypeError — recorte de um AE só
+    # torna "coluna toda nula" alcançável.
+    lo, hi = _parse_filter_date(f.get("date_from")), _parse_filter_date(f.get("date_to"))
+    if lo or hi:
+        cd = pd.to_datetime(df["close_date"], errors="coerce").dt.normalize()
+        if lo:
+            df = df[cd >= pd.Timestamp(lo)]
+            cd = cd.loc[df.index]
+        if hi:
+            df = df[cd <= pd.Timestamp(hi)]
+
+    df = df.copy()
+
+    # ---- Os dois sinais de envolvimento, cada um na sua coluna ----
+    df["has_ticket"] = df["legal_tickets"].fillna(0).astype(int) > 0
+    df["has_mail"]   = df[_mail_cols].sum(axis=1) > 0
+
+    # ---- Toque nominal por pessoa: ticket OU e-mail ----
+    # Duas colunas por pessoa viram uma só aqui porque a pergunta do Pedro é
+    # "houve interação dela?", não "por qual canal". O canal continua visível na
+    # tabela por pessoa e nos badges do drill.
+    df["t_ana"]      = df["tk_ana"].fillna(False).astype(bool) | (df["mail_ana"] > 0)
+    df["t_luiza"]    = df["tk_luiza"].fillna(False).astype(bool) | (df["mail_luiza"] > 0)
+    df["t_juridico"] = df["mail_juridico"] > 0
+
+    # ---- Desfecho do jurídico ----
+    sig  = df["legal_signed"].fillna(0).astype(int) > 0
+    lost = df["legal_lost"].fillna(0).astype(int) > 0
+    andn = df["legal_open_order"].notna()
+    # Atribuído em ordem CRESCENTE de prioridade (cada .loc sobrescreve o
+    # anterior): assinado ganha de "em andamento", que ganha de perdido. Um deal
+    # com contrato assinado E outra minuta abandonada conta como assinado — o
+    # que interessa é se ALGUM contrato saiu.
+    df["legal_status"] = "Com ticket, estágio indefinido"
+    df.loc[~df["has_ticket"], "legal_status"] = "Sem ticket"
+    df.loc[df["has_ticket"] & lost, "legal_status"] = "Perdido no jurídico"
+    df.loc[df["has_ticket"] & andn, "legal_status"] = "Minuta em andamento"
+    df.loc[df["has_ticket"] & sig,  "legal_status"] = "Contrato assinado"
+    # String vazia (e não None) pro caso "não há minuta em andamento": `.map()`
+    # devolvendo None numa coluna float volta como NaN, e NaN é TRUTHY — o
+    # `if r.legal_stage_label` do drill passava e escrevia "Sem ticket · nan".
+    _ord = pd.to_numeric(df["legal_open_order"], errors="coerce")
+    df["legal_stage_label"] = [
+        _LEGAL_OPEN_STAGE.get(int(v), "") if pd.notna(v) else "" for v in _ord]
+
+    return df, mail_ok
+
+
+def _legal_env_mask(df, env: str):
+    """Máscara de 'jurídico envolvido' segundo a definição escolhida."""
+    if env == "mail":
+        return df["has_mail"]
+    if env == "any":
+        return df["has_ticket"] | df["has_mail"]
+    return df["has_ticket"]
+
+
+def _legal_cohort(df, coh: str):
+    """Recorta a coorte da comparação (ver `_LEGAL_COHORTS`)."""
+    return df[df["max_stage_num"] >= _LEGAL_COHORTS[coh]["min_stage"]]
+
+
+def _legal_stats(df) -> dict:
+    """Bloco de números de um grupo de deals fechados.
+
+    `ticket` = ticket médio dos deals GANHOS com valor > 0. Só won porque um deal
+    perdido não tem ticket (nunca virou receita), e valor > 0 porque 363 deals do
+    Sales BR têm amount vazio no HubSpot — contá-los como R$ 0 no denominador
+    afunda a média com dinheiro que existe mas não foi preenchido. `ticket_cov`
+    diz de quantos deals a média saiu, pra o número não ser lido como se
+    cobrisse os won todos."""
+    n = int(len(df))
+    won = df[df["is_won"]] if n else df
+    n_won = int(len(won))
+    priced = won[won["amount"] > 0] if n_won else won
+    return {
+        "deals":      n,
+        "won":        n_won,
+        "lost":       n - n_won,
+        "conv":       (n_won / n * 100) if n else None,
+        "mrr":        float(won["amount"].sum()) if n_won else 0.0,
+        "ticket":     (float(priced["amount"].mean()) if len(priced) else None),
+        "ticket_cov": int(len(priced)),
+    }
+
+
+def _legal_drill_args(keep: dict, grain: str, **extra) -> dict:
+    """Args do drill-down: filtros da página + o recorte clicado. Mantém a aba e
+    a lista explodida falando do mesmo conjunto."""
+    return {**keep, "grain": ("leader" if grain == "leader" else "ae"), **extra}
+
+
+_DRILL_LEGAL_COLUMNS = [
+    {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+    {"key": "outcome",   "label": "Desfecho"},
+    {"key": "amount",    "label": "Valor", "type": "money"},
+    {"key": "legal",     "label": "Jurídico"},
+    {"key": "who",       "label": "Interação"},
+    {"key": "tickets",   "label": "Tickets", "type": "int"},
+    {"key": "deal_type", "label": "Tipo"},
+    {"key": "stage_max", "label": "Etapa máx."},
+    {"key": "close",     "label": "Fechou em"},
+]
+
+
+@app.route("/pipeline/legal/deals")
+def pipeline_legal_deals():
+    """Drill-down da aba Legal. Recorta pelo que foi clicado por cima dos filtros
+    da página, sempre pelo mesmo `_legal_frame` dos painéis:
+      env/coh      — definição e coorte ativas na tela (vêm nos filtros)
+      side=com|sem — o lado do comparativo
+      cell=tk_ml|tk_only|ml_only|none — uma célula da matriz ticket × e-mail
+      who=ana|luiza|juridico — deals com interação daquela pessoa
+      status=<legal_status> — uma linha da tabela de desfecho no jurídico
+    """
+    f = get_filters()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    df, _ = _legal_frame(f, force=request.args.get("refresh") == "1")
+    env, coh = _legal_env(f.get("env", "")), _legal_coh(f.get("coh", ""))
+    df = _legal_cohort(df, coh)
+
+    # O rótulo do recorte é anexado sempre que o argumento é VÁLIDO, e não só
+    # quando sobrou linha: senão um recorte legítimo mas vazio abriria a modal
+    # com o título genérico "Deals fechados", que descreve o conjunto errado.
+    # O `len(df)` guarda apenas a filtragem, que num frame vazio não tem o que
+    # fazer.
+    bits = []
+    _CELLS = {"tk_ml": "Ticket + interação nominal", "tk_only": "Só ticket",
+              "ml_only": "Só interação nominal", "none": "Nenhum sinal"}
+
+    side = (request.args.get("side") or "").strip()
+    if side in ("com", "sem"):
+        bits.append(("Com" if side == "com" else "Sem") + " jurídico")
+        if len(df):
+            mask = _legal_env_mask(df, env)
+            df = df[mask if side == "com" else ~mask]
+
+    cell = (request.args.get("cell") or "").strip()
+    if cell in _CELLS:
+        bits.append(_CELLS[cell])
+        if len(df):
+            tk, ml = df["has_ticket"], df["has_mail"]
+            df = df[{"tk_ml": tk & ml, "tk_only": tk & ~ml,
+                     "ml_only": ~tk & ml, "none": ~tk & ~ml}[cell]]
+
+    who = (request.args.get("who") or "").strip()
+    if who in ("ana", "luiza", "juridico"):
+        bits.append(next(p["label"] for p in bq.LEGAL_PEOPLE if p["key"] == who))
+        if len(df):
+            df = df[df[f"t_{who}"]]
+
+    status = (request.args.get("status") or "").strip()
+    if status:
+        bits.append(status)
+        if len(df):
+            df = df[df["legal_status"] == status]
+
+    people = {p["key"]: p["label"] for p in bq.LEGAL_PEOPLE}
+    rows = []
+    if len(df):
+        df = df.sort_values("amount", ascending=False)
+        for r in df.itertuples(index=False):
+            # Canal explícito por pessoa: "Ana (ticket+e-mail)" responde de onde
+            # o sinal veio sem obrigar a abrir o HubSpot pra descobrir.
+            who_bits = []
+            for key, tk_flag, n_mail in (
+                    ("ana",      bool(r.tk_ana),   int(r.mail_ana)),
+                    ("luiza",    bool(r.tk_luiza), int(r.mail_luiza)),
+                    ("juridico", False,            int(r.mail_juridico))):
+                if not (tk_flag or n_mail):
+                    continue
+                ch = "+".join([c for c, on in (("ticket", tk_flag), ("e-mail", n_mail > 0)) if on])
+                who_bits.append(f"{people[key]} ({ch})")
+            legal = r.legal_status
+            if r.legal_stage_label:
+                legal += f" · {r.legal_stage_label}"
+            closed = pd.to_datetime(r.close_date, errors="coerce")
+            _st = _STAGE_BY_NUM.get(int(r.max_stage_num))
+            rows.append({
+                "deal_name": r.deal_name or "—",
+                "deal_url":  _hs_deal_url(r.deal_id),
+                "ae":        r.account_executive,
+                "outcome":   "Won" if r.is_won else "Lost",
+                "amount":    float(r.amount or 0),
+                "legal":     legal,
+                "who":       " · ".join(who_bits) or "—",
+                "tickets":   int(r.legal_tickets or 0),
+                "deal_type": r.deal_type or "—",
+                "stage_max": _st["label"] if _st else "—",
+                "close":     closed.strftime("%d/%m/%Y") if pd.notna(closed) else "—",
+            })
+
+    n_won = sum(1 for x in rows if x["outcome"] == "Won")
+    mrr_won = sum(x["amount"] for x in rows if x["outcome"] == "Won")
+    sub = f"{len(rows)} deal{'s' if len(rows) != 1 else ''} fechado{'s' if len(rows) != 1 else ''}"
+    if rows:
+        sub += (f" · {n_won} won ({n_won / len(rows) * 100:.1f}%)".replace(".", ",")
+                + f" · {fmt_money(mrr_won)} ganhos")
+    show_ae = "leader" if (grain == "leader" or not f.get("ae")) else "ae"
+    return jsonify({
+        "title": " · ".join(bits) or "Deals fechados",
+        "subtitle": sub,
+        "columns": _with_ae_col(_DRILL_LEGAL_COLUMNS, show_ae),
+        "rows": rows,
+    })
+
+
+@app.route("/pipeline/legal")
+def pipeline_legal():
+    return _pipeline_legal_page("ae")
+
+
+@app.route("/leaders/pipeline/legal")
+def leaders_pipeline_legal():
+    return _pipeline_legal_page("leader")
+
+
+def _tickets_parados_desde(force: bool = False) -> str:
+    """'dd/mm' do último ticket no BQ quando o sync está parado há mais de
+    `_EMAIL_CALL_STALE_DAYS` dias; '' quando está em dia ou não deu pra medir."""
+    try:
+        fr = bq.tickets_freshness(force_refresh=force)
+        until = pd.to_datetime(fr.iloc[0]["ticket_until"], errors="coerce", utc=True)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("tickets_freshness indisponível: %s", e)
+        return ""
+    if pd.isna(until):
+        return ""
+    dias = (pd.Timestamp.now(tz="UTC") - until).total_seconds() / 86400
+    return f"{until.tz_convert(BRT):%d/%m}" if dias > _EMAIL_CALL_STALE_DAYS else ""
+
+
+def _pipeline_legal_page(grain="ae"):
+    """Ticket médio e conversão dos deals COM o jurídico envolvido contra os SEM.
+
+    Universo = deals FECHADOS do Sales BR (ver `_legal_frame` pra por que só
+    fechados). Dois eixos de escolha na página, ambos com consequência grande no
+    número e por isso explícitos na tela em vez de escondidos no código:
+    a DEFINIÇÃO de envolvimento (`env`: ticket · interação nominal · qualquer um)
+    e a COORTE da comparação (`coh`: Negociação+ · todos), documentadas em
+    `_LEGAL_ENVS` e `_LEGAL_COHORTS`.
+
+    Quatro painéis, do mais agregado ao mais específico:
+      1. o comparativo com/sem (cards) + o delta
+      2. a matriz ticket × e-mail — os dois sinais são independentes e a célula
+         "só e-mail" é a descoberta que a visão por ticket não mostra
+      3. por pessoa (Ana · Luiza · juridico@), que é a sinalização nominal pedida
+      4. por desfecho no jurídico (assinado · em andamento · perdido)
+    """
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    df_all, mail_ok = _legal_frame(f, force=force)
+
+    env = _legal_env(f.get("env", ""))
+    # México: só o sinal por TICKET (pipeline Legal North America). A interação
+    # nominal procura o jurídico do Brasil (Ana, Luiza, juridico@) e lá dá zero
+    # por construção — o Pedro mandou desconsiderar (12/10/2026). Some a escolha
+    # e somem os dois painéis do sinal nominal, em vez de mostrar zeros.
+    nominal = not _is_mx()
+    if not nominal:
+        env = "ticket"
+    coh = _legal_coh(f.get("coh", ""))
+    df = _legal_cohort(df_all, coh)
+    # Quantos ficaram de fora pela coorte — sem isso o total da aba muda de
+    # tamanho ao trocar o chip e parece que o filtro de cima quebrou.
+    n_fora_coorte = int(len(df_all) - len(df))
+
+    mask = _legal_env_mask(df, env)
+    com, sem = _legal_stats(df[mask]), _legal_stats(df[~mask])
+    total = _legal_stats(df)
+
+    # Delta: conversão em PONTOS PERCENTUAIS (a diferença entre duas taxas não é
+    # uma taxa) e ticket médio em %, que é como se lê variação de preço.
+    delta = {
+        "conv_pp": ((com["conv"] - sem["conv"])
+                    if (com["conv"] is not None and sem["conv"] is not None) else None),
+        "ticket_pct": ((com["ticket"] / sem["ticket"] - 1) * 100
+                       if (com["ticket"] and sem["ticket"]) else None),
+    }
+
+    # ---- `keep`: filtros ativos sem as chaves vazias ----
+    # Montado aqui e não no template pelo mesmo motivo do Pipeline Total: url_for
+    # com valor "" emite `?dtype=&source=` e vira chip fantasma na barra.
+    keep = {k: v for k, v in f.items() if v and k != "role"}
+    _drill = _legal_drill_args(keep, grain)
+
+    def _url(**kw):
+        """URL da própria página trocando um dos chips. Remove a chave quando o
+        valor é o default, pra não sujar a URL com o estado que já é padrão."""
+        args = {k: v for k, v in keep.items() if k not in kw}
+        args.update({k: v for k, v in kw.items() if v})
+        return url_for(request.endpoint, **args)
+
+    # `_q` devolve a forma de QUERYSTRING de um corte: vazia quando é o default,
+    # pra trocar um chip não gravar o valor padrão do OUTRO na URL.
+    _q = lambda k, v: "" if v == _LEGAL_DEFAULTS[k] else v  # noqa: E731
+    envs = [{"key": k, "active": k == env, "url": _url(env=_q("env", k), coh=_q("coh", coh)), **v}
+            for k, v in _LEGAL_ENVS.items() if nominal or k == "ticket"]
+    cohs = [{"key": k, "active": k == coh, "url": _url(coh=_q("coh", k), env=_q("env", env)), **v}
+            for k, v in _LEGAL_COHORTS.items()]
+
+    # ---- Painel 2: matriz ticket × e-mail ----
+    # Os dois sinais cruzados, não somados: cada célula tem conversão e ticket
+    # próprios, e é aí que "só e-mail" (jurídico acionado por fora do processo)
+    # aparece como grupo com número em vez de virar ruído dentro de "sem ticket".
+    tk, ml = df["has_ticket"], df["has_mail"]
+    matrix = [
+        {"key": "tk_ml",   "label": "Ticket + interação nominal", "tone": "green",
+         "hint": "processo formal aberto e alguém do jurídico na conversa"},
+        {"key": "tk_only", "label": "Só ticket",                  "tone": "teal",
+         "hint": "ticket aberto, sem e-mail das três caixas na janela do deal"},
+        {"key": "ml_only", "label": "Só interação nominal",       "tone": "amber",
+         "hint": "jurídico na conversa sem ticket aberto — acionado por fora do processo"},
+        {"key": "none",    "label": "Nenhum sinal",               "tone": "slate",
+         "hint": "nem ticket nem e-mail do jurídico"},
+    ]
+    _sel = {"tk_ml": tk & ml, "tk_only": tk & ~ml, "ml_only": ~tk & ml, "none": ~tk & ~ml}
+    for row in matrix:
+        row.update(_legal_stats(df[_sel[row["key"]]]))
+        row["share"] = (row["deals"] / total["deals"]) if total["deals"] else 0.0
+        row["drill"] = url_for("pipeline_legal_deals", cell=row["key"], **_drill)
+
+    # ---- Painel 3: por pessoa ----
+    # Contra o TOTAL da coorte (e não entre si): os conjuntos se sobrepõem — o
+    # mesmo deal costuma ter Ana e juridico@ — então as linhas não somam, e
+    # apresentá-las como partes de um todo mentiria.
+    people = []
+    for p in bq.LEGAL_PEOPLE:
+        col = f"t_{p['key']}"
+        st = _legal_stats(df[df[col]])
+        st.update({
+            "key": p["key"], "label": p["label"], "email": p["email"],
+            # Canal onde a pessoa é observável. Luiza e juridico@ não movem
+            # estágio de ticket no HubSpot (0 toques nos 1.437 tickets do Legal),
+            # então pra elas o único sinal É o e-mail — dizer isso evita a
+            # leitura de que elas participaram menos.
+            "channels": ("ticket + e-mail" if p["user_id"] and df[f"tk_{p['key']}"].any()
+                         else "e-mail"),
+            "drill": url_for("pipeline_legal_deals", who=p["key"], **_drill),
+        })
+        people.append(st)
+
+    # ---- Painel 4: desfecho no jurídico ----
+    # Ordem fixa (não por volume) pra a leitura seguir o caminho da minuta:
+    # assinado → em andamento → perdido → sem ticket.
+    _ORDER = ["Contrato assinado", "Minuta em andamento", "Perdido no jurídico",
+              "Com ticket, estágio indefinido", "Sem ticket"]
+    status_rows = []
+    for s in _ORDER:
+        g = df[df["legal_status"] == s]
+        if not len(g):
+            continue
+        st = _legal_stats(g)
+        st.update({
+            "label": s,
+            "drill": url_for("pipeline_legal_deals", status=s, **_drill),
+            # Só faz sentido no bucket em andamento — nos outros o deal do
+            # jurídico já terminou e não há "onde parou".
+            "stages": (", ".join(sorted(g["legal_stage_label"].dropna().unique()))
+                       if s == "Minuta em andamento" else ""),
+        })
+        status_rows.append(st)
+
+    return render_template(
+        "pipeline_legal.html", ctx=ctx, grain=grain,
+        tickets_parados=_tickets_parados_desde(request.args.get("refresh") == "1"),
+        env=env, coh=coh, envs=envs, cohs=cohs, nominal=nominal,
+        com=com, sem=sem, total=total, delta=delta,
+        matrix=matrix, people=people, status_rows=status_rows,
+        mail_ok=mail_ok, n_fora_coorte=n_fora_coorte, keep=keep,
+        drill_total=url_for("pipeline_legal_deals", **_drill),
+        drill_com=url_for("pipeline_legal_deals", side="com", **_drill),
+        drill_sem=url_for("pipeline_legal_deals", side="sem", **_drill),
     )
 
 
@@ -5675,7 +8108,7 @@ def _pipeline_funnel_page(grain="ae"):
     t_curr_iso = f"{last_sun.isoformat()} 15:00:00 UTC"
     t_prev_iso = f"{prev_sun.isoformat()} 15:00:00 UTC"
 
-    df = bq.pipeline_wow_snapshot(t_curr_iso, t_prev_iso, force_refresh=force)
+    df = bq.pipeline_wow_snapshot(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl())
     df = _apply_roster_current(df)           # roster Q3 + remove quem saiu (BQ traz líder cru)
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
     df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
@@ -5683,12 +8116,14 @@ def _pipeline_funnel_page(grain="ae"):
         df = df[df["region"] == f["region"]]
     if f.get("leader"):
         df = df[df["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        df = df[df["account_executive"] == f["ae"]]
 
     # Movimentação por TRANSIÇÃO (histórico completo na janela, não diff de
     # snapshots): captura o caminho INTRA-semana — deal criado e movido de
     # Scheduled a Scoping na mesma semana conta em cada etapa por onde passou
     # (o diff de pontas perdia esses). Uma linha por mudança de stage.
-    tr = bq.funnel_transitions(t_curr_iso, t_prev_iso, force_refresh=force)
+    tr = bq.funnel_transitions(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl())
     tr = _apply_roster_current(tr)
     tr = tr[tr["leader"].isin(ALLOWED_LEADERS)]
     tr = tr[~tr["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
@@ -5696,6 +8131,8 @@ def _pipeline_funnel_page(grain="ae"):
         tr = tr[tr["region"] == f["region"]]
     if f.get("leader"):
         tr = tr[tr["leader"].isin(expand_leader(f["leader"]))]
+    if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+        tr = tr[tr["account_executive"] == f["ae"]]
     tr = tr.copy()
     tr["dir"] = tr.apply(lambda r: _funnel_dir(r["from_stage"], r["to_stage"]), axis=1)
 
@@ -6283,6 +8720,63 @@ _WOW_CAT_LABEL = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu",
 _WOW_NET_CATS = ("novo", "cresceu", "encolheu", "lost")
 
 
+def _wow_event_rows(ev):
+    """Linhas do drill a partir de eventos JÁ categorizados — uma linha por
+    EVENTO, não por deal: o mesmo deal aparece 2× se cresceu e depois avançou na
+    mesma semana, que é justamente o que o diff de pontas escondia.
+
+    Compartilhado entre o drill da PoP (par de domingos) e o do Histórico (uma
+    semana da série): os dois explodem o mesmo tipo de frame, e duas cópias
+    divergiriam na primeira mudança de coluna."""
+    def _lbl(sid):
+        return stage_display(sid) if sid else "—"
+
+    def _quando(ts):
+        """Timestamp do evento em BRT — as telas falam em "domingo 12h BRT",
+        então mostrar UTC aqui confundiria a leitura. UTC−3 fixo, a mesma
+        convenção que o resto do PoP já usa ao montar os snapshots como 15h UTC."""
+        try:
+            t = pd.Timestamp(ts)
+            if t.tzinfo is not None:
+                t = t.tz_convert(None)
+            return (t - timedelta(hours=3)).strftime("%d/%m %H:%M")
+        except (ValueError, TypeError, AttributeError):
+            return "—"
+
+    rows = []
+    for _, r in ev.iterrows():
+        if r["kind"] == "stage":
+            mov = f"{_lbl(r['stage_from'])} → {_lbl(r['stage_to'])}"
+            val = float(r["amount_at"])
+        else:
+            mov = f"{_lbl(r['stage_at'])} · valor alterado"
+            val = float(r["amt_to"])
+        rows.append({
+            "deal_name": r.get("deal_name") or "—",
+            "deal_url":  _hs_deal_url(r.get("deal_id")),
+            "ae":        r["account_executive"],
+            "categoria": _WOW_CAT_LABEL.get(r["category"], r["category"]),
+            "movimento": mov,
+            "quando":    _quando(r["ts"]),
+            "delta":     float(r["delta"]),
+            "amount":    val,
+        })
+    rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
+    return rows
+
+
+def _wow_drill_columns(grain, name):
+    """Colunas do drill de eventos PoP — idênticas na PoP e no Histórico."""
+    return _with_ae_col([
+        {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+        {"key": "categoria", "label": "Movimento"},
+        {"key": "movimento", "label": "Estágio (de → para)"},
+        {"key": "quando",    "label": "Quando", "align": "right"},
+        {"key": "delta",     "label": "Δ (R$)", "type": "money_signed"},
+        {"key": "amount",    "label": "Amount no evento", "type": "money"},
+    ], "leader" if (grain == "leader" or not name) else "ae")
+
+
 def _wow_snapshot_filtered():
     """Snapshot WoW dos 2 domingos comparados (padrão: os 2 últimos), com
     roster/allowed/hidden aplicados. Só as barras de ESTADO (prev/curr) usam
@@ -6290,10 +8784,10 @@ def _wow_snapshot_filtered():
     last_sun, prev_sun = _wow_window(get_filters())
     tc = f"{last_sun.isoformat()} 15:00:00 UTC"
     tp = f"{prev_sun.isoformat()} 15:00:00 UTC"
-    df = bq.pipeline_wow_snapshot(tc, tp)
+    df = bq.pipeline_wow_snapshot(tc, tp, pipeline=_pl())
     df = _apply_roster_current(df)
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
-    df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+    df = drop_departed_people(df)          # gestor fica (ver _render_pipeline_wow)
     return df
 
 
@@ -6304,11 +8798,13 @@ def _wow_events_filtered(force=False):
     last_sun, prev_sun = _wow_fixed_pair()
     tc = f"{last_sun.isoformat()} 15:00:00 UTC"
     tp = f"{prev_sun.isoformat()} 15:00:00 UTC"
-    ev = bq.wow_events(tc, tp, force_refresh=force)
+    ev = bq.wow_events(tc, tp, force_refresh=force, pipeline=_pl())
     ev = _apply_roster_current(ev)
     ev = ev[ev["leader"].isin(ALLOWED_LEADERS)]
-    ev = ev[~ev["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
-    return ev
+    ev = drop_departed_people(ev)          # gestor fica (ver _render_pipeline_wow)
+    # Deal Type também aqui: a lista explodida tem que ser o recorte da tela, e
+    # não o total — é o bug clássico de drill que discorda da barra clicada.
+    return _pt_apply_dim_filter(ev, "dtype", get_filters().get("dtype", ""))
 
 
 @app.route("/pipeline/wow/<focus>/deals")
@@ -6343,51 +8839,7 @@ def pipeline_wow_deals(focus):
     ev = _wow_events_categorize(ev, focus)
     ev = ev[ev["category"].isin(cats)]
 
-    def _lbl(sid):
-        if not sid:
-            return "—"
-        return stage_display(sid)
-
-    def _quando(ts):
-        """Timestamp do evento em BRT — a página fala em "domingo 12h BRT", então
-        mostrar UTC aqui confundiria a leitura. UTC−3 fixo, a mesma convenção que
-        o resto do WoW já usa ao montar os snapshots como 15:00 UTC."""
-        try:
-            t = pd.Timestamp(ts)
-            if t.tzinfo is not None:
-                t = t.tz_convert(None)
-            return (t - timedelta(hours=3)).strftime("%d/%m %H:%M")
-        except (ValueError, TypeError, AttributeError):
-            return "—"
-
-    # Uma linha por EVENTO (não por deal): o mesmo deal pode aparecer 2× se
-    # cresceu e depois avançou na mesma semana — é justamente o que o diff de
-    # pontas escondia.
-    rows = []
-    for _, r in ev.iterrows():
-        # `_c`, NÃO `cat`: reusar o nome sobrescrevia o `cat` do filtro (que vale
-        # "" quando o drill traz várias categorias) com a categoria da ÚLTIMA
-        # linha, e aí o título ganhava um sufixo aleatório ("· Novo") e o
-        # subtítulo caía no ramo de categoria única, somando tudo como se fosse
-        # uma só. Bug que já existia antes da migração.
-        _c = r["category"]
-        if r["kind"] == "stage":
-            mov = f"{_lbl(r['stage_from'])} → {_lbl(r['stage_to'])}"
-            val = float(r["amount_at"])
-        else:
-            mov = f"{_lbl(r['stage_at'])} · valor alterado"
-            val = float(r["amt_to"])
-        rows.append({
-            "deal_name": r.get("deal_name") or "—",
-            "deal_url":  _hs_deal_url(r.get("deal_id")),
-            "ae":        r["account_executive"],
-            "categoria": _WOW_CAT_LABEL.get(_c, _c),
-            "movimento": mov,
-            "quando":    _quando(r["ts"]),
-            "delta":     float(r["delta"]),
-            "amount":    val,
-        })
-    rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
+    rows = _wow_event_rows(ev)
     # Saldo = MESMA conta da página: só o que aumentou/diminuiu de pipe. A 5ª
     # categoria (won no Late, movido-pra-Late no Early) fica fora e aparece à
     # parte, senão o subtítulo divergia do card "Saldo do período".
@@ -6402,33 +8854,26 @@ def pipeline_wow_deals(focus):
     if len(rows) != n_deals:
         _d += f" · {len(rows)} movimentos"
     if cat == "won":
-        subtitle = (f"{_d} won · R$ {round(won):,}".replace(",", ".")) + " que saiu do pipe"
+        subtitle = f"{_d} won · {fmt_money(won)}" + " que saiu do pipe"
     elif cat == "late":
-        subtitle = (f"{_d} · R$ {round(won):,}".replace(",", ".")) + " movidos pra Late stage"
+        subtitle = f"{_d} · {fmt_money(won)}" + " movidos pra Late stage"
     elif cat:
         # uma categoria só (novo/cresceu/encolheu/lost) → soma dela, não "saldo"
         _v = sum(x["delta"] for x in rows)
         subtitle = (f"{_d} · "
-                    f"{'+' if _v >= 0 else '−'}R$ {abs(round(_v)):,}".replace(",", "."))
+                    f"{'+' if _v >= 0 else '−'}{fmt_money(abs(_v))}")
     else:
         subtitle = (f"{_d} · saldo "
-                    f"{'+' if net >= 0 else '−'}R$ {abs(round(net)):,}".replace(",", "."))
+                    f"{'+' if net >= 0 else '−'}{fmt_money(abs(net))}")
         if won:
             _w_lbl = "movido p/ Late" if focus == "early" else "won"
-            subtitle += f" · {_w_lbl} R$ {round(won):,}".replace(",", ".")
+            subtitle += f" · {_w_lbl} {fmt_money(won)}"
     _escopo = name or f"PoP {focus} — total"
     _sufixo = _WOW_CAT_LABEL.get(cat, "") if cat else ("" if len(cats) == 5 else "Saldo")
     return jsonify({
         "title": (f"{_escopo} · {_sufixo}" if _sufixo else _escopo),
         "subtitle": subtitle,
-        "columns": _with_ae_col([
-            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
-            {"key": "categoria", "label": "Movimento"},
-            {"key": "movimento", "label": "Estágio (de → para)"},
-            {"key": "quando",    "label": "Quando", "align": "right"},
-            {"key": "delta",     "label": "Δ (R$)", "type": "money_signed"},
-            {"key": "amount",    "label": "Amount no evento", "type": "money"},
-        ], "leader" if (grain == "leader" or not name) else "ae"),
+        "columns": _wow_drill_columns(grain, name),
         "rows": rows,
     })
 
@@ -6442,7 +8887,7 @@ def _funnel_moves_scope():
     grain = "leader" if request.args.get("grain") == "leader" else "ae"
     last_sun, prev_sun = _wow_window(get_filters())
     tr = bq.funnel_transitions(f"{last_sun.isoformat()} 15:00:00 UTC",
-                               f"{prev_sun.isoformat()} 15:00:00 UTC")
+                               f"{prev_sun.isoformat()} 15:00:00 UTC", pipeline=_pl())
     tr = _apply_roster_current(tr)
     tr = tr[tr["leader"].isin(ALLOWED_LEADERS)]
     tr = tr[~tr["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
@@ -6468,8 +8913,7 @@ def pipeline_funnel_moves():
 
     _carry = {k: v for k, v in request.args.items() if v and k != "money"}
     def _u(stage, direction):
-        return (url_for("pipeline_funnel_move_deals") + "?" +
-                urllib.parse.urlencode({**_carry, "stage": stage, "dir": direction}))
+        return url_for("pipeline_funnel_move_deals", **{**_carry, "stage": stage, "dir": direction})
 
     rows = []
     tot = {"entrou": 0, "avancou": 0, "lost": 0, "voltou": 0}
@@ -6662,21 +9106,29 @@ def _render_pipeline_wow(focus: str, grain="ae"):
     def _scope(x):
         x = _apply_roster_current(x)         # roster Q3 + remove quem saiu (BQ traz líder cru)
         x = x[x["leader"].isin(ALLOWED_LEADERS)]
-        x = x[~x["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
+        # Gestor FICA no frame: os cards, a ponte do rodapé e a visão por líder
+        # precisam enxergar o funil dele. Ele sai só do pivot por AE, abaixo.
+        x = drop_departed_people(x)
         if f.get("region"):
             x = x[x["region"] == f["region"]]
         if f.get("leader"):
             x = x[x["leader"].isin(expand_leader(f["leader"]))]
+        if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+            x = x[x["account_executive"] == f["ae"]]
+        # Deal Type recorta as DUAS fontes (snapshot e eventos) pelo mesmo
+        # `_scope`, senão as barras de estado e o movimento passariam a falar de
+        # universos diferentes e a ponte do rodapé não fecharia.
+        x = _pt_apply_dim_filter(x, "dtype", f.get("dtype", ""))
         return x
 
     # DUAS fontes, de propósito: o snapshot dos 2 domingos só responde "quanto
     # havia em cada ponta" (barras de ESTADO); todo o MOVIMENTO vem dos eventos
     # da janela, que enxergam o caminho intra-semana. Ver _wow_events_categorize.
-    df = _scope(bq.pipeline_wow_snapshot(t_curr_iso, t_prev_iso, force_refresh=force))
+    df = _scope(bq.pipeline_wow_snapshot(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl()))
     df["gp_prev"] = df["stage_prev"].apply(_hs_stage_group)
     df["gp_curr"] = df["stage_curr"].apply(_hs_stage_group)
     ev = _wow_events_categorize(
-        _scope(bq.wow_events(t_curr_iso, t_prev_iso, force_refresh=force)), focus)
+        _scope(bq.wow_events(t_curr_iso, t_prev_iso, force_refresh=force, pipeline=_pl())), focus)
 
     # 5ª categoria do relatório: no EARLY é o que AVANÇOU pra Late (o conceito de
     # won saiu da tela, a pedido); no LATE segue sendo won. O slot visual (cards,
@@ -6685,7 +9137,12 @@ def _render_pipeline_wow(focus: str, grain="ae"):
 
     # Per-AE (ou por líder, explodindo p/ ancestrais). Totais sempre do frame CRU
     # pra não duplicar diretor+gerente.
-    ev_ent = _explode_leaders(ev, f.get("leader")) if grain == "leader" else ev
+    # Aqui a saída é uma barra POR PESSOA, e gestor não é vendedor: ele sai do
+    # pivot. No grain de líder NÃO sai — `_explode_leaders` reescreve a linha dele
+    # pro próprio nome como líder, que é justamente onde a venda direta deve
+    # aparecer. Os cards e a ponte continuam vendo tudo (saem de `ev`, não daqui).
+    ev_ent = (_explode_leaders(ev, f.get("leader")) if grain == "leader"
+              else drop_non_ae_people(ev))
     relevant = ev_ent[ev_ent["category"].isin(_WOW_NET_CATS + (fifth,))]
     in_focus = df[(df["gp_prev"] == focus) | (df["gp_curr"] == focus)]
 
@@ -6770,6 +9227,1555 @@ def _render_pipeline_wow(focus: str, grain="ae"):
         fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
         y_max=y_max, grain=grain,
     )
+
+
+# ===========================================================================
+# Histórico PoP — a mesma mecânica das telas PoP Early/Late, porém em SÉRIE:
+# N semanas de movimento em vez de um único par de domingos.
+#
+# Duas fontes, como na PoP e pelo mesmo motivo de fundo (cada uma responde uma
+# pergunta diferente), mas aqui com um motivo A MAIS, medido:
+#   · MOVIMENTO  ← `wow_events`, bucketizado por semana. Enxerga o caminho
+#     intra-semana (deal criado na quarta e ganho na sexta).
+#   · NÍVEL      ← `bq.pipeline_level_series`, snapshot real de cada domingo.
+#     NÃO é a soma acumulada dos eventos: ela erra até 0,9% do pipe no Late por
+#     causa de amount apagado no HubSpot e de deals que entram e saem como won
+#     na mesma janela. A conta completa está no docstring da query.
+# ===========================================================================
+
+WOW_HIST_WEEK_OPTS = (8, 12, 26)
+WOW_HIST_WEEKS_DEFAULT = 12
+
+
+def _wow_hist_weeks() -> int:
+    """Nº de semanas da série, do chip da página (?weeks=). Valor fora da lista
+    cai no padrão — a janela vira cache key no BQ, então aceitar número livre da
+    URL seria criar uma entrada de cache nova a cada request."""
+    try:
+        w = int(request.args.get("weeks") or 0)
+    except (TypeError, ValueError):
+        w = 0
+    return w if w in WOW_HIST_WEEK_OPTS else WOW_HIST_WEEKS_DEFAULT
+
+
+WOW_HIST_QUARTER_KEY = "q"
+
+
+def _wow_hist_window(f):
+    """(nº de semanas, domingos) da série do Histórico PoP.
+
+    Dois modos: os chips numéricos, que são janelas MÓVEIS terminando no último
+    domingo, e o modo Quarter (`?weeks=q`), que ancora a série no início do
+    trimestre do filtro. O Quarter existe porque "quanto o pipe cresceu no
+    trimestre" não é respondível por janela móvel — 12 semanas atravessam a
+    virada e misturam dois quarters. Reaproveita `_fc_hist_sundays`, que já é o
+    calendário do Histórico do Forecast, pra as duas telas recortarem o
+    trimestre exatamente do mesmo jeito."""
+    if request.args.get("weeks") == WOW_HIST_QUARTER_KEY:
+        q0, q1 = _fc_hist_quarter(f)
+        suns = _fc_hist_sundays(q0, q1)
+        return max(0, len(suns) - 1), suns
+    w = _wow_hist_weeks()
+    return w, _wow_hist_sundays(w)
+
+
+def _wow_hist_focus() -> str:
+    return "late" if request.args.get("focus") == "late" else "early"
+
+
+def _wow_hist_sundays(weeks: int) -> list:
+    """Os `weeks`+1 domingos que delimitam a série — N janelas precisam de N+1
+    pontas. O índice 0 é a ÂNCORA (só nível inicial, nenhum movimento) e a
+    semana k é o intervalo (domingo[k−1], domingo[k]]."""
+    last_sun, _ = _last_two_sundays()
+    return [last_sun - timedelta(weeks=weeks - i) for i in range(weeks + 1)]
+
+
+def _wow_hist_frames(weeks: int, scope, force=False, suns=None):
+    """(eventos com `week_idx`, níveis com `week_idx`+`gp`, domingos) no recorte
+    da página. `scope` é o filtro de roster/allowlist/líder/região do caller."""
+    suns = suns or _wow_hist_sundays(weeks)
+    iso = [f"{s.isoformat()} 15:00:00 UTC" for s in suns]
+
+    ev = scope(bq.wow_events(iso[-1], iso[0], force_refresh=force, pipeline=_pl())).copy()
+    lv = scope(bq.pipeline_level_series(
+        iso, sorted(_HS_EARLY_STAGES | _HS_LATE_STAGES), force_refresh=force, pipeline=_pl())).copy()
+    lv["gp"] = lv["stage"].apply(_hs_stage_group)
+
+    # Semana de cada evento: teto da distância até a âncora, em blocos de 7 dias.
+    # TETO (e não piso) porque a janela é aberta embaixo e fechada em cima —
+    # (domingo[k−1], domingo[k]] — então um evento exatamente às 12h do domingo k
+    # pertence à semana k, não à k+1. O clip cobre só arredondamento de borda: o
+    # próprio SQL já corta em (t_prev, t_curr].
+    if len(ev):
+        ts = pd.to_datetime(ev["ts"], utc=True)
+        anchor = pd.Timestamp(suns[0], tz="UTC") + pd.Timedelta(hours=15)
+        dist = (ts - anchor) / pd.Timedelta(days=7)
+        ev["week_idx"] = dist.apply(
+            lambda x: max(1, min(weeks, int(x) + (0 if x == int(x) else 1))))
+    else:
+        ev["week_idx"] = pd.Series(dtype="int64")
+    return ev, lv, suns
+
+
+def _wow_hist_week_rows(ev, lv, focus, weeks, suns):
+    """Uma linha por semana: valor e nº de deals de cada categoria, saldo e o
+    nível do pipe no domingo que FECHA a semana.
+
+    Sempre do frame CRU de eventos — nunca do exploded por líder, que somaria
+    diretor + gerente e dobraria o total do time."""
+    fifth = "late" if focus == "early" else "won"
+    e = _wow_events_categorize(ev, focus)
+    lvf = lv[lv["gp"] == focus]
+    return _hist_week_rows(e, lvf, _WOW_NET_CATS, fifth, weeks, suns)
+
+
+def _hist_week_rows(e, lvf, net_cats, fifth, weeks, suns, level_col="amount"):
+    """Núcleo compartilhado pelo Histórico PoP e pelo Histórico do Forecast.
+
+    Recebe os eventos JÁ categorizados e o nível JÁ recortado no foco, porque as
+    duas telas decidem essas duas coisas de formas diferentes (PoP: grupo de
+    estágio; Forecast: estágio aberto + close date dentro do quarter) mas montam
+    a linha da semana do mesmo jeito. Uma 2ª cópia divergiria na primeira coluna
+    nova — o mesmo motivo que já fez `_wow_event_rows` ser compartilhado.
+
+    `level_col` é a coluna do NÍVEL: a PoP mede em amount cheio, o Histórico do
+    Forecast mede no amount PONDERADO pelo Modelo Analytics (`v_model`) — nível e
+    movimento têm que sair da mesma coluna, senão a ponte não fecha."""
+    cats = tuple(net_cats) + (fifth,)
+    rows = []
+    for k in range(1, weeks + 1):
+        wk = e[e["week_idx"] == k]
+        r = {"idx": k, "sunday": suns[k],
+             "label": _fmt_date_short(suns[k]),
+             "from_label": _fmt_date_short(suns[k - 1])}
+        for c in cats:
+            sub = wk[wk["category"] == c]
+            r[c] = float(sub["delta"].sum())
+            r["deals_" + c] = int(sub["deal_id"].nunique())
+        r["net"] = sum(r[c] for c in net_cats)
+        r["fifth"] = r[fifth]
+        r["deals_fifth"] = r["deals_" + fifth]
+        _lv = lvf[lvf["week_idx"] == k]
+        r["level"] = float(_lv[level_col].sum())
+        r["level_deals"] = int(len(_lv))
+        rows.append(r)
+    _lv0 = lvf[lvf["week_idx"] == 0]
+    return rows, float(_lv0[level_col].sum()), int(len(_lv0))
+
+
+def _wow_hist_bridge(ev, focus, level0, level_end):
+    """Ponte da JANELA INTEIRA: do nível inicial ao final, parcela por parcela.
+
+    Existe porque os dois números de destaque da tela parecem se contradizer —
+    "saldo acumulado +R$ 8,55M" ao lado de "o pipe subiu R$ 1,33M". Não é
+    contradição: o saldo só conta o que entrou/saiu DE VALOR no estágio, enquanto
+    won, avanço pro Late, transferência, volta de estágio e reabertura movem o
+    pipe sem passar pelo saldo. Sem a ponte, o leitor não tem como fechar a conta
+    e desconfia do número certo. É a mesma peça que a tela PoP já tem no rodapé.
+
+    Diferença importante em relação à ponte da PoP: lá ela fecha EXATO e uma
+    sobra é bug. Aqui NÃO: nível e movimento vêm de fontes distintas (snapshot vs
+    eventos), que divergem em centavos por causa de amount apagado no HubSpot e
+    de deals que entram e saem como won na mesma janela — o docstring de
+    `bq.pipeline_level_series` tem a medição. Por isso o resíduo é uma PARCELA
+    exibida, não um erro escondido: some quando é zero, aparece nomeado quando
+    não é."""
+    e = _wow_events_categorize(ev, focus)
+    fifth = "late" if focus == "early" else "won"
+    _cats = _WOW_NET_CATS + (fifth, "won", "transferiu", "regrediu", "reabriu")
+    tot = {c: float(e.loc[e["category"] == c, "delta"].sum()) for c in _cats}
+    tot["net"] = sum(tot[c] for c in _WOW_NET_CATS)
+    # Resíduo = o que o nível fez e os eventos não explicam. Sai da diferença
+    # total (não da soma das parcelas exibidas) pra capturar QUALQUER divergência,
+    # inclusive de categoria que nem apareça na ponte.
+    tot["residuo"] = (level_end - level0) - float(e["delta"].sum())
+    return tot
+
+
+def _wow_hist_people(ev, lv, focus, weeks, grain, leader_filter):
+    """Uma linha por PESSOA (AE ou líder) com o saldo de cada semana, o saldo
+    acumulado e o nível de pipe nas duas pontas da janela.
+
+    No grão de líder o frame é explodido por ancestral (`_explode_leaders`), de
+    modo que o diretor engloba o gerente — é a mesma convenção das outras telas,
+    e por isso a soma da coluna NÃO bate com o total do time (de propósito: o
+    total vem do frame cru)."""
+    e = _wow_events_categorize(ev, focus)
+    e = e[e["category"].isin(_WOW_NET_CATS)]
+    lvf = lv[lv["gp"] == focus]
+    return _hist_people(e, lvf, weeks, grain, leader_filter)
+
+
+def _hist_people(e, lvf, weeks, grain, leader_filter, level_col="amount",
+                 explode=None):
+    """Núcleo compartilhado do painel por pessoa (ver `_hist_week_rows`).
+    `level_col` segue a mesma regra de lá: PoP em amount cheio, Histórico do
+    Forecast no ponderado do Modelo Analytics. `explode` troca o
+    `_explode_leaders` (o PoP Histórico Q usa a hierarquia de cada trimestre)."""
+    if grain == "leader":
+        e = (explode or _explode_leaders)(e, leader_filter)
+        lvf = (explode or _explode_leaders)(lvf, leader_filter)
+    else:
+        # Painel por VENDEDOR: gestor não vira linha. Ele continua nos totais e
+        # nas séries do time, que saem dos frames crus — só não é listado como se
+        # fosse um AE. No grão de líder ele aparece, com o próprio nome.
+        e, lvf = drop_non_ae_people(e), drop_non_ae_people(lvf)
+
+    piv = (e.pivot_table(index="account_executive", columns="week_idx",
+                         values="delta", aggfunc="sum", fill_value=0.0)
+           if len(e) else pd.DataFrame())
+    lv_piv = (lvf.pivot_table(index="account_executive", columns="week_idx",
+                              values=level_col, aggfunc="sum", fill_value=0.0)
+              if len(lvf) else pd.DataFrame())
+
+    # Universo = quem teve movimento OU tem pipe em alguma ponta. Sem a 2ª
+    # metade, quem ficou a janela inteira parado sumia da comparação — e "não
+    # mexeu o pipe em 12 semanas" é exatamente o que a tela existe pra mostrar.
+    names = sorted(set(piv.index) | set(lv_piv.index))
+    out = []
+    for nm in names:
+        vals = [float(piv.loc[nm, k]) if (nm in piv.index and k in piv.columns) else 0.0
+                for k in range(1, weeks + 1)]
+        def _lv_at(k):
+            return (float(lv_piv.loc[nm, k])
+                    if (nm in lv_piv.index and k in lv_piv.columns) else 0.0)
+        out.append({
+            "name": nm, "short": short_name(nm), "weekly": vals,
+            "total": sum(vals),
+            "level_start": _lv_at(0), "level_end": _lv_at(weeks),
+            "pos_weeks": sum(1 for v in vals if v > 0),
+        })
+    out.sort(key=lambda r: r["total"], reverse=True)
+    return out
+
+
+_HIST_POS_SEGS = (("novo", "#15803d"), ("cresceu", "#86efac"))
+_HIST_NEG_SEGS = (("encolheu", "#fdba74"), ("lost", "#dc2626"))
+
+
+def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
+                     neg=_HIST_NEG_SEGS, net_cats=_WOW_NET_CATS):
+    """Geometria SVG do gráfico de movimento: uma coluna por semana, empilhada
+    dos dois lados da linha do zero (novo/cresceu acima, encolheu/lost abaixo),
+    com marcador de saldo. `drill_url(idx, cats)` monta a URL de cada segmento.
+
+    A escala é ASSINADA e compartilhada: o mesmo R$ tem a mesma altura acima e
+    abaixo do zero, senão uma semana de perdas pareceria menor que uma de ganhos
+    do mesmo tamanho.
+
+    `pos`/`neg` são os canais (chave, cor) de cada lado, na ordem do zero pra
+    fora; o PoP Histórico por quarter acrescenta os dois de close date."""
+    _TOP, _PLOT, _BOT = 26, 330, 86
+    _LEFT = 92
+    _STEP = 64 if weeks <= 13 else 40
+    _BW = round(_STEP * 0.58)
+
+    pos_max = max(sum(r[k] for k, _ in pos) for r in wk_rows) if wk_rows else 0.0
+    neg_max = max(-sum(r[k] for k, _ in neg) for r in wk_rows) if wk_rows else 0.0
+    if pos_max <= 0 and neg_max <= 0:
+        # Recorte sem movimento nenhum (filtro que não casa com ninguém, ou um
+        # time que não mexeu o Late na janela). Sem isto, pos_max/span = 0 grudava
+        # a linha do zero no TOPO do gráfico e a tela vazia era lida como "tudo
+        # negativo". Centralizado, o vazio parece o que é.
+        pos_max = neg_max = 0.5
+    span = (pos_max + neg_max) or 1.0
+    zero_y = _TOP + _PLOT * (pos_max / span)
+
+    def _y(v):
+        """R$ (assinado) → coordenada y."""
+        return zero_y - (v / span) * _PLOT
+
+    # Passo ÚNICO nos dois lados do zero (ver _nice_money_step): a mesma régua
+    # acima e abaixo é o que deixa comparar um ganho com uma perda de bater o
+    # olho. Cada lado recebe só os ticks que cabem nele, então o lado menor não
+    # fica com rótulos colados.
+    step_v = _nice_money_step(span)
+    yL = [{"label": "0", "y": round(zero_y, 1)}]
+    k = 1
+    while k * step_v <= pos_max:
+        yL.append({"label": fmt_brl(k * step_v), "y": round(_y(k * step_v), 1)})
+        k += 1
+    k = 1
+    while k * step_v <= neg_max:
+        yL.append({"label": "−" + fmt_brl(k * step_v), "y": round(_y(-k * step_v), 1)})
+        k += 1
+
+    cols = []
+    for i, r in enumerate(wk_rows):
+        cx = _LEFT + i * _STEP + _STEP / 2
+        segs, top_v, bot_v = [], 0.0, 0.0
+        # Empilha do zero pra fora, na ordem em que a legenda lista.
+        for key, cor in pos:
+            v = r[key]
+            if v <= 0:
+                continue
+            segs.append({"ch": key, "fill": cor,
+                         "x": round(cx - _BW / 2, 1), "w": _BW,
+                         "y": round(_y(top_v + v), 1),
+                         "h": round((v / span) * _PLOT, 1),
+                         "amt": fmt_brl(v), "deals": r["deals_" + key],
+                         "url": drill_url(r["idx"], key)})
+            top_v += v
+        for key, cor in neg:
+            v = -r[key]                        # guardados negativos
+            if v <= 0:
+                continue
+            segs.append({"ch": key, "fill": cor,
+                         "x": round(cx - _BW / 2, 1), "w": _BW,
+                         "y": round(_y(-bot_v), 1),
+                         "h": round((v / span) * _PLOT, 1),
+                         "amt": fmt_brl(v), "deals": r["deals_" + key],
+                         "url": drill_url(r["idx"], key)})
+            bot_v += v
+        cols.append({
+            "idx": r["idx"], "label": r["label"], "segs": segs,
+            "cx": round(cx, 1), "zx": round(_LEFT + i * _STEP, 1),
+            "net": r["net"], "net_label": fmt_brl(abs(r["net"])),
+            "net_y": round(_y(r["net"]), 1),
+            "top_y": round(_y(top_v), 1), "bot_y": round(_y(-bot_v), 1),
+            "url": drill_url(r["idx"], ",".join(net_cats)),
+        })
+    right_x = _LEFT + max(len(wk_rows), 1) * _STEP
+    return {"w": right_x + 30, "h": _TOP + _PLOT + _BOT, "left": _LEFT,
+            "right_x": right_x, "top": _TOP, "step": _STEP, "bw": _BW,
+            "zero_y": round(zero_y, 1), "plot_h": _PLOT,
+            "base_y": _TOP + _PLOT, "yL": yL, "cols": cols}
+
+
+def _build_hist_level(wk_rows, level0, sun0, breaks=None):
+    """Geometria da linha de NÍVEL do pipe. Eixo começa em 0 de propósito: numa
+    série de nível, cortar a base exagera a variação — 5% de oscilação vira um
+    tobogã se o eixo abre no mínimo da série.
+
+    `breaks` (PoP Histórico por quarter): viradas de trimestre, cada uma com a
+    semana `week` em que caiu, a fração `frac` da semana até ela, o nível que
+    SAIU (`out`, régua do trimestre que acabou) e o que ENTROU (`in`, régua do
+    novo). A linha é cortada ali — ligar os dois lados desenharia como
+    movimento o que é só troca de régua."""
+    _TOP, _PLOT, _BOT = 24, 200, 74
+    _LEFT = 92
+    _STEP = 64 if len(wk_rows) <= 13 else 40
+    base_y = _TOP + _PLOT
+    breaks = breaks or []
+    vals = [level0] + [r["level"] for r in wk_rows]
+    # Piso de R$ 1.000 (e não 1.0) no topo do eixo: num recorte sem pipe nenhum,
+    # 4 ticks entre 0 e R$ 1,08 saíam todos como "R$ 0"/"R$ 1" depois do
+    # arredondamento do fmt_brl — cinco rótulos repetidos sem informação.
+    top = max(vals + [b[k] for b in breaks for k in ("out", "in")] + [1000.0]) * 1.08
+    yL = [{"label": fmt_brl(top * k / 4), "y": round(base_y - k / 4 * _PLOT, 1)}
+          for k in range(5)]
+    pts, marks = [], []
+    for i, v in enumerate(vals):
+        cx = _LEFT + (i - 0.5) * _STEP + _STEP / 2   # âncora meia coluna à esquerda
+        cy = base_y - (v / top) * _PLOT
+        pts.append(f"{round(cx, 1)},{round(cy, 1)}")
+        marks.append({"cx": round(cx, 1), "cy": round(cy, 1),
+                      "label": fmt_brl(v),
+                      "date": _fmt_date_short(sun0 if i == 0 else wk_rows[i - 1]["sunday"]),
+                      # A âncora fica exatamente EM CIMA do eixo (x = left), então
+                      # o rótulo centrado invadia os números do eixo Y. Ancorado
+                      # pela esquerda, ele cresce pra dentro do gráfico.
+                      "anchor": "start" if i == 0 else "middle",
+                      "lx": round(cx + (5 if i == 0 else 0), 1),
+                      # Rótulos INTERCALADOS acima/abaixo do ponto. "R$ 4,05M"
+                      # ocupa ~50px e o passo é 64 (40 em 26 semanas), então numa
+                      # única faixa eles se sobrepõem. Intercalar preserva os N
+                      # números — esconder um a cada dois tiraria justamente a
+                      # semana que o leitor foi conferir.
+                      "ly": round(cy - 11 if i % 2 == 0 else cy + 18, 1),
+                      "is_anchor": i == 0})
+
+    # Com virada, a polyline vira trechos: até a virada no nível que saiu, e da
+    # virada em diante a partir do nível que entrou.
+    segs, brk, ini = [], [], 0
+    for b in sorted(breaks, key=lambda b: (b["week"], b["frac"])):
+        bx = round(_LEFT + (b["week"] - 1 + b["frac"]) * _STEP, 1)
+        y_out = round(base_y - (b["out"] / top) * _PLOT, 1)
+        y_in = round(base_y - (b["in"] / top) * _PLOT, 1)
+        segs.append(" ".join(pts[ini:b["week"]] + [f"{bx},{y_out}"]))
+        pts_in = f"{bx},{y_in}"
+        ini = b["week"]
+        brk.append({"x": bx, "y_out": y_out, "y_in": y_in, "label": b["label"],
+                    "in_label": fmt_brl(b["in"]), "out_label": fmt_brl(b["out"]),
+                    "start": pts_in})
+    tail = pts[ini:]
+    if brk:
+        tail = [brk[-1]["start"]] + tail
+        # Cada trecho do meio começa no "entrou" da virada anterior.
+        for j in range(1, len(segs)):
+            segs[j] = brk[j - 1]["start"] + " " + segs[j]
+    segs.append(" ".join(tail))
+    return {"w": _LEFT + len(wk_rows) * _STEP + 30, "h": _TOP + _PLOT + _BOT,
+            "left": _LEFT, "top": _TOP, "base_y": base_y, "step": _STEP,
+            "right_x": _LEFT + len(wk_rows) * _STEP,
+            "yL": yL, "pts": " ".join(pts), "marks": marks,
+            "segs": segs, "breaks": brk}
+
+
+def _build_hist_spark(people, weeks):
+    """Mini-gráficos por pessoa, todos na MESMA escala Y — é a escala comum que
+    torna a comparação honesta: normalizar cada um pelo próprio máximo faria a
+    semana de R$ 30 mil de um AE parecer igual à de R$ 900 mil de outro."""
+    _W, _H = 26, 70                       # por semana / altura útil
+    # Máximo REAL, não o topo robusto (_robust_top) que outros charts daqui usam:
+    # lá o outlier é clampado e o RÓTULO mostra o valor verdadeiro, mas aqui não
+    # há rótulo por barra — clampar seria esconder a semana excepcional que é
+    # justamente o que se quer enxergar na comparação. O número exato de cada
+    # semana está na matriz logo abaixo.
+    span = max([abs(v) for p in people for v in p["weekly"]] + [1.0])
+    out = []
+    for p in people:
+        bars = []
+        for i, v in enumerate(p["weekly"]):
+            h = abs(v) / span * (_H / 2)
+            bars.append({"x": round(i * _W + 2, 1), "w": _W - 4,
+                         "y": round(_H / 2 - (h if v > 0 else 0), 1),
+                         "h": round(max(h, 0.8), 1),
+                         "pos": v >= 0, "week": i + 1})
+        out.append({**p, "bars": bars})
+    return {"w": weeks * _W, "h": _H, "mid": _H / 2, "bw": _W, "rows": out,
+            "span": span, "span_label": fmt_brl(span)}
+
+
+def _render_wow_history(grain="ae"):
+    """Histórico PoP: N semanas de movimento do pipe Early ou Late, no total do
+    time e pessoa a pessoa."""
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    weeks, suns_win = _wow_hist_window(f)
+    focus = _wow_hist_focus()
+    # O drill precisa reconstruir a MESMA janela: no modo Quarter isso é a chave
+    # "q", não o número de semanas — passar o número faria o drill montar uma
+    # janela móvel do mesmo tamanho, ancorada no lugar errado.
+    weeks_arg = (WOW_HIST_QUARTER_KEY
+                 if request.args.get("weeks") == WOW_HIST_QUARTER_KEY else weeks)
+
+    def _scope(x):
+        x = _apply_roster_current(x)
+        x = x[x["leader"].isin(ALLOWED_LEADERS)]
+        x = drop_departed_people(x)          # gestor fica (ver _render_pipeline_wow)
+        if f.get("region"):
+            x = x[x["region"] == f["region"]]
+        if f.get("leader"):
+            x = x[x["leader"].isin(expand_leader(f["leader"]))]
+        if f.get("ae"):   # filtro de AE da barra (antes ignorado aqui)
+            x = x[x["account_executive"] == f["ae"]]
+        # Vale pros dois frames da série (eventos e níveis) — ver nota no PoP.
+        x = _pt_apply_dim_filter(x, "dtype", f.get("dtype", ""))
+        return x
+
+    ev, lv, suns = _wow_hist_frames(weeks, _scope, force=force, suns=suns_win)
+    wk_rows, level0, _ = _wow_hist_week_rows(ev, lv, focus, weeks, suns)
+    people = _wow_hist_people(ev, lv, focus, weeks, grain, f.get("leader"))
+    level_end = wk_rows[-1]["level"] if wk_rows else level0
+    bridge = _wow_hist_bridge(ev, focus, level0, level_end)
+
+    def _drill(idx, cats, name=""):
+        return url_for("pipeline_wow_history_deals", focus=focus, week=idx,
+                       weeks=weeks_arg, cat=cats, name=name, grain=grain,
+                       # O drill lê o Deal Type da PRÓPRIA URL; sem isto ele
+                       # explodia aquisição + expansão com a barra só de uma.
+                       dtype=(f.get("dtype") or None),
+                       leader=(f.get("leader") if not name else None),
+                       region=(f.get("region") if not name else None))
+
+    fifth = "late" if focus == "early" else "won"
+    # Chips de navegação da própria página (foco e nº de semanas). Preservam o
+    # resto da querystring pra não zerar Líder/AE/moeda ao trocar de aba.
+    def _chip_url(**kw):
+        args = {k: v for k, v in request.args.items() if k not in kw and v}
+        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+
+    return render_template(
+        "pipeline_wow_history.html", ctx=ctx,
+        focus=focus, grain=grain, weeks=weeks,
+        focus_label=("Early · " + _STAGE_BY_ID["93878633"]["name"] if focus == "early"
+                     else "Late · Negotiation / Decision / Procurement"),
+        fifth_cat=fifth, fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
+        wk_rows=wk_rows, people=people,
+        level0=level0, level_end=level_end, bridge=bridge,
+        first_label=_fmt_date_short(suns[0]), last_label=_fmt_date_short(suns[-1]),
+        bars=_build_hist_bars(wk_rows, weeks, _drill),
+        lvl=_build_hist_level(wk_rows, level0, suns[0]),
+        spark=_build_hist_spark(people, weeks),
+        total_net=sum(r["net"] for r in wk_rows),
+        total_fifth=sum(r["fifth"] for r in wk_rows),
+        best=(max(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        worst=(min(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        week_opts=([(w, f"{w} sem") for w in WOW_HIST_WEEK_OPTS]
+                   + [(WOW_HIST_QUARTER_KEY, "Quarter")]),
+        week_sel=(WOW_HIST_QUARTER_KEY
+                  if request.args.get("weeks") == WOW_HIST_QUARTER_KEY else weeks),
+        chip_url=_chip_url, drill=_drill,
+    )
+
+
+@app.route("/pipeline/wow/history")
+def pipeline_wow_history():
+    return _render_wow_history("ae")
+
+
+@app.route("/leaders/pipeline/wow/history")
+def leaders_pipeline_wow_history():
+    return _render_wow_history("leader")
+
+
+@app.route("/pipeline/wow/history/deals")
+def pipeline_wow_history_deals():
+    """Drill de UMA semana da série. Mesma explosão da PoP (uma linha por
+    evento), recortada pela semana clicada — o `week` vem do gráfico e a janela
+    é reconstruída aqui a partir de (weeks, week), não da URL, pra não existir
+    par de datas na querystring que possa divergir do que foi clicado."""
+    focus = "late" if request.args.get("focus") == "late" else "early"
+    weeks, suns_win = _wow_hist_window(get_filters())
+    try:
+        wk = int(request.args.get("week") or 0)
+    except (TypeError, ValueError):
+        wk = 0
+    if not 1 <= wk <= weeks:
+        return jsonify(_empty_drill(""))
+
+    name = (request.args.get("name") or "").strip()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
+        return jsonify(_empty_drill(name))
+
+    _all = list(_WOW_NET_CATS) + ["late" if focus == "early" else "won"]
+    _pedido = (request.args.get("cat") or "").strip()
+    if _pedido:
+        pedidas = [c.strip().lower() for c in _pedido.split(",")]
+        cats = [c for c in _all if c in pedidas]
+    else:
+        cats = list(_all)
+
+    def _scope(x):
+        x = _apply_roster_current(x)
+        x = x[x["leader"].isin(ALLOWED_LEADERS)]
+        x = drop_departed_people(x)
+        # Mesmo recorte da série clicada (ver nota no _scope da página).
+        return _pt_apply_dim_filter(x, "dtype", get_filters().get("dtype", ""))
+
+    ev, _lv, suns = _wow_hist_frames(weeks, _scope, suns=suns_win)
+    ev = ev[ev["week_idx"] == wk]
+    ev = _entity_filter(ev, name, grain,
+                        request.args.get("leader"), request.args.get("region"))
+    ev = _wow_events_categorize(ev, focus)
+    ev = ev[ev["category"].isin(cats)]
+    rows = _wow_event_rows(ev)
+
+    _janela = f"{_fmt_date_short(suns[wk - 1])} → {_fmt_date_short(suns[wk])}"
+    n_deals = int(ev["deal_id"].nunique())
+    _d = f"{n_deals} deal{'s' if n_deals != 1 else ''}"
+    if len(rows) != n_deals:
+        _d += f" · {len(rows)} movimentos"
+    _v = sum(x["delta"] for x in rows)
+    _sinal = "+" if _v >= 0 else "−"
+    # `fmt_money` respeita o filtro mestre de moeda (e o MX, que é sempre ARR
+    # US$). O R$ fixo daqui era o último lugar que escrevia "R$" numa tela do
+    # México — a barra dizia US$ e o drill dela dizia R$.
+    _valor = f"{_sinal}{fmt_money(abs(_v))}"
+    cat = cats[0] if len(cats) == 1 else ""
+    subtitle = (f"{_janela} · {_d} · "
+                + (_valor if cat else f"saldo {_valor}"))
+    _escopo = name or f"PoP {focus} — total"
+    _sufixo = _WOW_CAT_LABEL.get(cat, "") if cat else "Saldo"
+    return jsonify({
+        "title": f"{_escopo} · {_sufixo} · semana {wk}",
+        "subtitle": subtitle,
+        "columns": _wow_drill_columns(grain, name),
+        "rows": rows,
+    })
+
+
+# ===========================================================================
+# PoP Histórico por QUARTER (só Sales Leaders) — o Histórico PoP com o pipe de
+# cada semana restrito ao TRIMESTRE VIGENTE: deal no grupo de estágio (Early ou
+# Late) E com close date dentro do trimestre daquela semana. Pedido do Pedro
+# (13/10/2026): "o pipeline de Q3 tem que ter close date para 30/09, e todo
+# trimestre da mesma forma". Trimestre = calendário normal (a extensão de
+# fechamento do Q3 até 02/10 vale só pra receita realizada).
+#
+# Por que não reaproveita as fontes do Histórico PoP: `wow_events` e
+# `pipeline_level_series` saem de `hubspot_deals_history`, que não versiona
+# close date. Quem versiona são as cópias diárias do BI
+# (`bq.pipeline_asof_changes`), gravadas às ~17h16 BRT.
+#
+# Movimento = diferença entre cópias CONSECUTIVAS, dia a dia — não domingo
+# contra domingo: o deal que entra no Late na terça e é ganho na sexta aparece
+# nas duas pontas do caminho, como no PoP. Nível e movimento saem da MESMA
+# grade, então a ponte fecha em zero por construção (sem o resíduo do PoP).
+#
+# Duas categorias novas, que o pipe por trimestre cria e o PoP não tem:
+#   puxou       o close date ENTROU no trimestre (deal já estava no estágio);
+#   escorregou  o close date SAIU do trimestre (ou foi apagado).
+# As duas entram no saldo: pro pipe do trimestre, escorregar é perda de verdade.
+#
+# Virada de trimestre: no 1º dia do trimestre novo o pipe troca de régua — sai
+# o que sobrou do trimestre que acabou e entra o que tem close date no novo.
+# Não é movimento de ninguém, então fica FORA do saldo e das barras: aparece na
+# ponte e como corte na linha de nível. Por isso o modo trimestre ancora na
+# VÉSPERA do início (30/09 pro Q4): o ponto de partida já é o pipe do Q4.
+#
+# O histórico é atribuído ao dono ATUAL do deal (o da cópia mais recente), a
+# mesma convenção do PoP Histórico — sem isso, troca de AE entre times virava
+# saída de um e entrada de outro.
+# ===========================================================================
+
+WQ_N_QUARTERS = 4      # chips de trimestre: os mais recentes que têm abertura
+# Chip de ano fiscal (pedido do Pedro, 20/10/2026): o FY inteiro numa série só,
+# trocando de régua a cada trimestre. Mesmas datas do preset "FY26" do filtro de
+# período. O FY não pode começar antes das cópias diárias do BI (23/03/2026).
+WQ_FISCAL_YEARS = {"FY26": (date(2026, 4, 1), date(2027, 1, 31))}
+
+# Canais do gráfico, do zero pra fora. Os de close date ficam na ponta, pra a
+# leitura do PoP original (novo/cresceu acima, encolheu/lost abaixo) continuar
+# no mesmo lugar.
+_WQ_POS = (("novo", "#15803d"), ("cresceu", "#86efac"), ("puxou", "#0284c7"))
+_WQ_NEG = (("encolheu", "#fdba74"), ("lost", "#dc2626"), ("escorregou", "#7c3aed"))
+_WQ_NET_CATS = tuple(k for k, _ in _WQ_POS + _WQ_NEG)
+_WQ_CAT_LABEL = {**_WOW_CAT_LABEL,
+                 "puxou": "Puxado pro trimestre",
+                 "escorregou": "Escorregou do trimestre",
+                 "saiu": "Saiu do funil",
+                 "virada_saiu": "Virada · ficou no trimestre anterior",
+                 "virada_entrou": "Virada · close date no trimestre novo"}
+_WQ_AUS = "__ausente__"        # deal fora da cópia do dia (apagado, outro funil, sem AE)
+_WQ_EV_COLS = ["deal_id", "week_idx", "step", "dia", "dia_ant", "q_escopo", "delta", "category",
+               "stage_from", "stage_to", "cd_from", "cd_to", "amt_from", "amt_to",
+               "deal_name", "account_executive", "leader", "region", "deal_type"]
+
+
+def _wq_quarter_key(q0: date) -> str:
+    return f"{q0.year}Q{(q0.month - 1) // 3 + 1}"
+
+
+def _wq_quarter_opts(disp: list) -> list:
+    """Trimestres que dá pra mostrar inteiros: precisam da cópia da VÉSPERA do
+    início, que é a abertura. As cópias diárias começam em 23/03/2026, então o
+    Q1/26 não entra."""
+    if not disp:
+        return []
+    out, q = [], _quarter_start_of(_today())
+    while len(out) < WQ_N_QUARTERS and q - timedelta(days=1) >= disp[0]:
+        out.append(q)
+        q = _prev_quarter(q)
+    return sorted(out)
+
+
+def _wq_window(force=False):
+    """(alvos, pontas, dias, sel, trimestres) da série.
+
+    `alvos` são as datas que a tela promete — domingos; no modo trimestre, a
+    véspera do início e, se o trimestre já acabou, o último dia dele. `pontas`
+    são as cópias que de fato as representam: a do próprio dia, ou a última
+    cópia SAUDÁVEL antes dele quando a do dia falta ou veio quebrada (ver
+    `_fcd_bi_saudaveis`). `dias` são todas as cópias saudáveis entre a 1ª e a
+    última ponta — é entre elas, de uma pra seguinte, que o movimento é medido."""
+    disp_df = bq.forecast_asof_snapshots(force_refresh=force)
+    disp = (sorted(datetime.strptime(str(x), "%Y%m%d").date() for x in disp_df["sufixo"])
+            if len(disp_df) else [])
+    qopts = _wq_quarter_opts(disp)
+    sel = (request.args.get("weeks") or "").strip()
+    last_sun, _ = _last_two_sundays()
+    # Domingo à tarde a cópia do dia só sai às ~17h16: até lá a série fecha no
+    # domingo anterior, em vez de prometer um ponto que não existe.
+    end_sun = max((d for d in disp if d.weekday() == 6 and d <= last_sun), default=None)
+    if end_sun is None:
+        return [], [], [], sel, qopts
+
+    q0 = next((q for q in qopts if _wq_quarter_key(q) == sel), None)
+    q1 = _quarter_end_of(q0) if q0 else None
+    if not q0 and sel in WQ_FISCAL_YEARS and WQ_FISCAL_YEARS[sel][0] - timedelta(days=1) >= disp[0]:
+        # FY: mesma mecânica do trimestre (véspera do início → domingos → último
+        # dia, se já acabou), com as viradas de trimestre no meio da série.
+        q0, q1 = WQ_FISCAL_YEARS[sel]
+    if q0:
+        alvos = [q0 - timedelta(days=1)]
+        s = q0 + timedelta(days=(6 - q0.weekday()) % 7)
+        while s <= min(q1, end_sun):
+            alvos.append(s)
+            s += timedelta(days=7)
+        # Trimestre encerrado fecha no último dia dele, não no último domingo:
+        # os dias finais são justamente os de mais won.
+        if q1 < _today() and q1 <= disp[-1] and alvos[-1] != q1:
+            alvos.append(q1)
+    else:
+        try:
+            w = int(sel)
+        except ValueError:
+            w = 0
+        if w not in WOW_HIST_WEEK_OPTS:
+            w = WOW_HIST_WEEKS_DEFAULT
+        sel = str(w)
+        alvos = [end_sun - timedelta(weeks=w - i) for i in range(w + 1)]
+
+    cands = [d for d in disp if alvos[0] - timedelta(days=7) <= d <= alvos[-1]]
+    sane = _wq_saudaveis(cands, force=force)
+    pares = []
+    for t in alvos:
+        p = max((d for d in sane if d <= t), default=None)
+        if p is None or (pares and p <= pares[-1][1]):
+            continue
+        pares.append((t, p))
+    alvos, pontas = [t for t, _ in pares], [p for _, p in pares]
+    dias = [d for d in sane if pontas and pontas[0] <= d <= pontas[-1]]
+    return alvos, pontas, dias, sel, qopts
+
+
+def _wq_explode(df, leader_filter):
+    """`_explode_leaders` com a hierarquia do trimestre de cada linha
+    (`q_escopo`): no Q2/26 a linha do Leonardo inclui o time do Gustavo."""
+    if not len(df):
+        return df
+    qs = list(pd.unique(df["q_escopo"]))
+    if leader_filter:
+        scope = set().union(*(_expand_leader_em(leader_filter, q) for q in qs))
+    else:
+        scope = set(LEADER_ORDER) - {"Pedro Mendes"}
+    parts = []
+    for L in [x for x in LEADER_ORDER if x != "Pedro Mendes" and x in scope]:
+        times = {q: _expand_leader_em(L, q) for q in qs}
+        m = [ld in times[q] for ld, q in zip(df["leader"], df["q_escopo"])]
+        part = df[m].copy()
+        if len(part):
+            part["account_executive"] = L
+            parts.append(part)
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0]
+
+
+def _wq_saudaveis(dias: list, force=False) -> list:
+    """As cópias de `dias` que não vieram quebradas (ver `bq.forecast_asof_ae_counts`).
+
+    Régua LOCAL — a mediana das cópias a até 7 dias — e não a da janela inteira
+    como em `_fcd_bi_saudaveis`, que é de 14 dias: em 26 semanas a base de deals
+    com AE cresce ~26% (15,4 mil em abril → 19,5 mil em outubro/2026), e a
+    mediana global marcava como quebradas as cópias de 05 a 16/04, que estavam
+    inteiras. A de 01/10/2026 (sem AE) e a de 02/10 (−26%) continuam caindo.
+    Se a checagem falhar, segue sem ela."""
+    sufs = [d.strftime("%Y%m%d") for d in dias]
+    try:
+        cnt = bq.forecast_asof_ae_counts(sorted(sufs), pipeline=_pl(), force_refresh=force)
+    except Exception as e:  # noqa: BLE001 — sanidade é best-effort
+        print(f"pepeuhacker · checagem das cópias do BI falhou ({e})", flush=True)
+        return list(dias)
+    n = dict(zip(cnt["sufixo"].astype(str), cnt["n_ae"].astype(float))) if len(cnt) else {}
+    if not n:
+        return list(dias)
+    out = []
+    for d, sfx in zip(dias, sufs):
+        viz = [n.get(o.strftime("%Y%m%d"), 0.0) for o in dias if abs((o - d).days) <= 7]
+        ref = float(pd.Series(viz).median()) if viz else 0.0
+        if n.get(sfx, 0.0) >= _FCD_BI_MIN_FRAC * ref:
+            out.append(d)
+    return out
+
+
+def _wq_scope(f, entity=True):
+    """Roster/allowlist/Deal Type — e, na página, líder/região. O drill recebe
+    líder/região pela URL e filtra depois, como no PoP.
+
+    `cut_from` = início do trimestre que está sendo medido: quem saiu da empresa
+    em DEPARTED_FROM continua inteiro nos trimestres ANTERIORES ao corte dele.
+    Sem isso os 6 AEs que saíram em 01/10/2026 sumiam também das semanas do Q3,
+    quando ainda eram do time (R$ 170–410 mil de pipe Late por domingo) — e a
+    quota do Q3, que conta com eles, ficava contra um pipe sem eles."""
+    def _scope(x, cut_from=None):
+        x = _apply_roster_current(x, cut_from=cut_from)
+        if cut_from is not None and "leader" in x.columns:
+            # Líder do AE NO TRIMESTRE MEDIDO — a mesma régua do realizado
+            # (`_attr_deal_leader`) e da meta. No Q3/Q4 é o roster (igual ao de
+            # hoje); no Q2 os times eram outros (Caio e Lucas com o Gustavo, o
+            # Arthur era AE dele), e o pipe com líder filtrado contava o time de
+            # hoje contra a meta do time de então.
+            q = _quarter_start_of(cut_from)
+            lq = {a: ld for (a, qq), ld in _period_leader_map().items() if qq == q and ld}
+            lq.update({a: v["leader"] for a, v in _roster_of(q).items() if a not in lq})
+            # Gestor continua dono do próprio deal (venda direta do time dele).
+            lq = {a: ld for a, ld in lq.items() if a not in NON_AE_USERS}
+            # Quem saiu e nunca teve linha na curada (Gabriel Faria e Rayssa
+            # Holanda, Q3/26) só aparece no roster — por isso o roster entra
+            # junto: sem líder, o deal caía no filtro de ALLOWED_LEADERS.
+            tem = x["account_executive"].isin(lq)
+            if tem.any():
+                x = x.copy()
+                x.loc[tem, "leader"] = x.loc[tem, "account_executive"].map(lq)
+                if "region" in x.columns:
+                    x.loc[tem, "region"] = x.loc[tem, "region"].fillna(_roster_region())
+        x = x[x["leader"].isin(ALLOWED_LEADERS)]
+        x = drop_departed_people(x)          # gestor fica (ver _render_pipeline_wow)
+        if entity and f.get("region"):
+            x = x[x["region"] == f["region"]]
+        if entity and f.get("leader"):
+            qh = _quarter_start_of(cut_from or _today())
+            x = x[x["leader"].isin(_expand_leader_em(f["leader"], qh))]
+        # Filtro de AE: desde 21/10/2026 vale nas duas telas (AE e Leaders) —
+        # antes a de Leaders limpava o `ae` e mostrava o time inteiro com um AE
+        # escolhido na barra.
+        if entity and f.get("ae"):
+            x = x[x["account_executive"] == f["ae"]]
+        return _pt_apply_dim_filter(x, "dtype", f.get("dtype", ""))
+    return _scope
+
+
+def _wq_frames(focus, scope, force=False):
+    """Eventos, níveis e viradas da série, já no recorte de `scope`.
+
+    Devolve um dict com:
+      ev       uma linha por (deal, passo) em que o valor no pipe mudou — passo =
+               par de cópias consecutivas, `step` = índice da cópia de chegada;
+      lv       valor de cada deal em cada ponta (`week_idx`, coluna `v`);
+      viradas  uma por troca de trimestre dentro da janela (o que saiu/entrou);
+      alvos, pontas, dias, sel, qopts — ver `_wq_window`.
+
+    A régua de cada passo é o trimestre do dia de CHEGADA, e a âncora é medida
+    na régua do 1º passo. Assim cada passo compara as duas pontas com a mesma
+    régua, e a troca de régua vira um evento à parte (`virada_*`) no 1º passo do
+    trimestre novo. Soma de todos os deltas = nível final − nível inicial."""
+    alvos, pontas, dias, sel, qopts = _wq_window(force=force)
+    out = {"ev": pd.DataFrame(columns=_WQ_EV_COLS),
+           "lv": pd.DataFrame(columns=["deal_id", "week_idx", "v", "stage", "cd",
+                                       "deal_name", "account_executive", "leader",
+                                       "region"]),
+           "viradas": [], "reguas": [], "alvos": alvos, "pontas": pontas, "dias": dias,
+           "sel": sel, "qopts": qopts}
+    if len(pontas) < 2:
+        return out
+    sufs = [d.strftime("%Y%m%d") for d in dias]
+    raw = bq.pipeline_asof_changes(sufs, sorted(_HS_EARLY_STAGES | _HS_LATE_STAGES),
+                                   pipeline=_pl(), force_refresh=force)
+    if not len(raw):
+        return out
+
+    meta = raw.drop_duplicates("deal_id")[["deal_id", "deal_name", "account_executive",
+                                           "deal_type"]].copy()
+    meta["deal_id"] = meta["deal_id"].astype(str)
+    meta = meta.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
+    # Venda direta de gestor: mesma atribuição do Histórico do Forecast.
+    mgr = meta["account_executive"].isin(NON_AE_USERS)
+    meta.loc[mgr, "leader"] = meta.loc[mgr, "account_executive"]
+    meta.loc[mgr, "region"] = meta.loc[mgr, "region"].fillna("BR")
+    # Escopo POR TRIMESTRE (ver `_wq_scope`): cada trimestre da janela tem o
+    # seu conjunto de deals dentro. A grade leva a UNIÃO deles; dono e líder
+    # do deal ficam os do trimestre mais recente em que ele está dentro.
+    trims = sorted({_quarter_start_of(d) for d in dias})
+    por_trim = {q: scope(meta.copy(), cut_from=q) for q in trims}
+    no_trim = {q: set(v["deal_id"]) for q, v in por_trim.items()}
+    meta = (pd.concat([por_trim[q] for q in reversed(trims)], ignore_index=True)
+              .drop_duplicates("deal_id").reset_index(drop=True))
+    if not len(meta):
+        return out
+    # Líder de cada deal EM CADA TRIMESTRE: eventos e níveis levam o do
+    # trimestre deles (`q_escopo`), pra painel por líder e drill recortarem
+    # igual à página — no Q2/26 o deal do Caio é do Gustavo, não do Leonardo.
+    lider_q = {q: dict(zip(v["deal_id"], v["leader"])) for q, v in por_trim.items()}
+
+    def _lider_no_trim(df):
+        return [lider_q.get(q, {}).get(d, ld)
+                for d, q, ld in zip(df["deal_id"], df["q_escopo"], df["leader"])]
+
+    # ---- Grade deal × dia, reconstruída das linhas de mudança com ffill ----
+    deals = meta["deal_id"].tolist()
+    D = len(dias)
+    pos = {s: i for i, s in enumerate(sufs)}
+    r = raw.assign(deal_id=raw["deal_id"].astype(str))
+    r = r[r["deal_id"].isin(set(deals))]
+    r = r.assign(i=r["dia"].astype(str).map(pos))
+    r = r[r["i"].notna()].astype({"i": int})
+    r["stg"] = r["stage"].astype(object).where(r["stage"].notna(), _WQ_AUS)
+    _cdt = pd.to_datetime(r["close_date"].astype(object), errors="coerce")
+    # Close date como nº de dias desde 1970; −1 = sem close date. Sentinela (e
+    # não NaN) porque o ffill abaixo preencheria o NaN legítimo de quem apagou
+    # o close date com a data antiga.
+    r["cd"] = ((_cdt - pd.Timestamp("1970-01-01")).dt.days).fillna(-1)
+    r["amt"] = pd.to_numeric(r["amount"], errors="coerce").fillna(0.0)
+
+    def _grade(col, vazio):
+        g = (r.pivot(index="deal_id", columns="i", values=col)
+              .reindex(index=deals, columns=range(D)).ffill(axis=1))
+        return g.fillna(vazio).to_numpy()
+
+    stg = _grade("stg", _WQ_AUS).astype(object)
+    amt = _grade("amt", 0.0).astype(float)
+    cd = _grade("cd", -1).astype(float)
+    gmap = {u: ("aus" if u == _WQ_AUS else _hs_stage_group(u)) for u in pd.unique(stg.ravel())}
+    grp = pd.Series(stg.ravel()).map(gmap).to_numpy().reshape(stg.shape)
+
+    ep = date(1970, 1, 1)
+    qs = np.array([(_quarter_start_of(d) - ep).days for d in dias], dtype=float)
+    qe = np.array([(_quarter_end_of(d) - ep).days for d in dias], dtype=float)
+    # Escopo de cada coluna = o do trimestre do dia (mesma régua do close date).
+    _dentro_q = {q: np.isin(np.array(deals, dtype=object), list(v)) for q, v in no_trim.items()}
+    sc = np.stack([_dentro_q[_quarter_start_of(d)] for d in dias], axis=1)
+
+    def _dentro(c, j):
+        """Deal no foco com close date no trimestre do dia `j` e no escopo
+        desse trimestre, na cópia `c`."""
+        return ((grp[:, c] == focus) & (cd[:, c] >= qs[j]) & (cd[:, c] <= qe[j])
+                & sc[:, j])
+
+    # ---- Passos: todas as cópias consecutivas de uma vez ----
+    gp, gc = grp[:, :-1], grp[:, 1:]
+    cp, cc = cd[:, :-1], cd[:, 1:]
+    ap, ac = amt[:, :-1], amt[:, 1:]
+    q0, q1 = qs[1:], qe[1:]                     # régua = dia de chegada
+    sq = sc[:, 1:]                              # escopo idem
+    in_p = (gp == focus) & (cp >= q0) & (cp <= q1) & sq
+    in_c = (gc == focus) & (cc >= q0) & (cc <= q1) & sq
+    mud = (in_p != in_c) | (in_p & in_c & (ap != ac))
+    other = "late" if focus == "early" else "early"
+    ent, sai, fica = ~in_p & in_c, in_p & ~in_c, in_p & in_c
+    cat = np.select(
+        [ent & np.isin(gp, ["aus", "pre", "none"]),
+         ent & (gp == other),
+         ent & np.isin(gp, ["won", "lost"]),
+         ent & (gp == focus),
+         sai & (gc == "aus"),
+         sai & (gc == "won"),
+         sai & (gc == "lost"),
+         sai & (gc == other),
+         sai & np.isin(gc, ["pre", "none"]),
+         sai & (gc == focus),
+         fica & (ac > ap),
+         fica & (ac < ap)],
+        # Late: chegar do Early é "novo" (decisão do Pedro de 03/08/2026, a
+        # mesma do PoP); no Early, voltar do Late é "transferiu".
+        ["novo", "novo" if focus == "late" else "transferiu", "reabriu", "puxou",
+         "saiu", "won", "lost", "late" if focus == "early" else "transferiu",
+         "regrediu", "escorregou", "cresceu", "encolheu"],
+        default="")
+    n_i, s_i = np.nonzero(mud)
+    _deals = np.array(deals, dtype=object)
+    partes = [pd.DataFrame({
+        "deal_id": _deals[n_i], "step": s_i + 1,
+        "delta": np.where(in_c, ac, 0.0)[n_i, s_i] - np.where(in_p, ap, 0.0)[n_i, s_i],
+        "category": cat[n_i, s_i],
+        "stage_from": stg[:, :-1][n_i, s_i], "stage_to": stg[:, 1:][n_i, s_i],
+        "cd_from": cp[n_i, s_i], "cd_to": cc[n_i, s_i],
+        "amt_from": ap[n_i, s_i], "amt_to": ac[n_i, s_i],
+    })]
+
+    # ---- Viradas de trimestre (a partir do 2º passo; o 1º já nasce na régua) ----
+    jks = [dias.index(p) for p in pontas]
+    viradas = []
+    for i in range(2, D):
+        if qs[i] == qs[i - 1]:
+            continue
+        c = i - 1
+        velho, novo = _dentro(c, c), _dentro(c, i)
+        for m, sinal, nome in ((velho, -1.0, "virada_saiu"), (novo, 1.0, "virada_entrou")):
+            partes.append(pd.DataFrame({
+                "deal_id": _deals[m], "step": i, "delta": sinal * amt[m, c],
+                "category": nome, "stage_from": stg[m, c], "stage_to": stg[m, c],
+                "cd_from": cd[m, c], "cd_to": cd[m, c],
+                "amt_from": amt[m, c], "amt_to": amt[m, c]}))
+        k = int(np.searchsorted(jks, i, side="left"))
+        ini, fim = alvos[k - 1], alvos[k]
+        q_ini = _quarter_start_of(dias[i])
+        viradas.append({
+            "week": k, "dia": dias[c],
+            "frac": min(1.0, max(0.0, (q_ini - ini).days / max(1, (fim - ini).days))),
+            "de": _quarter_label(dias[c]), "para": _quarter_label(dias[i]),
+            "label": f"{_quarter_label(dias[c])} → {_quarter_label(dias[i])}",
+            "out": float(amt[velho, c].sum()), "in": float(amt[novo, c].sum()),
+            "n_out": int(velho.sum()), "n_in": int(novo.sum())})
+
+    ev = pd.concat([p for p in partes if len(p)], ignore_index=True) if any(
+        len(p) for p in partes) else pd.DataFrame(columns=_WQ_EV_COLS)
+    if len(ev):
+        ev["week_idx"] = np.searchsorted(jks, ev["step"].to_numpy(), side="left")
+        ev["dia"] = [dias[i] for i in ev["step"]]
+        ev["dia_ant"] = [dias[i - 1] for i in ev["step"]]
+        # Trimestre cujo escopo (e hierarquia) vale pra linha: o do dia de
+        # chegada; a saída da virada pertence ao trimestre que acabou.
+        ev["q_escopo"] = [_quarter_start_of(a if c == "virada_saiu" else d)
+                          for a, d, c in zip(ev["dia_ant"], ev["dia"], ev["category"])]
+        ev = ev.merge(meta[["deal_id", "deal_name", "account_executive", "leader",
+                            "region", "deal_type"]], on="deal_id", how="left")
+        ev["leader"] = _lider_no_trim(ev)
+    out["ev"] = ev.reindex(columns=_WQ_EV_COLS)
+
+    # ---- Nível em cada ponta (a âncora na régua do 1º passo) ----
+    lv, reguas = [], []
+    for k, j in enumerate(jks):
+        jr = 1 if k == 0 else j
+        m = _dentro(j, jr)
+        reguas.append(_quarter_start_of(dias[jr]))
+        lv.append(pd.DataFrame({"deal_id": _deals[m], "week_idx": k, "v": amt[m, j],
+                                "stage": stg[m, j], "cd": cd[m, j]}))
+    lv = pd.concat(lv, ignore_index=True)
+    lv["q_escopo"] = lv["week_idx"].map(dict(enumerate(reguas)))
+    lv = lv.merge(meta[["deal_id", "deal_name", "account_executive", "leader",
+                        "region"]], on="deal_id", how="left")
+    lv["leader"] = _lider_no_trim(lv)
+    out["lv"] = lv
+    out["viradas"] = viradas
+    out["reguas"] = reguas
+    return out
+
+
+def _wq_cd_txt(v) -> str:
+    """Close date da grade (dias desde 1970, −1 = vazio) → '30/09/26'."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if v < 0 or v != v:
+        return "sem data"
+    return (date(1970, 1, 1) + timedelta(days=int(v))).strftime("%d/%m/%y")
+
+
+def _wq_bridge(ev, fifth, viradas, level0, level_end):
+    """Ponte da janela inteira: do nível inicial ao final, parcela por parcela.
+    Aqui ela fecha EXATO (nível e movimento são a mesma grade); o resíduo só
+    existe como teste — se aparecer, é bug, e a tela mostra."""
+    _cats = _WQ_NET_CATS + (fifth, "won", "transferiu", "regrediu", "reabriu", "saiu")
+    tot = {c: float(ev.loc[ev["category"] == c, "delta"].sum()) for c in _cats}
+    tot["net"] = sum(tot[c] for c in _WQ_NET_CATS)
+    tot["viradas"] = [{**v, "saldo": v["in"] - v["out"]} for v in viradas]
+    _virada = float(ev.loc[ev["category"].isin(["virada_saiu", "virada_entrou"]),
+                           "delta"].sum())
+    tot["residuo"] = (level_end - level0) - float(ev["delta"].sum())
+    tot["virada_total"] = _virada
+    return tot
+
+
+# ---------------------------------------------------------------------------
+# Cobertura histórica do PoP Histórico Q — pedido do Pedro (13/10/2026): "o
+# quanto tínhamos de pipeline em relação à remaining quota", domingo a domingo.
+#
+#   cobertura(s)          = pipe do foco no trimestre-régua de s ÷ remanescente(s)
+#   remanescente(s)       = max(meta do trimestre − realizado até s, 0)
+#
+# É a conta da aba Cobertura (`_pipeline_page`) andando pra trás no tempo, com
+# UMA diferença: aqui o deal do próprio gestor entra no pipe e no realizado (a
+# regra do resto do Leaders, `drop_departed_people`); a aba Cobertura ainda o
+# tira (HIDDEN_FROM_AE_VIEWS no pipe; realizado só nas linhas de AE). Medido em
+# 11/10/2026: R$ 60 mil a mais no Late do Leonardo (LDC Unidades Portuárias).
+#   · META: time inteiro = TEAM_REVENUE_META (= soma dos Comp. Target dos 4
+#     diretores; bate no centavo no Q3 e no Q4/26); líder filtrado = Comp.
+#     Target dele, o mesmo número da barra dele na Cobertura de Leaders.
+#     Trimestre sem meta declarada (Q2/26) = soma das quotas — o fallback que a
+#     própria Cobertura usa.
+#   · REALIZADO: won com PO no trimestre até s, lido da cópia do BI DO PRÓPRIO
+#     domingo (`bq.won_asof`), a mesma base do pipe — assim cada deal está num
+#     lado só da conta. Validado e hold juntos (os dois abatem a quota).
+#   · META DE COBERTURA: a da semana de s. Late = 2x→4x (`_late_coverage_goal`).
+#     Early = rampa do ciclo (`_early_coverage_goal`), mas SÓ quando o ciclo
+#     aponta pro trimestre-régua: no M3 a meta Early da Cobertura é do pipe do
+#     trimestre SEGUINTE contra a quota cheia dele, que não é o pipe desta tela.
+# ---------------------------------------------------------------------------
+
+def _ae_quarter_quota(ae, q, f=None, force=False) -> float:
+    """Quota de UM AE no trimestre `q` — roster quando o trimestre tem um
+    (Q3/Q4 de 2026), linha curada antes disso. Mesma conta da aba Cobertura."""
+    f_ae = {**(f or {}), "date_from": "", "date_to": "", "leader": "", "region": "",
+            "role": "", "ae": ae}
+    for k in ("dtype", "source", "prod", "fcat", "cdate", "cown", "env", "coh", "money"):
+        f_ae.setdefault(k, "")
+    qdf = _quota_by_ae_for_window(_entity_only_filters(_get_clean_ae_perf(force=force), f_ae),
+                                  q, _quarter_end_of(q), f_ae)
+    return float(pd.to_numeric(qdf["quota_brl"], errors="coerce").fillna(0).sum())
+
+
+def _wq_team_meta(q, f, force=False):
+    """(meta R$, fonte) do trimestre `q` no recorte de líder da página. Meta
+    None = não há meta comparável.
+
+    Líder filtrado num trimestre SEM Comp. Target (Q2/26) fica sem meta, de
+    propósito: a soma das quotas sairia do time que ele tinha NAQUELE
+    trimestre (líder da linha curada), e o pipe é do time de hoje — no Q2 o
+    Arthur não liderava ninguém (meta 0) e o Leonardo só tinha o Raphael
+    (R$ 35 mil contra R$ 1,5 mi de pipe = 43x)."""
+    A = (f.get("ae") or "").strip()
+    if A:
+        quota = _ae_quarter_quota(A, q, f, force=force)
+        return (quota, "quota do AE") if quota > 0 else (None, "sem quota no trimestre")
+    L = (f.get("leader") or "").strip()
+    if L and L != "Pedro Mendes":
+        targets = _leader_targets(q)
+        if L in targets:
+            return float(targets[L]), "Comp. Target"
+        return None, "sem meta declarada"
+    if q in TEAM_REVENUE_META:
+        return float(TEAM_REVENUE_META[q]), "meta do time"
+    f_ = {**f, "date_from": "", "date_to": "", "ae": "", "role": ""}
+    qdf = _quota_by_ae_for_window(_entity_only_filters(_get_clean_ae_perf(force=force), f_),
+                                  q, _quarter_end_of(q), f_)
+    return (float(pd.to_numeric(qdf["quota_brl"], errors="coerce").fillna(0).sum()),
+            "soma das quotas")
+
+
+def _wq_realizado(fr, f, force=False) -> pd.DataFrame:
+    """Realizado do trimestre-régua de cada ponta, COMO ESTAVA na cópia dela.
+
+    Mesmas regras do `_validated_hold_by_ae` da Cobertura: data da receita com a
+    extensão de fechamento (`_rev_date` — PO de 01–02/10/2026 é Q3, então não
+    abate o Q4), fora quem está em DEPARTED_AES, líder pelo trimestre da receita
+    (`_attr_deal_leader`), só ALLOWED_LEADERS e o filtro de líder da página."""
+    cols = ["week_idx", "deal_id", "deal_name", "account_executive", "leader",
+            "amount", "po"]
+    pontas, reguas = fr["pontas"], fr["reguas"]
+    if not pontas or len(reguas) != len(pontas):
+        return pd.DataFrame(columns=cols)
+    sufs = [p.strftime("%Y%m%d") for p in pontas]
+    w = bq.won_asof(sufs, pipeline=_pl(), force_refresh=force)
+    if not len(w):
+        return pd.DataFrame(columns=cols)
+    w = w.assign(week_idx=w["dia"].astype(str).map({x: k for k, x in enumerate(sufs)}))
+    w = w[w["week_idx"].notna()].astype({"week_idx": int})
+    w["po"] = pd.to_datetime(w["po_emission_date"].astype(object), errors="coerce")
+    w["rev_po"] = _rev_date(w["po"])
+    w = w[w["rev_po"].notna()]
+    rq = w["rev_po"].map(lambda t: _quarter_start_of(t.date()))
+    w = w[rq == w["week_idx"].map(dict(enumerate(reguas)))]
+    w = w[~w["account_executive"].isin(DEPARTED_AES)]
+    # Quem saiu: o won dele só conta antes do corte (regra de `_get_forecast_deals`).
+    for ae, corte in DEPARTED_FROM.items():
+        if ae in DEPARTED_FROM_KEEP_WON:
+            continue                            # venda fechada dele conta (ver a constante)
+        w = w[~((w["account_executive"] == ae) & (w["rev_po"] >= pd.Timestamp(corte)))]
+    w = w.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
+    w["leader"] = _attr_deal_leader(w, "rev_po", _period_leader_map(force=force))
+    w = w[w["leader"].isin(ALLOWED_LEADERS)]
+    if f.get("ae"):
+        w = w[w["account_executive"] == f["ae"]]
+    elif f.get("leader"):
+        reg = w["week_idx"].map(dict(enumerate(reguas)))
+        times = {q: _expand_leader_em(f["leader"], q) for q in set(reguas)}
+        w = w[[ld in times[q] for ld, q in zip(w["leader"], reg)]]
+    return w.reindex(columns=cols)
+
+
+def _wq_fmt_meta(v) -> str:
+    """Meta de cobertura com a casa que ela tem: 2,25x (e não "2,2x", que é o
+    que o `_fmt_mult` devolve e esconde o limiar de verdade do teste)."""
+    txt = f"{float(v):.2f}".rstrip("0").rstrip(".")
+    return txt.replace(".", ",") + "x"
+
+
+def _wq_fmt_cov(v) -> str:
+    """Cobertura TRUNCADA em 1 casa: 2,249x vira "2,2x", nunca "2,25x" — um
+    valor abaixo da meta não pode aparecer igual a ela."""
+    t = math.floor(float(v) * 10 + 1e-9) / 10
+    return (f"{t:.0f}" if t == int(t) else f"{t:.1f}").replace(".", ",") + "x"
+
+
+def _wq_cobertura(fr, focus, f, force=False) -> list:
+    """Uma linha por ponta da série: pipe, meta, realizado, remanescente,
+    cobertura e a meta de cobertura da semana."""
+    alvos, reguas = fr["alvos"], fr["reguas"]
+    if not reguas or len(reguas) != len(alvos):
+        return []
+    lvl = fr["lv"].groupby("week_idx")["v"].sum()
+    rz = _wq_realizado(fr, f, force=force)
+    rz_v = rz.groupby("week_idx")["amount"].sum()
+    rz_n = rz.groupby("week_idx")["deal_id"].nunique()
+    metas = {q: _wq_team_meta(q, f, force=force) for q in set(reguas)}
+    rows = []
+    for k, (a, q) in enumerate(zip(alvos, reguas)):
+        meta, fonte = metas[q]
+        real = float(rz_v.get(k, 0.0))
+        tem_meta = meta is not None and meta > 0
+        rem = max(meta - real, 0.0) if tem_meta else None
+        pipe = float(lvl.get(k, 0.0))
+        # Semana da meta: a do domingo; na âncora do modo trimestre (véspera do
+        # início, já na régua do trimestre novo) é a 1ª semana dele. Presa no
+        # trimestre-régua: se a ponta cair numa cópia do trimestre anterior, a
+        # meta tem que ser a dele.
+        gd = min(max(a, q), _quarter_end_of(q))
+        if focus == "late":
+            wk, goal = _late_coverage_goal(gd)
+        else:
+            e = _early_coverage_goal(gd)
+            wk, goal = e["week"], (e["goal"] if e["target_q"] == q else None)
+        cov = (pipe / rem) if (tem_meta and rem > 0) else None
+        if not tem_meta:
+            goal = None
+        rows.append({
+            "k": k, "date": a, "label": _fmt_date_short(a), "curta": _fmt_date_curta(a),
+            "regua": q, "regua_label": _quarter_label(q),
+            "pipe": pipe, "meta": meta, "meta_fonte": fonte,
+            "real": real, "n_real": int(rz_n.get(k, 0)), "rem": rem, "cov": cov,
+            "goal": goal, "goal_label": (f"S{wk} · {_wq_fmt_meta(goal)}" if goal is not None
+                                         else "—"),
+            "tem_meta": tem_meta, "batida": tem_meta and rem == 0,
+            # Meta batida (remanescente 0) conta como coberta.
+            "hit": tem_meta and (rem == 0 or (goal is not None and cov >= goal)),
+            "cov_txt": (_wq_fmt_cov(cov) if cov is not None
+                        else ("meta batida" if tem_meta else "sem meta")),
+        })
+    return rows
+
+
+def _wq_build_cov(rows, viradas, drill):
+    """Geometria do gráfico de cobertura: por domingo, barra verde (pipe) e
+    cinza (remanescente) no eixo de R$ à esquerda; linha azul da cobertura e
+    degraus tracejados da meta de cobertura no eixo Nx à direita. Mesmas cores
+    da aba Cobertura (`_rank_chart.html`), pra ler como a mesma família.
+
+    O topo do eixo Nx é robusto (p90 das coberturas): no fim do trimestre o
+    remanescente encolhe e uma semana com R$ 10 mil faltando vira 200x —
+    escalar por ela achataria todas as outras. O ponto acima do topo fica
+    preso nele, com o valor real no rótulo."""
+    _TOP, _PLOT, _BOT = 34, 250, 74
+    _LEFT, _RAX = 92, 58
+    n = len(rows)
+    _STEP = 64 if n <= 14 else 40
+    _BW = max(7, round(_STEP * 0.3))
+    base_y = _TOP + _PLOT
+    right_x = _LEFT + n * _STEP
+
+    mtop = max([r["pipe"] for r in rows] + [r["rem"] or 0.0 for r in rows] + [1000.0]) * 1.12
+    yL = [{"label": fmt_brl(mtop * i / 4), "y": round(base_y - i / 4 * _PLOT, 1)}
+          for i in range(5)]
+    covs = sorted(r["cov"] for r in rows if r["cov"] is not None)
+    goals = [r["goal"] for r in rows if r["goal"] is not None]
+    ref = covs[min(len(covs) - 1, int(0.9 * len(covs)))] if covs else 0.0
+    raw_top = max([ref] + goals + [1.0]) * 1.15
+    xstep = 1 if raw_top <= 6 else (2 if raw_top <= 12 else 5)
+    xtop = int(math.ceil(raw_top / xstep) * xstep)
+    yR = [{"label": _fmt_mult(v), "y": round(base_y - v / xtop * _PLOT, 1)}
+          for v in range(0, xtop + 1, xstep)]
+
+    def _ym(v):
+        return round(base_y - min(v, xtop) / xtop * _PLOT, 1)
+
+    cols, segs, cur, goal_d = [], [], [], []
+    for i, r in enumerate(rows):
+        x0 = _LEFT + i * _STEP
+        cx = x0 + _STEP / 2
+        hp, hr = r["pipe"] / mtop * _PLOT, (r["rem"] or 0.0) / mtop * _PLOT
+        cy = _ym(r["cov"]) if r["cov"] is not None else None
+        gy = _ym(r["goal"]) if r["goal"] is not None else None
+        cols.append({
+            **r, "x0": round(x0, 1), "cx": round(cx, 1),
+            "pipe_x": round(cx - _BW - 1, 1), "rem_x": round(cx + 1, 1),
+            "pipe_y": round(base_y - hp, 1), "pipe_h": round(max(hp, 0.5), 1),
+            "rem_y": round(base_y - hr, 1), "rem_h": round(max(hr, 0.5), 1),
+            "cov_y": cy, "clamped": r["cov"] is not None and r["cov"] > xtop,
+            "url_pipe": drill(r["k"], "pipe"), "url_real": drill(r["k"], "realizado"),
+            "is_anchor": i == 0,
+        })
+        # Linha da cobertura: corta na troca de régua (virada) e em semana sem
+        # remanescente, igual à linha de nível.
+        nova_regua = i > 0 and rows[i - 1]["regua"] != r["regua"]
+        if cy is None or nova_regua:
+            if len(cur) > 1:
+                segs.append(" ".join(cur))
+            cur = []
+        if cy is not None:
+            cur.append(f"{round(cx, 1)},{cy}")
+        if gy is not None:
+            goal_d.append(f"M{round(x0 + 3, 1)},{gy}H{round(x0 + _STEP - 3, 1)}")
+    if len(cur) > 1:
+        segs.append(" ".join(cur))
+    brk = [{"x": round(_LEFT + (v["week"] - 0.5 + v["frac"]) * _STEP, 1), "label": v["para"]}
+           for v in viradas]
+    return {"w": right_x + _RAX, "h": base_y + _BOT, "left": _LEFT, "right_x": right_x,
+            "top": _TOP, "base_y": base_y, "step": _STEP, "bw": _BW,
+            "yL": yL, "yR": yR, "cols": cols, "segs": segs,
+            "goal_d": " ".join(goal_d), "breaks": brk}
+
+
+def _render_wow_quarter(grain="leader"):
+    """PoP Histórico por quarter: N semanas (ou um trimestre) de movimento do
+    pipe Early ou Late com close date no trimestre vigente de cada semana.
+
+    grain="ae" é a cópia do Sales AE BR (pedido do Pedro, 20/10/2026): o painel
+    por pessoa lista vendedores (gestor fica no total, fora das linhas) e o filtro
+    de AE recorta pipe, realizado e meta — com um AE escolhido, a meta é a quota
+    dele no trimestre. Desde 21/10/2026 o filtro de AE vale também na tela de
+    Leaders (antes era limpo aqui e a tela mostrava o time inteiro)."""
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    focus = _wow_hist_focus()
+    fr = _wq_frames(focus, _wq_scope(f), force=force)
+    ev, lv, alvos, viradas = fr["ev"], fr["lv"], fr["alvos"], fr["viradas"]
+    weeks = max(0, len(alvos) - 1)
+    sel = fr["sel"]
+    fifth = "late" if focus == "early" else "won"
+
+    if weeks:
+        wk_rows, level0, _ = _hist_week_rows(ev, lv, _WQ_NET_CATS, fifth, weeks, alvos,
+                                             level_col="v")
+    else:
+        wk_rows, level0 = [], 0.0
+    # Ponta que caiu numa cópia de outro dia (a do dia faltou ou veio quebrada):
+    # o rótulo avisa com asterisco em vez de fingir que é o domingo.
+    trocadas = {k for k, (a, p) in enumerate(zip(alvos, fr["pontas"])) if a != p}
+    for r in wk_rows:
+        r["virada"] = next((v for v in viradas if v["week"] == r["idx"]), None)
+        if r["idx"] in trocadas:
+            r["label"] += "*"
+    level_end = wk_rows[-1]["level"] if wk_rows else level0
+    people = (_hist_people(ev[ev["category"].isin(_WQ_NET_CATS)], lv, weeks, grain,
+                           f.get("leader"), level_col="v", explode=_wq_explode)
+              if weeks else [])
+    bridge = _wq_bridge(ev, fifth, viradas, level0, level_end)
+
+    def _drill(idx, cats, name=""):
+        # Na tela de AE com um AE escolhido, o total É o AE: o drill sai no nome dele.
+        if not name and grain == "ae" and f.get("ae"):
+            name = f["ae"]
+        return url_for("pipeline_wow_quarter_deals" if grain == "ae"
+                       else "leaders_pipeline_wow_quarter_deals", focus=focus, week=idx,
+                       weeks=sel, cat=cats, name=name, grain=grain,
+                       dtype=(f.get("dtype") or None),
+                       leader=(f.get("leader") if not name else None),
+                       region=(f.get("region") if not name else None))
+
+    def _chip_url(**kw):
+        args = {k: v for k, v in request.args.items() if k not in kw and v}
+        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+
+    bars = _build_hist_bars(wk_rows, weeks, _drill, pos=_WQ_POS, neg=_WQ_NEG,
+                            net_cats=_WQ_NET_CATS)
+    # Marcador da virada no gráfico de barras: na fração da semana em que o
+    # trimestre novo começou (quinta, 01/10 → ~57% da semana 27/09→04/10).
+    bar_breaks = [{"x": round(bars["left"] + (v["week"] - 1 + v["frac"]) * bars["step"], 1),
+                   "label": v["para"]} for v in viradas]
+    q_sel = next((q for q in fr["qopts"] if _wq_quarter_key(q) == sel), None)
+    fy_sel = sel if (not q_sel and sel in WQ_FISCAL_YEARS) else None
+    janela_b = (_quarter_label(q_sel) if q_sel else fy_sel if fy_sel else f"{weeks} semanas")
+
+    # Cobertura histórica. Com Deal Type ela não existe: a quota não é aberta
+    # por tipo, e pipe só de aquisição contra a quota inteira mentiria.
+    def _cov_drill(k, kind):
+        return url_for("pipeline_wow_quarter_cobertura" if grain == "ae"
+                       else "leaders_pipeline_wow_quarter_cobertura", focus=focus, k=k,
+                       kind=kind, weeks=sel, leader=(f.get("leader") or None),
+                       region=(f.get("region") or None), ae=(f.get("ae") or None))
+
+    cov_rows = (_wq_cobertura(fr, focus, f, force=force)
+                if (weeks and not f.get("dtype")) else [])
+    for r in cov_rows:
+        if r["k"] in trocadas:
+            r["label"] += "*"
+    cov = _wq_build_cov(cov_rows, viradas, _cov_drill) if cov_rows else None
+    return render_template(
+        "pipeline_wow_quarter.html", ctx=ctx,
+        focus=focus, grain=grain, weeks=weeks, janela_b=janela_b, modo_q=bool(q_sel),
+        modo_fy=bool(fy_sel),
+        focus_label=("Early · " + _STAGE_BY_ID["93878633"]["name"] if focus == "early"
+                     else "Late · Negotiation / Decision / Procurement"),
+        fifth_cat=fifth, fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
+        wk_rows=wk_rows, people=people, viradas=viradas,
+        level0=level0, level_end=level_end, bridge=bridge,
+        first_label=(_fmt_date_short(alvos[0]) if alvos else "—"),
+        last_label=(_fmt_date_short(alvos[-1]) if alvos else "—"),
+        tem_troca=bool(trocadas),
+        bars=bars, bar_breaks=bar_breaks,
+        lvl=_build_hist_level(wk_rows, level0, alvos[0] if alvos else _today(),
+                              breaks=viradas),
+        spark=_build_hist_spark(people, weeks),
+        total_net=sum(r["net"] for r in wk_rows),
+        total_fifth=sum(r["fifth"] for r in wk_rows),
+        total_puxou=sum(r["puxou"] for r in wk_rows),
+        total_escorregou=sum(r["escorregou"] for r in wk_rows),
+        best=(max(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        worst=(min(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        week_opts=([(str(w), f"{w} sem") for w in WOW_HIST_WEEK_OPTS]
+                   + [(_wq_quarter_key(q), _quarter_label(q)) for q in fr["qopts"]]
+                   + [(k, k) for k, (a, _) in WQ_FISCAL_YEARS.items() if a <= _today()]),
+        week_sel=sel, net_cats=",".join(_WQ_NET_CATS),
+        hist_channels=list(_WQ_NET_CATS),
+        chip_url=_chip_url, drill=_drill,
+        cov=cov, cov_now=(cov_rows[-1] if cov_rows else None),
+        cov_fontes=sorted({(r["regua_label"], r["meta_fonte"], r["meta"] or 0.0) for r in cov_rows}),
+        cov_early_m3=(focus == "early" and any(r["goal"] is None and r["tem_meta"]
+                                               for r in cov_rows)),
+    )
+
+
+@app.route("/leaders/pipeline/wow/quarter/cobertura")
+def leaders_pipeline_wow_quarter_cobertura():
+    return _wq_cobertura_drill("leader")
+
+
+@app.route("/pipeline/wow/quarter/cobertura")
+def pipeline_wow_quarter_cobertura():
+    return _wq_cobertura_drill("ae")
+
+
+def _wq_cobertura_drill(grain):
+    """Drill da cobertura de UM domingo: `kind=pipe` lista o pipe que estava no
+    numerador; `kind=realizado` lista o won que abateu a quota até ali. Na tela
+    de AE o `ae` da URL recorta os dois lados e a meta (quota do AE)."""
+    focus = "late" if request.args.get("focus") == "late" else "early"
+    f = get_filters()
+    try:
+        k = int(request.args.get("k") or -1)
+    except (TypeError, ValueError):
+        k = -1
+    fr = _wq_frames(focus, _wq_scope(f))
+    if not 0 <= k < len(fr["alvos"]) or len(fr["reguas"]) != len(fr["alvos"]):
+        return jsonify(_empty_drill(""))
+    q, quando = fr["reguas"][k], _fmt_date_short(fr["alvos"][k])
+    qlbl = _quarter_label(q)
+    if request.args.get("kind") == "realizado":
+        rz = _wq_realizado(fr, f)
+        rz = rz[rz["week_idx"] == k]
+        meta, fonte = _wq_team_meta(q, f)
+        real = float(rz["amount"].sum())
+        rows = [{"deal_name": r.deal_name or "—", "deal_url": _hs_deal_url(r.deal_id),
+                 "ae": r.account_executive,
+                 "po": (r.po.strftime("%d/%m/%y") + (f" · {_rev_tag(r.po)}" if _rev_tag(r.po) else "")
+                        if pd.notna(r.po) else "—"),
+                 "amount": float(r.amount)} for r in rz.itertuples(index=False)]
+        rows.sort(key=lambda x: x["amount"], reverse=True)
+        conta = (f"{fonte} {fmt_money(meta)} − realizado {fmt_money(real)} "
+                 f"({len(rows)} deals) = remanescente {fmt_money(max(meta - real, 0))}"
+                 if meta else f"{fonte} · realizado {fmt_money(real)} ({len(rows)} deals)")
+        return jsonify({
+            "title": f"Realizado do {qlbl} até {quando}",
+            "subtitle": conta,
+            "columns": [
+                {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+                {"key": "ae", "label": "AE"},
+                {"key": "po", "label": "PO"},
+                {"key": "amount", "label": "Amount", "type": "money"},
+            ],
+            "rows": rows,
+        })
+    lv = fr["lv"][fr["lv"]["week_idx"] == k]
+    rows = [{"deal_name": r.deal_name or "—", "deal_url": _hs_deal_url(r.deal_id),
+             "ae": r.account_executive, "estagio": stage_display(r.stage),
+             "close": _wq_cd_txt(r.cd), "amount": float(r.v)}
+            for r in lv.itertuples(index=False)]
+    rows.sort(key=lambda x: x["amount"], reverse=True)
+    return jsonify({
+        "title": f"Pipe {focus.capitalize()} do {qlbl} em {quando}",
+        "subtitle": f"{len(rows)} deals · {fmt_money(sum(x['amount'] for x in rows))}",
+        "columns": [
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "ae", "label": "AE"},
+            {"key": "estagio", "label": "Estágio"},
+            {"key": "close", "label": "Close date"},
+            {"key": "amount", "label": "Amount", "type": "money"},
+        ],
+        "rows": rows,
+    })
+
+
+@app.route("/leaders/pipeline/wow/quarter")
+def leaders_pipeline_wow_quarter():
+    return _render_wow_quarter("leader")
+
+
+@app.route("/pipeline/wow/quarter")
+def pipeline_wow_quarter():
+    return _render_wow_quarter("ae")
+
+
+@app.route("/leaders/pipeline/wow/quarter/deals")
+def leaders_pipeline_wow_quarter_deals():
+    return _wq_deals_drill()
+
+
+@app.route("/pipeline/wow/quarter/deals")
+def pipeline_wow_quarter_deals():
+    return _wq_deals_drill()
+
+
+def _wq_deals_drill():
+    """Drill de UMA semana da série. Uma linha por EVENTO (o mesmo deal aparece
+    2× se entrou e saiu na semana), com o estágio e o close date de → para. A
+    janela é reconstruída a partir de (weeks, week), como no Histórico PoP."""
+    focus = "late" if request.args.get("focus") == "late" else "early"
+    f = get_filters()
+    try:
+        wk = int(request.args.get("week") or 0)
+    except (TypeError, ValueError):
+        wk = 0
+    name = (request.args.get("name") or "").strip()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
+        return jsonify(_empty_drill(name))
+    fr = _wq_frames(focus, _wq_scope(f, entity=False))
+    alvos = fr["alvos"]
+    if not 1 <= wk <= len(alvos) - 1:
+        return jsonify(_empty_drill(""))
+
+    _all = list(_WQ_NET_CATS) + ["late" if focus == "early" else "won",
+                                 "virada_saiu", "virada_entrou"]
+    _pedido = (request.args.get("cat") or "").strip()
+    cats = ([c for c in _all if c in {x.strip().lower() for x in _pedido.split(",")}]
+            if _pedido else list(_WQ_NET_CATS))
+    ev = fr["ev"]
+    ev = ev[(ev["week_idx"] == wk) & ev["category"].isin(cats)]
+    # Recorte de pessoa com a hierarquia do trimestre de cada linha (no Q2/26 o
+    # Leonardo inclui o Gustavo) — a mesma régua do escopo da página.
+    _L = name if (name and grain == "leader") else ("" if name else
+                                                    (request.args.get("leader") or ""))
+    if name and grain == "ae":
+        ev = ev[ev["account_executive"] == name]
+    elif _L:
+        times = {q: _expand_leader_em(_L, q) for q in pd.unique(ev["q_escopo"])}
+        ev = ev[[ld in times[q] for ld, q in zip(ev["leader"], ev["q_escopo"])]]
+    if not name and request.args.get("region"):
+        ev = ev[ev["region"] == request.args.get("region")]
+    # Filtro de AE da tela por cima do clique (líder/região acima seguem a
+    # hierarquia do trimestre de cada linha).
+    if request.args.get("ae"):
+        ev = ev[ev["account_executive"] == request.args.get("ae")]
+
+    def _lbl(sid):
+        return "—" if sid == _WQ_AUS else stage_display(sid)
+
+    rows = []
+    for r in ev.itertuples(index=False):
+        est = (_lbl(r.stage_from) if r.stage_from == r.stage_to
+               else f"{_lbl(r.stage_from)} → {_lbl(r.stage_to)}")
+        cdf, cdt = _wq_cd_txt(r.cd_from), _wq_cd_txt(r.cd_to)
+        if r.stage_from == _WQ_AUS:
+            cdf = "—"
+        if r.stage_to == _WQ_AUS:
+            cdt = "—"
+        quando = (r.dia.strftime("%d/%m") if (r.dia - r.dia_ant).days <= 1
+                  else f"{r.dia_ant.strftime('%d/%m')}–{r.dia.strftime('%d/%m')}")
+        if r.category.startswith("virada"):
+            quando = f"virada {r.dia_ant.strftime('%d/%m')}"
+        rows.append({
+            "deal_name": r.deal_name or "—", "deal_url": _hs_deal_url(r.deal_id),
+            "ae": r.account_executive,
+            "categoria": _WQ_CAT_LABEL.get(r.category, r.category),
+            "movimento": est,
+            "close": cdf if cdf == cdt else f"{cdf} → {cdt}",
+            "quando": quando, "delta": float(r.delta),
+            "amount": float(r.amt_to if r.stage_to != _WQ_AUS else r.amt_from),
+        })
+    rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
+
+    _janela = f"{_fmt_date_short(alvos[wk - 1])} → {_fmt_date_short(alvos[wk])}"
+    n_deals = int(ev["deal_id"].nunique())
+    _d = f"{n_deals} deal{'s' if n_deals != 1 else ''}"
+    if len(rows) != n_deals:
+        _d += f" · {len(rows)} movimentos"
+    _v = sum(x["delta"] for x in rows)
+    _valor = f"{'+' if _v >= 0 else '−'}{fmt_money(abs(_v))}"
+    cat = cats[0] if len(cats) == 1 else ""
+    if set(cats) == {"virada_saiu", "virada_entrou"}:
+        _sufixo = "Virada de trimestre"
+    else:
+        _sufixo = _WQ_CAT_LABEL.get(cat, "") if cat else "Saldo"
+    _escopo = name or f"PoP {focus} por quarter — total"
+    return jsonify({
+        "title": f"{_escopo} · {_sufixo} · semana {wk}",
+        "subtitle": f"{_janela} · {_d} · " + (_valor if cat else f"saldo {_valor}"),
+        "columns": _with_ae_col([
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "categoria", "label": "Movimento"},
+            {"key": "movimento", "label": "Estágio (de → para)"},
+            {"key": "close",     "label": "Close date (de → para)"},
+            {"key": "quando",    "label": "Cópia do BI", "align": "right"},
+            {"key": "delta",     "label": "Δ (R$)", "type": "money_signed"},
+            {"key": "amount",    "label": "Amount", "type": "money"},
+        ], "leader" if (grain == "leader" or not name) else "ae"),
+        "rows": rows,
+    })
 
 
 @app.route("/pipeline/visits")
@@ -6857,6 +10863,2551 @@ def _pipeline_visits_page(grain="ae"):
                            tot_field=tot_field, tot_ia=tot_ia, range_label=range_label)
 
 
+# ===========================================================================
+# Histórico do Forecast — a série semanal do forecast BRUTO do quarter.
+#
+# Mesma mecânica do Histórico PoP (nível · movimento · pessoa a pessoa), com
+# duas diferenças de fundo, as duas ditadas pelo dado e não por estilo:
+#
+#   1) O QUE DEFINE "ESTAR DENTRO". No PoP é o GRUPO DE ESTÁGIO. Aqui são duas
+#      condições: estágio aberto (1-6) E close date dentro do quarter. Um deal
+#      sai do forecast tanto por mudar de estágio quanto por ESCORREGAR de data
+#      — e o 2º caminho é o mais comum. Por isso o close date desta tela é o
+#      vigente em cada domingo, não o de hoje: usar o de hoje apagaria
+#      retroativamente quem escorregou, encolhendo o passado até ele virar o
+#      presente. E é a FOTO do dia que dá essa data (ver
+#      `bq.forecast_asof_series`) — a reconstrução anterior, por
+#      `close_date_history_df`, errava nos dois sentidos: inflava R$ 3,2 mi o
+#      domingo de 30/08/2026 por congelamento e outros R$ 4,2 mi o de 05/07 por
+#      inventar close date de deal que ainda não tinha nenhum.
+#
+#   2) MOVIMENTO E NÍVEL SAEM DA MESMA FONTE. O PoP lê movimento de `wow_events`
+#      e nível de `pipeline_level_series` — duas fontes que divergem até 0,9%,
+#      e é por isso que a ponte de lá exibe um resíduo nomeado. Aqui o movimento
+#      é DERIVADO do próprio nível, domingo contra domingo, então
+#          Σ delta ≡ nível_fim − nível_início
+#      por construção, e a ponte fecha em zero sempre. Não é capricho: não existe
+#      stream de eventos de forecast pra cruzar — o que existe é a FOTO de cada
+#      domingo (ver `bq.forecast_asof_series`), e o movimento sai da diferença
+#      entre duas fotos.
+#
+# O preço de (2) é perder o caminho intra-semana: um deal que entrou na quarta e
+# saiu na sexta não aparece como dois movimentos, só como saldo zero. No PoP isso
+# importava (22 deals numa janela de 1 semana); aqui é aceitável porque a
+# pergunta da tela é de NÍVEL — "como o forecast do quarter evoluiu" — e não de
+# fluxo intra-semanal.
+# ===========================================================================
+
+
+
+def _fc_open_stage_ids() -> list:
+    """Os 6 estágios abertos (Scheduled→Procurement) direto do STAGE_REGISTRY,
+    que já é a fonte única da definição de funil. Uma 2ª lista aqui divergiria
+    dele na próxima mudança de estágio — o mesmo motivo pelo qual
+    `bq.forecast_asof_series` recebe a lista em vez de embutir a sua."""
+    return [s["id"] for s in STAGE_REGISTRY]
+
+
+def _fc_hist_sundays(q_start: date, q_end: date) -> list:
+    """Domingos que delimitam a série: âncora no domingo <= início do quarter,
+    depois de 7 em 7 até o último domingo fechado (sem passar do fim do quarter).
+
+    O índice 0 é a ÂNCORA — só nível, nenhum movimento medido — e a semana k é o
+    intervalo (domingo[k−1], domingo[k]]. Mesma convenção do Histórico PoP, pra
+    que as duas telas leiam "semana que fechou em DD/MM" com o mesmo sentido."""
+    last_sun, _ = _last_two_sundays()
+    end = min(last_sun, _sunday_on_or_before(q_end))
+    s = _sunday_on_or_before(q_start)
+    out = []
+    while s <= end:
+        out.append(s)
+        s += timedelta(days=7)
+    return out
+
+
+def _fc_asof_leader_meta(force=False) -> pd.DataFrame:
+    """(account_executive → leader, region) pro frame as-of. A cópia diária do BI
+    não tem líder: ela é da tabela de DEALS, e a hierarquia mora na curated de
+    performance. Usa o snapshot mais recente de cada AE, igual a
+    `_get_forecast_deals` — o roster atual é reaplicado depois, no scope."""
+    ae = canon_ae_names(bq.ae_performance(force_refresh=force))
+    ae = apply_leader_overrides(ae)
+    ae = ae[(ae["region"].notna()) & (ae["role"] == "AE")]
+    ae["quarter"] = pd.to_datetime(ae["quarter"]).dt.date
+    return (ae.sort_values("quarter").drop_duplicates("account_executive", keep="last")
+              [["account_executive", "leader", "region"]])
+
+
+def _fc_hist_frames(q_start: date, q_end: date, scope, force=False):
+    """(eventos derivados, níveis, domingos) do Histórico do Forecast.
+
+    A fonte é a CÓPIA DIÁRIA do BI (`bq.forecast_asof_series`): o estado que a
+    curated tinha naquele domingo — estágio, amount, close date, tipo e forecast
+    category, todos as-of. Ver o bloco de comentário sobre `FC_ASOF_DATASET` em
+    bq.py para o porquê de isto ter substituído a reconstrução por
+    `hubspot_deals_history` + `close_date_history_df`.
+
+    Colunas que a tela consome:
+      · `in_fc`   — o deal estava no forecast do quarter NAQUELE domingo
+                    (estágio aberto 1-6 E close date dentro do trimestre);
+      · `v`       — amount cheio quando `in_fc`, 0 quando não (bruto);
+      · `v_model` — amount × probabilidade do MODELO ANALYTICS (segmento ×
+                    estágio × tipo, já com o desconto de segurança);
+      · `v_dir`   — amount × peso da FORECAST CATEGORY dos diretores
+                    (100/75/50/25%; OMIT/vazio = 0);
+      · `forecast_category` — a categoria as-of, preservada crua pra tela poder
+                    medir a COBERTURA (ver `_fc_cat_coverage`): em 28/06/2026 só
+                    5% do pipeline (por valor) estava numa das 4 categorias
+                    previstas, contra 74% em 30/08 — sem esse número ao lado, a
+                    curva dos diretores lê como forecast crescendo o que é
+                    sobretudo CRM sendo preenchido.
+
+    Só entram domingos que TÊM snapshot. Os que não têm não viram zero nem
+    interpolação: viram buraco na série, e a tela diz quais faltam."""
+    suns = _fc_hist_sundays(q_start, q_end)
+    disp = bq.forecast_asof_snapshots(force_refresh=force)
+    mapa = dict(zip(disp["dia"], disp["sufixo"])) if len(disp) else {}
+    idx = {s.strftime("%Y%m%d"): k for k, s in enumerate(suns)}
+    sufixos = [mapa[d] for d in idx if d in mapa]
+    # Semanas com FOTO — vem da existência da tabela, não do frame filtrado: um
+    # líder sem deal numa semana não é "semana sem dado", é semana com zero.
+    com_foto = {k for d, k in idx.items() if d in mapa}
+
+    raw = bq.forecast_asof_series(sufixos, _fc_open_stage_ids(),
+                                  force_refresh=force, pipeline=_pl())
+    weeks = max(0, len(suns) - 1)
+    if not len(raw):
+        cols = ["deal_id", "deal_name", "account_executive", "leader", "region",
+                "week_idx", "stage", "amount", "close_date", "sunday",
+                "in_fc", "v", "v_model", "v_dir", "forecast_category"]
+        vazio = pd.DataFrame(columns=cols)
+        return _fc_hist_events(vazio, 0), vazio, suns, set()
+
+    lv = canon_ae_names(raw).copy()
+    lv["week_idx"] = lv["dia"].map(idx)
+    lv = lv[lv["week_idx"].notna()]
+    lv["week_idx"] = lv["week_idx"].astype(int)
+    lv["sunday"] = lv["week_idx"].map(dict(enumerate(suns)))
+    lv["amount"] = pd.to_numeric(lv["amount"], errors="coerce").fillna(0.0)
+    lv["close_date"] = pd.to_datetime(lv["close_date"], errors="coerce")
+
+    # Hierarquia + roster/allowlist/líder/região (o `scope` é o mesmo das outras
+    # telas de histórico).
+    lv = lv.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
+    # Venda direta de gestor: o "AE" do deal é o próprio líder, então ele não
+    # casa no meta de role='AE'. Mesma atribuição que `_get_forecast_deals` faz.
+    mgr = lv["account_executive"].isin(NON_AE_USERS)
+    lv.loc[mgr, "leader"] = lv.loc[mgr, "account_executive"]
+    lv.loc[mgr, "region"] = lv.loc[mgr, "region"].fillna("BR")
+    lv = scope(lv)
+
+    lo, hi = pd.Timestamp(q_start), pd.Timestamp(q_end)
+    lv["in_fc"] = (lv["stage"].isin(_fc_open_stage_ids())
+                   & lv["close_date"].notna()
+                   & (lv["close_date"] >= lo) & (lv["close_date"] <= hi))
+    lv["v"] = lv["amount"].where(lv["in_fc"], 0.0)
+
+    # Peso do Modelo Analytics, vetorizado por (segmento, estágio, tipo): o frame
+    # tem ~15 mil linhas e é remontado a cada request.
+    seg = (lv["account_executive"].map(_mx_ae_segment) if _is_mx()
+           else lv["leader"].map(LEADER_SEGMENT))
+    st = lv["stage"].map(MODEL_STAGE)
+    kind = lv["deal_type"].map({"Aquisition": "acq", "Up & cross sell": "exp"})
+    prob = pd.Series(0.0, index=lv.index)
+    ok = seg.notna() & st.notna() & kind.notna()
+    if ok.any():
+        prob.loc[ok] = [FORECAST_MODEL_PROB[a][b][c] * MODEL_SAFETY_FACTOR
+                        for a, b, c in zip(seg[ok], st[ok], kind[ok])]
+    lv["v_model"] = lv["v"] * prob
+
+    # Peso dos diretores, com a MESMA tabela da aba Forecast
+    # (FORECAST_CATEGORY_PCT_EFF, já com o fator de correção — a série histórica
+    # inteira é recalculada aqui, então ela nasce corrigida junto com o atual):
+    # OMIT vale 0 e "sem categoria" também cai em 0 pelo
+    # fillna — é o que a aba faz com os "não previstos". A distinção entre os dois
+    # zeros não se perde: `forecast_category` fica crua no frame e
+    # `_fc_cat_coverage` a usa pra medir cobertura.
+    pct = lv["forecast_category"].map(FORECAST_CATEGORY_PCT_EFF)
+    lv["v_dir"] = lv["v"] * pct.fillna(0.0)
+
+    ev = _fc_hist_events(lv, weeks, value_col="v_model", presence_col="in_fc",
+                         com_foto=com_foto)
+    return ev, lv, suns, com_foto
+
+
+def _fc_hist_events(lv, weeks: int, value_col="v", presence_col=None,
+                    com_foto=None):
+    """Movimento derivado: uma linha por (deal, semana) em que o valor mudou.
+
+    `value_col` escolhe a BASE do movimento: "v" é o amount cheio (bruto) e
+    "v_model" é o amount ponderado pelo Modelo Analytics. A tela usa o ponderado
+    — é o número que o líder compara com a meta — e o drill precisa usar a MESMA
+    coluna, senão a soma dos deals do drill não fecha com a barra clicada.
+
+    `presence_col` é o que decide ENTRADA e SAÍDA (tipicamente `in_fc`), e existe
+    porque no ponderado o valor zero é ambíguo: um deal em Scheduled/Qualification/
+    Project Scoping está DENTRO do forecast do quarter e vale 0 no modelo (só
+    Negotiation/Decision/Procurement têm probabilidade). Sem esta coluna, o deal
+    que só avançou de estágio entrava como "novo" — media-se 40% do valor da barra
+    verde do Q3/2026 assim (R$ 1,42 mi de R$ 3,53 mi; na semana 5, 87% da barra).
+    Avanço de estágio é "ganhou peso", não entrada.
+
+    `com_foto` limita o movimento às semanas MEDÍVEIS: só existe delta quando os
+    DOIS domingos do par têm foto. Sem isso, uma semana sem snapshot virava barra
+    de saldo zero (indistinguível de "nada aconteceu") e a primeira semana com
+    foto virava uma coluna fantasma de "entrou tudo" — o Q1/2026 mostrava
+    R$ 2,03 mi de entrada em 15/02 que era a série começando.
+
+    Categorias — de propósito as MESMAS do PoP (`_WOW_NET_CATS` + um 5º), pra
+    que os construtores de linha, barra e heatmap sejam os mesmos e as duas
+    telas se leiam igual:
+      novo     entrou no forecast do quarter (deal criado, estágio abriu, ou o
+               close date entrou no trimestre);
+      cresceu  / encolheu — mexeu de valor/peso sem entrar nem sair;
+      lost     saiu SEM ser ganho: escorregou pra fora do quarter, foi perdido
+               ou voltou pra um estágio fora de 1-6;
+      won      saiu por ter sido GANHO — o 5º, separado justamente pra que won e
+               escorregada não virem a mesma barra vermelha."""
+    cols = ["deal_id", "week_idx", "delta", "category",
+            "v_prev", "v_curr", "deal_name", "account_executive", "leader", "region"]
+    if not len(lv) or weeks < 1:
+        return pd.DataFrame(columns=cols)
+
+    def _piv(col, dtype=None):
+        d = lv.assign(_x=lv[col].astype(dtype) if dtype else lv[col])
+        piv = d.pivot_table(index="deal_id", columns="week_idx", values="_x",
+                            aggfunc="sum", fill_value=0)
+        for k in range(weeks + 1):      # semana sem nenhum deal ainda é coluna
+            if k not in piv.columns:
+                piv[k] = 0
+        return piv[sorted(piv.columns)]
+
+    piv = _piv(value_col, float)
+    pres = _piv(presence_col, float) if presence_col else (piv != 0).astype(float)
+
+    # Estágio de cada (deal, domingo) — só pra distinguir won de escorregada.
+    stg = (lv.drop_duplicates(["deal_id", "week_idx"])
+             .set_index(["deal_id", "week_idx"])["stage"])
+    # Dono de cada (deal, semana): quem era o AE NAQUELE domingo. Congelar no dono
+    # da 1ª foto jogava o movimento no time errado quando o deal troca de mão —
+    # 101 deals mudaram de AE dentro do Q3/2026, R$ 360 mil de eventos.
+    dono = (lv.drop_duplicates(["deal_id", "week_idx"])
+              .set_index(["deal_id", "week_idx"])[["deal_name", "account_executive",
+                                                   "leader", "region"]])
+
+    medivel = (None if com_foto is None
+               else {k for k in range(1, weeks + 1)
+                     if k in com_foto and (k - 1) in com_foto})
+
+    partes = []
+    for k in range(1, weeks + 1):
+        if medivel is not None and k not in medivel:
+            continue
+        prev, curr = piv[k - 1], piv[k]
+        p_prev, p_curr = pres[k - 1] > 0, pres[k] > 0
+        d = curr - prev
+        m = (d != 0) | (p_prev != p_curr)
+        if not m.any():
+            continue
+        partes.append(pd.DataFrame({
+            "deal_id": piv.index[m], "week_idx": k,
+            "v_prev": prev[m].to_numpy(), "v_curr": curr[m].to_numpy(),
+            "delta": d[m].to_numpy(),
+            "dentro_antes": p_prev[m].to_numpy(),
+            "dentro_agora": p_curr[m].to_numpy(),
+        }))
+    if not partes:
+        return pd.DataFrame(columns=cols)
+    ev = pd.concat(partes, ignore_index=True)
+
+    def _cat(r):
+        # Sem underscore no nome de propósito: itertuples() renomeia coluna que
+        # começa com "_" pra posicional (_1, _2) e o acesso por nome quebra.
+        if not r.dentro_antes and r.dentro_agora:
+            return "novo"
+        if r.dentro_antes and not r.dentro_agora:
+            return ("won" if stg.get((r.deal_id, r.week_idx)) == _HS_WON_STAGE
+                    else "lost")
+        return "cresceu" if r.delta > 0 else "encolheu"
+
+    ev["category"] = [_cat(r) for r in ev.itertuples()]
+    # Entrada/saída com delta 0 (deal que entrou num estágio sem peso no modelo,
+    # ou saiu valendo 0) não é movimento nenhum na série ponderada: some, senão a
+    # barra ganha deals que não mexeram o número.
+    ev = ev[(ev["delta"] != 0)]
+    if not len(ev):
+        return pd.DataFrame(columns=cols)
+    ev = ev.join(dono, on=["deal_id", "week_idx"])
+    return ev.reindex(columns=cols)
+
+
+# ---------------------------------------------------------------------------
+# As DUAS séries semanais da tela. Uma por modelo de forecast, porque são duas
+# perguntas diferentes e os números não se substituem:
+#
+#   · MODELO ANALYTICS — peso = probabilidade histórica de conversão do
+#     segmento × estágio × tipo. Reconstruível pro quarter INTEIRO, porque a
+#     cópia diária do BI tem estágio, amount e tipo as-of.
+#   · MODELO DOS DIRETORES (100/75/50/25%) — peso = `hs_manual_forecast_category`,
+#     o julgamento do dono do deal. Também reconstruível pro quarter inteiro,
+#     porque a cópia diária do BI guarda a categoria as-of. O que NÃO se pode
+#     fazer é aplicar a categoria de HOJE ao passado: um deal que hoje é Commit
+#     era Pipeline em julho, o passado sairia alto e a curva viria "caindo" por
+#     artefato de método. Ler a foto do dia não tem esse problema; o viés dela é
+#     outro, e está medido em `_fc_cat_coverage` (a categoria vai sendo
+#     PREENCHIDA durante o trimestre).
+#
+# Os pontos que não existem entram como None e a linha PULA — não como zero, que
+# seria afirmar que o forecast era nulo naquela semana.
+# ---------------------------------------------------------------------------
+
+def _fc_cat_coverage(lv, suns, com_foto):
+    """Como o pipeline estava CLASSIFICADO em cada domingo, POR VALOR:
+      · `prev` — % numa das 4 categorias previstas (100/75/50/25%);
+      · `omit` — % marcado como Not forecasted (peso 0 de propósito);
+      · `sem`  — % sem categoria nenhuma (ninguém preencheu).
+
+    Isto vai pra tela junto da série dos diretores porque sem isso o gráfico
+    mente por omissão. Medido no Q3/2026: em 28/06 só 5% do pipeline (por valor)
+    estava numa categoria prevista — 39% sem categoria e 56% em Not forecasted —
+    contra 74% em 30/08. A curva do modelo dos diretores sobe 18x nesse período, e
+    a maior parte disso é o CRM sendo preenchido, não confiança nova do time.
+
+    `omit` fica separado de `sem` de propósito: "o AE disse que não entra" é uma
+    informação; "ninguém preencheu" é a falta dela."""
+    out = []
+    for k in range(len(suns)):
+        if k not in com_foto:
+            out.append(None)
+            continue
+        wk = lv[(lv["week_idx"] == k) & lv["in_fc"]] if len(lv) else lv
+        tot = float(wk["v"].sum()) if len(wk) else 0.0
+        if not tot:
+            out.append(None)
+            continue
+        cat = wk["forecast_category"]
+        prev = float(wk.loc[cat.isin(FORECAST_CATEGORY_ORDER), "v"].sum())
+        vazio = cat.isna() | (cat.astype(str).str.strip() == "")
+        out.append({"prev": 100.0 * prev / tot,
+                    "sem": 100.0 * float(wk.loc[vazio, "v"].sum()) / tot,
+                    "omit": 100.0 * float(wk.loc[cat.eq("OMIT"), "v"].sum()) / tot})
+    return out
+
+
+def _fc_nota_cobertura(cob, suns) -> str:
+    """A nota que acompanha a série dos diretores — ver `_fc_cat_coverage`."""
+    vis = [(k, c) for k, c in enumerate(cob) if c is not None]
+    if not vis:
+        return ""
+    (k0, c0), (k1, c1) = vis[0], vis[-1]
+    detalhe = " · ".join(f"{_fmt_date_short(suns[k])} <b>{c['prev']:.0f}%</b>" for k, c in vis)
+    return (
+        "<b>Leia junto com a cobertura.</b> Este peso é o julgamento do dono do deal, "
+        "então a curva só é comparável entre semanas se a categoria estiver preenchida. "
+        f"Em {_fmt_date_short(suns[k0])}, <b>{c0['prev']:.0f}%</b> do pipeline (por valor) "
+        f"estava numa das 4 categorias previstas — {c0['sem']:.0f}% sem categoria nenhuma e "
+        f"{c0['omit']:.0f}% em <i>Not forecasted</i>. Em {_fmt_date_short(suns[k1])} são "
+        f"<b>{c1['prev']:.0f}%</b> ({c1['sem']:.0f}% e {c1['omit']:.0f}%). "
+        "Ou seja: boa parte da subida desta curva é CRM sendo preenchido, não confiança nova — "
+        "o Modelo Analytics ao lado não tem esse viés. Categoria prevista, semana a semana: "
+        f"{detalhe}.")
+
+
+def _fc_series_team(lv, suns, col, com_foto):
+    """Série do time (uma soma por domingo) de uma das colunas ponderadas.
+    Domingo sem foto devolve None — buraco na linha, não zero: zero afirmaria que
+    o forecast era nulo naquela semana. `com_foto` é o conjunto de semanas que
+    TÊM snapshot, e vem da existência da tabela — não do frame, que já está
+    filtrado por líder/região e pode estar legitimamente vazio numa semana."""
+    out = []
+    for k in range(len(suns)):
+        if k not in com_foto:
+            out.append(None)
+            continue
+        wk = lv[lv["week_idx"] == k] if len(lv) else lv
+        out.append(float(wk[col].fillna(0.0).sum()) if len(wk) else 0.0)
+    return out
+
+
+def _fc_series_by_leader(lv, suns, col, leader_filter, com_foto):
+    """Uma série por LÍDER, na convenção das telas de Leaders: o diretor engloba
+    o gerente (via `_explode_leaders`), então a soma das linhas não fecha com o
+    time — de propósito, igual à matriz semana × líder."""
+    ex = _explode_leaders(lv, leader_filter)
+    if not len(ex):
+        return []
+    out = []
+    for name, grp in ex.groupby("account_executive"):
+        vals = []
+        for k in range(len(suns)):
+            if k not in com_foto:
+                vals.append(None)
+                continue
+            wk = grp[grp["week_idx"] == k]
+            vals.append(float(wk[col].fillna(0.0).sum()) if len(wk) else 0.0)
+        out.append({"name": name, "short": short_name(name), "values": vals})
+    # Ordem = LEADER_ORDER (hierarquia), não alfabética nem por valor: a mesma
+    # sequência do dropdown e do organograma, pra leitura ficar previsível.
+    ordem = {L: i for i, L in enumerate(LEADER_ORDER)}
+    out.sort(key=lambda r: ordem.get(r["name"], 99))
+    return out
+
+
+def _fc_done_cumulative(f, suns, q0, q1, force=False):
+    """Done (PO Won) ACUMULADO até cada domingo, no time e por líder.
+
+    Fato imutável: um deal ganho não deixa de ter sido ganho, e a data de
+    validação não muda depois. Por isso o acumulado sai da base de HOJE em vez do
+    histórico semanal — não há nada a reconstruir. O recorte de quarter é o mesmo
+    da aba Forecast (data de validação, não close date), com a extensão de
+    fechamento (`rev_date`): validado em 01–02/10/2026 é Done do Q3, não do Q4."""
+    deals = _get_forecast_deals(force=force)
+    lo, hi = pd.Timestamp(q0), pd.Timestamp(q1)
+    won = deals[deals["is_won"] & deals["rev_date"].notna()
+                & (deals["rev_date"] >= lo) & (deals["rev_date"] <= hi)].copy()
+    won = _fc_hist_scope(f, cut_from=q0)(won)
+    team = [float(won[won["rev_date"] <= pd.Timestamp(s)]["amount"].sum())
+            for s in suns]
+    ex = _explode_leaders(won, f.get("leader"))
+    by = {}
+    if len(ex):
+        for name, grp in ex.groupby("account_executive"):
+            by[name] = [float(grp[grp["rev_date"] <= pd.Timestamp(s)]["amount"].sum())
+                        for s in suns]
+    return team, by
+
+
+def _fc_sum_series(a, b):
+    """Soma duas séries ponto a ponto preservando os buracos: None + x = None.
+    (Projeção = Done + Forecast; onde o forecast não existe, a projeção também
+    não — somar só o Done desenharia uma curva que não é de projeção nenhuma.)"""
+    out = []
+    for i, va in enumerate(a):
+        vb = b[i] if i < len(b) else None
+        out.append(None if (va is None or vb is None) else float(va) + float(vb))
+    return out
+
+
+def _build_fc_line(suns, series, goal=None, y_max=None):
+    """Geometria SVG da linha de uma das séries de forecast, em R$.
+
+    Difere do `_build_line_chart` (que é em %) em três coisas que esta tela pede:
+      · eixo em moeda, com o filtro mestre MRR/ARR aplicado pelo fmt_brl;
+      · LINHA DE META horizontal — sem ela a série não responde "estamos acima ou
+        abaixo do alvo?", que é a pergunta da tela;
+      · buraco na série: valor None não desenha ponto E parte a linha em dois
+        segmentos, em vez de interpolar por cima de uma semana sem dado.
+
+    Eixo Y começa em 0: numa série de nível, cortar a base transforma 5% de
+    oscilação em tobogã (mesma decisão do `_build_hist_level`)."""
+    _TOP, _PLOT, _BOT = 34, 250, 76
+    # _RIGHT = espaço do rótulo da meta na margem. 78 e não 70 porque em ARR US$
+    # o rótulo é maior ("US$ 5,95M" = 62px contra "R$ 2,50M" = 54px) e sobravam
+    # 2,4px de folga — um valor de 2 dígitos passaria por cima da borda.
+    _LEFT, _RIGHT = 96, 78
+    n = max(len(suns), 1)
+    # Passo dimensionado pra largura TOTAL caber no painel (~1.100px no desktop):
+    # com 96 o gráfico de 10 pontos dava 1.134 e o container abria scroll
+    # horizontal — o rótulo da meta, que fica na margem direita, ficava cortado.
+    _STEP = 88 if n <= 11 else (60 if n <= 16 else 44)
+    base_y = _TOP + _PLOT
+    right_x = _LEFT + n * _STEP
+
+    vals = [v for s in series for v in s["values"] if v is not None]
+    top = y_max or (max(vals + ([goal] if goal else []) + [1000.0]) * 1.10)
+    yL = [{"label": fmt_brl(top * k / 4), "y": round(base_y - k / 4 * _PLOT, 1)}
+          for k in range(5)]
+    # Rótulo de data: "28 jun 2026" (11 chars) só cabe em toda coluna com passo
+    # largo. Com passo médio o ANO sai (ele já está no h1 e no subtítulo), o que
+    # corta a largura quase pela metade; com passo estreito, além disso, rotula
+    # uma coluna a cada duas — sempre incluindo a última. Medido antes: 26 de 26
+    # pares de datas se sobrepondo numa janela de 27 pontos.
+    _curto = _STEP < 70
+    _pula = _STEP < 56
+    def _rot(i, sd):
+        if _pula and i % 2 != (len(suns) - 1) % 2:
+            return ""
+        return _fmt_date_curta(sd) if _curto else _fmt_date_short(sd)
+    xs = [{"label": _rot(i, sd),
+           "cx": round(_LEFT + i * _STEP + _STEP / 2, 1),
+           "zx": round(_LEFT + i * _STEP, 1)} for i, sd in enumerate(suns)]
+
+    def _y(v):
+        return round(base_y - min(v / top, 1.0) * _PLOT, 1)
+
+    # ---- 1ª passada: geometria dos pontos e das linhas ----
+    out = []
+    for s in series:
+        segs, cur, pontos = [], [], []
+        for i, v in enumerate(s["values"]):
+            if v is None:                      # buraco: parte a linha em dois
+                if len(cur) > 1:
+                    segs.append(" ".join(cur))
+                cur = []
+                continue
+            cx, cy = xs[i]["cx"], _y(float(v))
+            cur.append(f"{cx},{cy}")
+            pontos.append({"i": i, "cx": cx, "cy": cy, "v": float(v)})
+        if len(cur) > 1:
+            segs.append(" ".join(cur))
+        out.append({"name": s["name"], "color": s["color"], "dash": s.get("dash", ""),
+                    "segs": segs, "points": pontos})
+
+    # ---- 2ª passada: rótulos, com registro do que já está ocupado na coluna ----
+    #
+    # Rotular ponto a ponto sem olhar o vizinho produzia duas colisões reais:
+    # rótulo da série de cima em cima da série de baixo (quando as duas terminam
+    # próximas, o caso de todo trimestre FECHADO, medido com 85% de sobreposição),
+    # e rótulo em cima da tracejada da meta. Aqui cada rótulo escolhe entre acima
+    # e abaixo do ponto o lado que ainda está livre.
+    goal_y = _y(float(goal)) if goal else None
+    ocupado = {}                     # índice da coluna → lista de y já usados
+    for si, s in enumerate(out):
+        n_pts = len(s["points"])
+        for pi, p in enumerate(s["points"]):
+            # Todos os pontos da 1ª série levam rótulo; das outras, só a ponta —
+            # 2 séries × 10 pontos com rótulo em tudo viram mancha. Com eixo
+            # apertado (passo < 56, janela de 20+ semanas) a 1ª série também
+            # rotula uma coluna a cada duas: as MESMAS que levam data, senão
+            # rótulos vizinhos de ~54px se sobrepõem num passo de 44.
+            ultimo = pi == n_pts - 1
+            if not (si == 0 or ultimo):
+                p["label"], p["ly"], p["big"] = "", p["cy"], False
+                continue
+            if _pula and not ultimo and p["i"] % 2 != (len(suns) - 1) % 2:
+                p["label"], p["ly"], p["big"] = "", p["cy"], False
+                continue
+            # Passo estreito precisa alternar acima/abaixo pra caber; passo largo
+            # prefere sempre acima (mais fácil de ler).
+            prefere_acima = (si > 0 or _STEP >= 70 or p["i"] % 2 == 0)
+            cands = ([p["cy"] - 11, p["cy"] + 18] if prefere_acima
+                     else [p["cy"] + 18, p["cy"] - 11])
+            # Com passo menor que a largura de um rótulo (~54px), o vizinho de
+            # coluna também disputa espaço — o registro tem que olhar os três.
+            _viz = ([p["i"] - 1, p["i"], p["i"] + 1] if _STEP < 58 else [p["i"]])
+            usados = [y for c in _viz for y in ocupado.get(c, [])]
+            escolhido = None
+            for c in cands:
+                if any(abs(c - u) < 13 for u in usados):
+                    continue
+                if goal_y is not None and abs(c - goal_y) < 11:
+                    continue
+                escolhido = c
+                break
+            if escolhido is None:           # os dois lados ocupados: fica no 1º
+                escolhido = cands[0]
+            ocupado.setdefault(p["i"], []).append(escolhido)
+            p["label"] = fmt_brl(p["v"])
+            p["ly"] = round(escolhido, 1)
+            p["big"] = si == 0
+
+    g = None
+    if goal:
+        # Rótulo DENTRO do gráfico é só o valor: "Meta · R$ 2,50M" não cabe na
+        # margem direita (78px) e saía cortado em "Me…". Quem nomeia a tracejada
+        # é a legenda, que tem o texto inteiro.
+        g = {"y": _y(float(goal)), "label": fmt_brl(goal), "value": fmt_brl(goal)}
+    return {"w": right_x + _RIGHT, "h": _TOP + _PLOT + _BOT, "left": _LEFT, "top": _TOP,
+            "base_y": base_y, "right_x": right_x, "step": _STEP, "plot_h": _PLOT,
+            "yL": yL, "xs": xs, "series": out, "goal": g}
+
+
+def _build_fc_small(rows, goal_by, n_pts, span=None):
+    """Small multiples: um mini-gráfico de linha por líder, TODOS na mesma escala.
+
+    A escala comum é o que torna a comparação honesta — normalizar cada card pelo
+    próprio máximo faria o forecast de R$ 130 mil do João parecer do tamanho do de
+    R$ 900 mil do Fernando (mesma razão do `_build_hist_spark`). A meta de cada um
+    entra como tracejada DENTRO do card: é ela que diz se a linha está no lugar.
+    """
+    _W, _H, _PAD = 30, 78, 9
+    # Escala: só o que ESTÁ na tela. Usar LEADER_BOARD_TARGET inteiro fazia o
+    # card do João Tavares (meta R$ 184 mil) ser escalado pela meta do Fernando
+    # (R$ 899 mil) quando o filtro era só o João — a linha dele ficava nos 40%
+    # de baixo do card e o cabeçalho anunciava um topo de ninguém na tela.
+    span = span or (max([v for r in rows for v in r["values"] if v is not None]
+                        + [float(goal_by.get(r["name"]) or 0.0) for r in rows]
+                        + [1000.0]) * 1.10)
+    w = max(n_pts, 1) * _W
+    out = []
+    for r in rows:
+        meta = float(goal_by.get(r["name"]) or 0.0)
+        segs, cur, pts = [], [], []
+        for i, v in enumerate(r["values"]):
+            if v is None:
+                if len(cur) > 1:
+                    segs.append(" ".join(cur))
+                cur = []
+                continue
+            cx = round(i * _W + _W / 2, 1)
+            cy = round(_H - _PAD - (float(v) / span) * (_H - 2 * _PAD), 1)
+            cur.append(f"{cx},{cy}")
+            pts.append({"cx": cx, "cy": cy})
+        if len(cur) > 1:
+            segs.append(" ".join(cur))
+        vis = [v for v in r["values"] if v is not None]
+        ini, fim = (vis[0], vis[-1]) if vis else (0.0, 0.0)
+        out.append({**r, "segs": segs, "points": pts,
+                    "goal_y": (round(_H - _PAD - (meta / span) * (_H - 2 * _PAD), 1)
+                               if meta else None),
+                    "goal": meta, "start": ini, "end": fim, "delta": fim - ini,
+                    "att": (fim / meta) if meta else None})
+    return {"w": w, "h": _H, "rows": out, "span": span, "span_label": fmt_brl(span)}
+
+
+def _fc_hist_bridge(wk_rows, level0, level_end):
+    """Ponte da janela. Aqui ela fecha EXATO por construção (nível e movimento
+    saem do mesmo `v`), ao contrário da ponte do Histórico PoP, onde o resíduo é
+    uma parcela real. O resíduo continua sendo calculado e exibido quando não é
+    zero — não porque se espere que aconteça, mas porque, se um dia acontecer,
+    é sinal de bug nesta tela e esconder isso seria pior."""
+    net = sum(r["net"] for r in wk_rows)
+    won = sum(r["fifth"] for r in wk_rows)
+    return {"net": net, "won": won,
+            "residuo": (level_end - level0) - (net + won)}
+
+
+def _fc_hist_label(q0: date, q1: date) -> str:
+    """Título da janela. "Q3 2026" quando é UM trimestre; "Q1→Q2 2026" quando o
+    filtro de datas cruza a virada — antes o h1 dizia "Q1 2026" pra uma série de
+    seis meses, porque o rótulo saía só de q0."""
+    a = f"Q{(q0.month - 1) // 3 + 1} {q0.year}"
+    b = f"Q{(q1.month - 1) // 3 + 1} {q1.year}"
+    return a if a == b else f"{a} → {b}"
+
+
+def _fc_hist_quarter(f) -> tuple:
+    """(início, fim) do quarter da série. Sai do MESMO recorte de data da barra
+    de filtros que a aba Forecast usa, e não de `today` fixo: assim escolher um
+    trimestre passado no filtro leva a série junto, em vez de a tela contradizer
+    o filtro que está desenhado logo acima dela. Sem filtro = quarter atual."""
+    today = _today()
+    from_d = pd.to_datetime(f["date_from"]).date() if f["date_from"] else _quarter_start_of(today)
+    to_d = pd.to_datetime(f["date_to"]).date() if f["date_to"] else _quarter_end_of(today)
+    return _quarter_start_of(from_d), _quarter_end_of(to_d)
+
+
+def _fc_hist_scope(f, cut_from=None):
+    """Filtro de roster/allowlist/líder/região da tela.
+
+    `drop_departed_people` e NÃO `HIDDEN_FROM_AE_VIEWS`: a lista antiga levava
+    embora também os GESTORES, e com eles a venda direta do líder — que a aba
+    Forecast conta. Media R$ 73 mil de diferença no domingo de 30/08/2026 (2,1%
+    do forecast do modelo), o suficiente pra as duas telas nunca fecharem. Quem é
+    gestor continua fora das listas POR AE, mas por `drop_non_ae_people`, no
+    ponto certo (ver o bloco "Duas exclusões DIFERENTES").
+
+    `cut_from` (o início do trimestre da série) manda no corte de quem saiu da
+    empresa: numa série histórica, quem está em DEPARTED_FROM tem que continuar
+    inteiro nos trimestres ANTERIORES ao cutoff dele — é o contrato da lista."""
+    def _scope(x):
+        x = _apply_roster_current(x, cut_from=cut_from)
+        x = x[x["leader"].isin(ALLOWED_LEADERS)]
+        x = drop_departed_people(x)
+        if f.get("region"):
+            x = x[x["region"] == f["region"]]
+        if f.get("leader"):
+            x = x[x["leader"].isin(expand_leader(f["leader"]))]
+        # Filtro de AE da barra (21/10/2026): antes ficava de fora, e as telas que
+        # usam este escopo (Histórico/WoW/DoD do Forecast, Pipeline DoD/WoW)
+        # mostravam o time inteiro com um AE escolhido — tela e explosão.
+        if f.get("ae"):
+            x = x[x["account_executive"] == f["ae"]]
+        return x
+    return _scope
+
+
+def _fc_hist_missing(suns, com_foto) -> list:
+    """Domingos da janela SEM snapshot as-of — a série tem buraco ali, e a tela
+    diz quais são em vez de emendar a linha por cima. Substituiu a caixa "origem
+    do close date": com a cópia diária do BI não há mais mistura de fontes, o
+    close date é o que valia no dia."""
+    return [_fmt_date_short(sd) for k, sd in enumerate(suns) if k not in com_foto]
+
+
+def _render_forecast_history(grain="ae"):
+    """Histórico do Forecast: como o forecast do quarter se comportou semana a
+    semana, nos DOIS modelos, no total do time e depois líder por líder.
+
+    Duas séries porque são dois julgamentos diferentes do mesmo pipeline, e
+    nenhum substitui o outro:
+      · Modelo Analytics — probabilidade histórica de conversão (segmento ×
+        estágio × tipo). Não depende de ninguém preencher nada;
+      · Modelo dos diretores — a forecast category (100/75/50/25%), que é o
+        julgamento do dono do deal. Depende de estar preenchida, e é por isso que
+        a COBERTURA aparece junto: em 28/06/2026 só 60% do pipeline tinha
+        categoria, contra 95% em 30/08 — boa parte da subida da curva é
+        preenchimento de CRM, não confiança nova.
+
+    Cada série é comparada com a MESMA meta das outras telas (Comp. Target, via
+    LEADER_BOARD_TARGET) — é a pergunta da tela: o forecast está andando na
+    direção do alvo?"""
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    q0, q1 = _fc_hist_quarter(f)
+
+    ev, lv, suns, com_foto = _fc_hist_frames(q0, q1, _fc_hist_scope(f, cut_from=q0),
+                                             force=force)
+    weeks = max(0, len(suns) - 1)
+    lvf = lv[lv["in_fc"]] if len(lv) else lv
+    # Nível e movimento na base do Modelo Analytics: é o número que o líder
+    # compara com a meta, e nível e movimento têm que sair da MESMA coluna pra
+    # ponte fechar (ver _fc_hist_bridge).
+    wk_rows, _lv0, _n0 = _hist_week_rows(ev, lvf, _WOW_NET_CATS, "won", weeks, suns,
+                                         level_col="v_model")
+    people = _hist_people(ev[ev["category"].isin(_WOW_NET_CATS)], lvf,
+                          weeks, grain, f.get("leader"), level_col="v_model")
+    # Semanas MEDÍVEIS: só as que têm foto nas duas pontas. Sem este corte, semana
+    # sem snapshot virava barra de saldo zero — que se lê como "nada aconteceu" —
+    # e a 1ª semana com foto virava coluna fantasma de "entrou tudo".
+    medivel = {k for k in range(1, weeks + 1) if k in com_foto and (k - 1) in com_foto}
+    wk_rows = [r for r in wk_rows if r["idx"] in medivel]
+    # A ponte parte do nível do domingo ANTERIOR à 1ª semana medível (e não do
+    # domingo 0, que pode não ter foto: level0 = 0 dizia "o forecast era zero").
+    level0 = (float(lvf[lvf["week_idx"] == (wk_rows[0]["idx"] - 1)]["v_model"].sum())
+              if wk_rows and len(lvf) else 0.0)
+    level_end = wk_rows[-1]["level"] if wk_rows else level0
+    bridge = _fc_hist_bridge(wk_rows, level0, level_end)
+    # A ponte só fecha se as semanas medíveis forem CONTÍNUAS. Com buraco no meio,
+    # o resíduo seria o que aconteceu na semana não medida — informação legítima,
+    # mas aí a ponte não é uma conta fechada, e sai da tela.
+    ponte_ok = bool(wk_rows) and (len(wk_rows) == wk_rows[-1]["idx"] - wk_rows[0]["idx"] + 1)
+    # A matriz semana × pessoa segue as MESMAS colunas do gráfico de movimento:
+    # `_hist_people` devolve uma célula por semana da janela, então as semanas não
+    # medíveis são recortadas aqui — senão a tabela tinha 13 colunas de dado pra
+    # 6 cabeçalhos (e estourava o índice na renderização).
+    _idxs = [r["idx"] for r in wk_rows]
+    for _p in people:
+        _p["weekly"] = [_p["weekly"][i - 1] for i in _idxs]
+        _p["total"] = sum(_p["weekly"])
+        _p["pos_weeks"] = sum(1 for v in _p["weekly"] if v > 0)
+    people = [_p for _p in people if _p["total"] or any(_p["weekly"])
+              or _p.get("level_end")]
+    people.sort(key=lambda r: r["total"], reverse=True)
+
+    # ---- As duas séries do time + o Done acumulado ----
+    fc_model = _fc_series_team(lv, suns, "v_model", com_foto)
+    fc_dir = _fc_series_team(lv, suns, "v_dir", com_foto)
+    done, done_by = _fc_done_cumulative(f, suns, q0, q1, force=force)
+    # KPI "Realizado": acumulado no quarter ATÉ HOJE (ou até o fim dele), não
+    # só até o último domingo do eixo — o eixo do Q3/26 para em 27/09 e o card
+    # perderia 28–30/09 e os validados na extensão de fechamento (até 02/10).
+    _done_fim, _ = _fc_done_cumulative(f, [min(_today(), q1)], q0, q1, force=force)
+    proj_model = _fc_sum_series(done, fc_model)
+    proj_dir = _fc_sum_series(done, fc_dir)
+    cobertura = _fc_cat_coverage(lv, suns, com_foto)
+
+    # ---- Meta: a MESMA das outras telas (Comp. Target dos líderes no recorte).
+    # SÓ no trimestre corrente: LEADER_BOARD_TARGET é a planilha do quarter em
+    # curso (ver o comentário do dict), então desenhá-la sobre a série de um
+    # trimestre passado seria comparar o forecast de abril com a meta de julho.
+    # Fora do quarter corrente a tela mostra as séries SEM linha de meta e diz
+    # por quê — melhor faltar a referência do que ela estar errada.
+    # "Corrente" pela data da RECEITA: durante a extensão de fechamento o
+    # trimestre que ainda acumula realizado é o anterior (02/10/2026 → Q3).
+    meta_ok = (q0 == _quarter_start_of(_rev_date(_today()))
+               and q1 == _quarter_end_of(q0))       # meta é de UM trimestre
+    lideres = sorted({L for L in lv["leader"].dropna().unique()}) if len(lv) else []
+    meta_team = _leader_meta_total(lideres) if meta_ok else 0.0
+    metas_lider = LEADER_BOARD_TARGET if meta_ok else {}
+    # Com um AE escolhido, a série é só dele: a meta é a quota dele no trimestre,
+    # e o alvo do líder sai dos cartões por líder (seria o time inteiro contra
+    # um vendedor).
+    if f.get("ae") and meta_ok:
+        meta_team = _ae_quarter_quota(f["ae"], q0, f, force=force)
+        metas_lider = {}
+
+    # ---- Recorte por líder (o "depois cada um dos diretores") ----
+    por_lider_model = _fc_series_by_leader(lv, suns, "v_model", f.get("leader"), com_foto)
+    por_lider_dir = _fc_series_by_leader(lv, suns, "v_dir", f.get("leader"), com_foto)
+    for r in por_lider_model:
+        r["values"] = _fc_sum_series(done_by.get(r["name"], [0.0] * len(suns)), r["values"])
+    for r in por_lider_dir:
+        r["values"] = _fc_sum_series(done_by.get(r["name"], [0.0] * len(suns)), r["values"])
+
+    def _drill(idx, cats, name=""):
+        return url_for("forecast_history_deals", week=idx, cat=cats, name=name,
+                       grain=grain,
+                       leader=(f.get("leader") if not name else None),
+                       region=(f.get("region") if not name else None),
+                       date_from=f.get("date_from"), date_to=f.get("date_to"))
+
+    # Topo de eixo COMUM aos dois gráficos. Com cada um usando o próprio máximo,
+    # duas séries de tamanhos diferentes desenhavam a mesma altura e comparar os
+    # modelos de bater o olho enganava.
+    _todos = [v for serie in (proj_model, proj_dir, done) for v in serie if v is not None]
+    y_max_comum = max(_todos + [meta_team, 1000.0]) * 1.10
+    # Mesma ideia nos small multiples: um span pros DOIS grids, senão o card do
+    # mesmo diretor tem a meta em alturas diferentes nos dois modelos — e o
+    # cabeçalho manda justamente comparar card a card.
+    _cards = [v for r in (por_lider_model + por_lider_dir) for v in r["values"]
+              if v is not None]
+    span_cards = max(_cards + [float(v) for v in metas_lider.values()]
+                     + [1000.0]) * 1.10
+
+    def _fim(serie):
+        vis = [v for v in serie if v is not None]
+        return vis[-1] if vis else 0.0
+
+    def _ini(serie):
+        vis = [v for v in serie if v is not None]
+        return vis[0] if vis else 0.0
+
+    # Datas do 1º e do último ponto COM DADO — e não as pontas da janela. Num
+    # trimestre parcialmente coberto (o Q1/2026 tem 7 domingos sem foto) o card
+    # dizia "de R$ 2,61M em 28 dez 2025", uma data que não tem ponto nenhum.
+    _com = sorted(k for k in com_foto if k < len(suns))
+    pt_ini_label = _fmt_date_short(suns[_com[0]]) if _com else "—"
+    pt_fim_label = _fmt_date_short(suns[_com[-1]]) if _com else "—"
+
+    def _delta_semana(serie):
+        """Δ do último ponto contra o ponto COM DADO anterior (e não contra o
+        índice −2, que pode ser um domingo sem foto)."""
+        vis = [v for v in serie if v is not None]
+        return (vis[-1] - vis[-2]) if len(vis) >= 2 else None
+
+    return render_template(
+        "forecast_history.html", ctx=ctx, grain=grain, weeks=weeks,
+        q_label=_fc_hist_label(q0, q1),
+        q_range=f"{q0.strftime('%d/%m/%Y')} → {q1.strftime('%d/%m/%Y')}",
+        wk_rows=wk_rows, people=people,
+        level0=level0, level_end=level_end, bridge=bridge, ponte_ok=ponte_ok,
+        # O subtítulo fala da SÉRIE (1º e último ponto com foto), não da janela:
+        # no Q1/2026 ele dizia "13 semanas · 28 dez 2025 → 29 mar 2026" pra uma
+        # série que começa em 15/02.
+        first_label=pt_ini_label, last_label=pt_fim_label,
+        pt_ini_label=pt_ini_label, pt_fim_label=pt_fim_label,
+        n_pontos=len(_com),
+        wow_model=_delta_semana(proj_model), wow_dir=_delta_semana(proj_dir),
+        bars=_build_hist_bars(wk_rows, weeks, _drill),
+        # A matriz só precisa da ESCALA (maior |saldo| de célula) pra pintar a
+        # intensidade. Antes vinha de `_build_hist_spark`, que montava também as
+        # barrinhas do painel de saldo por pessoa — painel que saiu da tela
+        # quando os small multiples passaram a ser de NÍVEL, por modelo.
+        hm_span=max([abs(v) for p in people for v in p["weekly"]] + [1.0]),
+        total_net=sum(r["net"] for r in wk_rows),
+        total_won=sum(r["fifth"] for r in wk_rows),
+        best=(max(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        worst=(min(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
+        faltando=_fc_hist_missing(suns, com_foto),
+        drill=_drill,
+        # --- Modelo Analytics
+        meta_team=meta_team,
+        chart_model=_build_fc_line(
+            suns,
+            [{"name": "Projeção (Done + Forecast)", "color": "#2563EB",
+              "values": proj_model},
+             {"name": "Done acumulado (PO Won)", "color": "#0F6E56",
+              "values": done, "dash": "5 4"}],
+            goal=meta_team, y_max=y_max_comum),
+        small_model=_build_fc_small(por_lider_model, metas_lider, len(suns),
+                                    span=span_cards),
+        proj_model_now=_fim(proj_model), proj_model_ini=_ini(proj_model),
+        att_model=(_fim(proj_model) / meta_team) if meta_team else None,
+        # --- Modelo dos diretores (forecast category)
+        chart_dir=_build_fc_line(
+            suns,
+            [{"name": "Projeção (Done + Forecast ponderado)", "color": "#7C3AED",
+              "values": proj_dir},
+             {"name": "Done acumulado (PO Won)", "color": "#0F6E56",
+              "values": done, "dash": "5 4"}],
+            goal=meta_team, y_max=y_max_comum),
+        small_dir=_build_fc_small(por_lider_dir, metas_lider, len(suns),
+                                  span=span_cards),
+        proj_dir_now=_fim(proj_dir), proj_dir_ini=_ini(proj_dir),
+        att_dir=(_fim(proj_dir) / meta_team) if meta_team else None,
+        cobertura=cobertura,
+        meta_ok=meta_ok,
+        sem_serie=not any(v is not None for v in proj_model),
+        done_now=(_done_fim[0] if _done_fim else (done[-1] if done else 0.0)),
+        rev_note=rev_ext_note(q0.isoformat(), q1.isoformat()),
+        nota_dir=_fc_nota_cobertura(cobertura, suns),
+        suns_labels=[_fmt_date_short(sd) for sd in suns],
+    )
+
+
+@app.route("/forecast/history")
+def forecast_history():
+    return _render_forecast_history("ae")
+
+
+@app.route("/leaders/forecast/history")
+def leaders_forecast_history():
+    return _render_forecast_history("leader")
+
+
+@app.route("/forecast/history/deals")
+def forecast_history_deals():
+    """Drill de UMA semana da série: os deals que entraram, cresceram, encolheram,
+    saíram ou foram ganhos naquela semana. A janela é reconstruída aqui a partir
+    do quarter + índice da semana — não vem par de datas na querystring que possa
+    divergir do que foi clicado (mesma decisão do drill do Histórico PoP)."""
+    f = get_filters()
+    q0, q1 = _fc_hist_quarter(f)
+    suns = _fc_hist_sundays(q0, q1)
+    weeks = max(0, len(suns) - 1)
+    try:
+        wk = int(request.args.get("week") or 0)
+    except (TypeError, ValueError):
+        wk = 0
+    if not 1 <= wk <= weeks:
+        return jsonify(_empty_drill(""))
+    # Semana sem foto nas duas pontas não é movimento medido: o gráfico não
+    # desenha barra ali, e o drill por URL direta também não inventa uma.
+    _disp = bq.forecast_asof_snapshots()
+    _dias = set(_disp["dia"]) if len(_disp) else set()
+    if not all(suns[i].strftime("%Y%m%d") in _dias for i in (wk - 1, wk)):
+        return jsonify(_empty_drill(""))
+
+    name = (request.args.get("name") or "").strip()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
+        return jsonify(_empty_drill(name))
+
+    _all = list(_WOW_NET_CATS) + ["won"]
+    _pedido = (request.args.get("cat") or "").strip()
+    if _pedido:
+        pedidas = [c.strip().lower() for c in _pedido.split(",")]
+        cats = [c for c in _all if c in pedidas]
+    else:
+        cats = list(_all)
+
+    ev, _lv, _suns, _cf = _fc_hist_frames(q0, q1, _fc_hist_scope(f, cut_from=q0))
+    ev = ev[(ev["week_idx"] == wk) & ev["category"].isin(cats)]
+    ev = _entity_filter(ev, name, grain,
+                        request.args.get("leader"), request.args.get("region"))
+
+    rows = []
+    for r in ev.sort_values("delta").itertuples():
+        rows.append({
+            "deal_name": r.deal_name,
+            "deal_url": _hs_deal_url(r.deal_id),   # era o portal 6482678 (errado)
+            "account_executive": r.account_executive,
+            "leader": r.leader,
+            "categoria": _WOW_CAT_LABEL.get(r.category, r.category),
+            "de_para": f"{fmt_brl(r.v_prev)} → {fmt_brl(r.v_curr)}",
+            "delta": float(r.delta),
+        })
+
+    _janela = f"{_fmt_date_short(suns[wk - 1])} → {_fmt_date_short(suns[wk])}"
+    _v = sum(x["delta"] for x in rows)
+    _sinal = "+" if _v >= 0 else "−"
+    # `fmt_money` respeita o filtro mestre de moeda (e o MX, que é sempre ARR
+    # US$). O R$ fixo daqui era o último lugar que escrevia "R$" numa tela do
+    # México — a barra dizia US$ e o drill dela dizia R$.
+    _valor = f"{_sinal}{fmt_money(abs(_v))}"
+    cat = cats[0] if len(cats) == 1 else ""
+    _n = len(rows)
+    subtitle = f"{_janela} · {_n} deal{'s' if _n != 1 else ''} · " + (
+        _valor if cat else f"saldo {_valor}")
+    _escopo = name or "Forecast do quarter — total"
+    _sufixo = _WOW_CAT_LABEL.get(cat, "") if cat else "Saldo"
+    return jsonify({
+        "title": f"{_escopo} · {_sufixo} · semana {wk}",
+        "subtitle": subtitle,
+        "columns": _with_ae_col([
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "categoria", "label": "Movimento"},
+            {"key": "de_para", "label": "No forecast (de → para)"},
+            {"key": "delta", "label": "Δ (R$)", "type": "money_signed"},
+        ], "leader" if (grain == "leader" or not name) else "ae"),
+        "rows": rows,
+    })
+
+
+# ===========================================================================
+# WoW do Forecast — a MIGRAÇÃO do pipeline entre as faixas de probabilidade,
+# domingo contra domingo.
+#
+# A pergunta desta tela não é "quanto é o forecast" (é a aba Forecast) nem "como
+# ele andou no trimestre" (é o Histórico): é O QUE MUDOU DE UMA SEMANA PRA OUTRA
+# e, sobretudo, SE A MUDANÇA FOI DE CONFIANÇA. Duas semanas podem fechar com o
+# MESMO ponderado querendo dizer coisas opostas — numa, R$ 2 mi subiram de 25%
+# pra 50%; na outra, R$ 2 mi entraram como Not forecasted e outros tantos
+# escorregaram de trimestre. O nível não distingue as duas; a migração sim.
+#
+# Por isso o objeto central é a MATRIZ faixa_anterior × faixa_atual, e não o
+# nível de cada faixa: o nível é a soma das linhas e das colunas dela.
+#
+# FONTE: as mesmas cópias diárias do BI do Histórico do Forecast
+# (`bq.forecast_asof_series`), duas fotos em vez de treze — mais o fechado
+# PERDIDO, que o Histórico não pede e que aqui é uma das faixas (ver a seção
+# ">>> LOST É OPCIONAL" no docstring da função em bq.py).
+#
+# TODO movimento é DERIVADO da diferença entre as duas fotos, porque não existe
+# stream de eventos de forecast category em lugar nenhum do BigQuery
+# (`hubspot_deals_history` versiona 7 campos e nenhum é ela). O preço é o mesmo
+# do Histórico: um deal que subiu na quarta e voltou na sexta aparece como
+# "ficou". A vantagem também é a mesma — a ponte fecha em ZERO por construção,
+# porque nível e movimento saem da mesma fonte:
+#     Σ Δprojeção(deal) ≡ projeção_atual − projeção_anterior
+# ===========================================================================
+
+# As 5 faixas de probabilidade, da MENOR pra MAIOR. Esta ordem é o que define
+# "subiu" e "desceu" — mora aqui, não no template.
+_FCW_BANDS = ("nf", "pipeline", "probable", "bestcase", "commit")
+# Desfecho: sai do jogo da probabilidade. Won é o 100% já realizado, Lost é o
+# zero definitivo. Nenhum dos dois é FAIXA, e é por isso que mover pra eles não
+# conta como subir nem descer de faixa (ver `_fcw_mv`): virar Won não é ganhar
+# confiança, é acabar a aposta.
+_FCW_OUTCOMES = ("won", "lost")
+_FCW_KEYS = _FCW_BANDS + _FCW_OUTCOMES
+_FCW_RANK = {k: i for i, k in enumerate(_FCW_BANDS)}
+# Forecast category crua do HubSpot → faixa. O que NÃO está aqui (OMIT, CLOSED,
+# vazio) cai em `nf`, e o PESO sai da faixa, nunca da categoria crua: senão um
+# deal aberto marcado CLOSED — que vale 1,0 em FORECAST_CATEGORY_PCT — entraria
+# na faixa de peso 0 valendo 100% no ponderado.
+_FCW_BAND_BY_RAW = {"PIPELINE": "pipeline", "PROBABLE": "probable",
+                    "BEST_CASE": "bestcase", "COMMIT": "commit"}
+# Âmbar do Not forecasted e cinza do "fora": saem do registro do Pipeline Total
+# pra as duas telas não pintarem a mesma categoria de cores diferentes.
+_FCW_NF_COLOR, _FCW_NF_INK = next((c, i) for _k, raw, _l, c, i in _PT_DIMS["fcat"]["values"]
+                                  if raw == "OMIT")
+_FCW_OUT_COLOR, _FCW_OUT_INK = next((c, i) for k, _r, _l, c, i in _PT_DIMS["fcat"]["values"]
+                                    if k == _PT_DIM_NONE)
+
+_FCW_META = {
+    # `w` = peso do modelo dos diretores, a MESMA tabela da aba Forecast, já com
+    # o DIR_FORECAST_FACTOR. Won vale 1,0 CHEIO porque já é receita, não previsão
+    # — e é por isso que virar Won passa a render um Δ de +10% do amount no
+    # `ganho` da ponte: o fator de correção se desfaz quando o deal se realiza.
+    # Lost e Not forecasted valem 0 — o primeiro por desfecho, o segundo por
+    # decisão de quem preencheu.
+    "nf": {"label": "Not forecasted", "hint": "0% · OMIT ou sem categoria",
+           "color": _FCW_NF_COLOR, "ink": _FCW_NF_INK, "w": 0.0},
+    **{k: {"label": FORECAST_CATEGORY_LABEL[raw],
+           "hint": {"PIPELINE": "Funnel", "PROBABLE": "Probable",
+                    "BEST_CASE": "Best Case", "COMMIT": "Commit"}[raw],
+           "color": FORECAST_CATEGORY_COLOR[raw], "ink": FORECAST_CATEGORY_INK[raw],
+           "w": FORECAST_CATEGORY_PCT_EFF[raw]}
+       for raw, k in _FCW_BAND_BY_RAW.items()},
+    # Verde-escuro do Realizado da aba Forecast (o #047857 já é o Commit) e
+    # vermelho do `.kpi.danger`.
+    "won":  {"label": "Won", "hint": "PO Won no trimestre",
+             "color": "#065F46", "ink": "#065F46", "w": 1.0},
+    "lost": {"label": "Lost", "hint": "perdido no trimestre",
+             "color": "#B91C1C", "ink": "#B91C1C", "w": 0.0},
+    "out":  {"label": "Fora do forecast", "hint": "close date fora do trimestre, "
+                                                  "estágio fora dos 6 abertos ou deal inexistente",
+             "color": _FCW_OUT_COLOR, "ink": _FCW_OUT_INK, "w": 0.0},
+}
+
+# Os movimentos, na ordem em que a tela conta a história: primeiro o que somou,
+# depois o que subtraiu. `sinal` é a EXPECTATIVA de direção (só pinta o rótulo);
+# o valor de cada linha é medido, não presumido.
+_FCW_MV_META = {
+    "entrou":  {"label": "Entrou no forecast", "color": "#2563EB", "sinal": 1,
+                "hint": "não estava no forecast do trimestre no domingo anterior"},
+    "subiu":   {"label": "Subiu de faixa", "color": "#047857", "sinal": 1,
+                "hint": "mesma etapa do jogo, mais confiança do dono do deal"},
+    "ganho":   {"label": "Ganho (Won)", "color": "#065F46", "sinal": 1,
+                "hint": "virou PO Won — o Δ é só a diferença entre o peso que ele "
+                        "tinha e os 100% do realizado, e é pequeno de propósito"},
+    "repreco": {"label": "Reprecificação", "color": "#6E56CF", "sinal": 0,
+                "hint": "ficou na mesma faixa e o amount mudou"},
+    "desceu":  {"label": "Desceu de faixa", "color": "#DB2777", "sinal": -1,
+                "hint": "o dono do deal tirou confiança"},
+    "saiu":    {"label": "Saiu do forecast", "color": "#B45309", "sinal": -1,
+                "hint": "escorregou de trimestre ou saiu dos 6 estágios abertos"},
+    "perdido": {"label": "Perdido (Lost)", "color": "#B91C1C", "sinal": -1,
+                "hint": "closed lost na semana — o Δ é o peso que ele tinha, agora zerado"},
+    "recl":    {"label": "Won/Lost reclassificado", "color": "#64748B", "sinal": 0,
+                "hint": "deal que era Won ou Lost do trimestre e deixou de ser "
+                        "(reabertura, ou data de validação/fechamento fora da janela)"},
+}
+_FCW_MV_ORDER = ("entrou", "subiu", "ganho", "repreco", "desceu", "saiu",
+                 "perdido", "recl")
+
+
+def _fcw_mv(bp: str, bc: str) -> str:
+    """Movimento de um deal entre as duas fotos. A ordem dos testes é o contrato
+    da tela, e não é arbitrária:
+
+      · desfecho vence faixa — um Commit que virou Won é "ganho", não "subiu";
+      · entrada/saída do trimestre vence faixa — um deal que escorregou pra
+        outubro é "saiu", e não "desceu pra fora";
+      · sobrar as duas pontas em faixa é o único caso de subiu/desceu, que é
+        justamente a pergunta "houve evolução dentro da probabilidade".
+    """
+    if bp == bc:
+        return "repreco"
+    if bc == "won":
+        return "ganho"
+    if bc == "lost":
+        return "perdido"
+    if bp in _FCW_OUTCOMES:
+        return "recl"
+    if bp == "out":
+        return "entrou"
+    if bc == "out":
+        return "saiu"
+    return "subiu" if _FCW_RANK[bc] > _FCW_RANK[bp] else "desceu"
+
+
+def _fcw_scope(f, cut_from=None):
+    """Escopo desta tela: o MESMO do Histórico do Forecast (roster, allowlist de
+    líder, região, venda direta de gestor) mais o corte de Deal Type — que existe
+    aqui pelo mesmo motivo das telas PoP: aquisição e expansão migram de faixa em
+    ritmos diferentes, e a soma das duas esconde isso."""
+    base = _fc_hist_scope(f, cut_from=cut_from)
+
+    def _scope(x):
+        return _pt_apply_dim_filter(base(x), "dtype", f.get("dtype", ""))
+    return _scope
+
+
+def _fcw_pairs(q0: date, q1: date, force=False):
+    """(pares, curr, prev, faltando) — os pares de domingos COMPARÁVEIS do
+    trimestre, o escolhido, e os domingos da janela que não têm foto.
+
+    Par comparável = dois domingos CONSECUTIVOS com foto nas duas pontas. Domingo
+    sem cópia as-of não vira zero nem interpolação: ele derruba os DOIS pares que
+    tocam nele, porque comparar 30/08 com 16/08 chamando de "semana" seria mentir
+    no rótulo. A tela diz quais domingos faltam.
+
+    O par vem do chip da própria página (`?par=YYYYMMDD`, o domingo ATUAL do par)
+    e não do date-picker: `_wow_window` ancora cada ponta de forma independente,
+    e com date_from/date_to soltos "01/06 → 30/06" viraria a comparação
+    "31/mai vs 28/jun" — 4 semanas travestidas de WoW. Este é o "seletor de PAR
+    de domingos consecutivos" que o docstring de `_wow_fixed_pair` pede."""
+    suns = _fc_hist_sundays(q0, q1)
+    disp = bq.forecast_asof_snapshots(force_refresh=force)
+    dias = set(disp["dia"]) if len(disp) else set()
+    com = {k for k, s in enumerate(suns) if s.strftime("%Y%m%d") in dias}
+    faltando = _fc_hist_missing(suns, com)
+    pares = [(suns[i], suns[i - 1]) for i in range(1, len(suns))
+             if i in com and (i - 1) in com]
+    if not pares:
+        return [], None, None, faltando
+    sel = (request.args.get("par") or "").strip()
+    curr, prev = next(((c, p) for c, p in pares if c.strftime("%Y%m%d") == sel),
+                      pares[-1])
+    return pares, curr, prev, faltando
+
+
+def _fcw_frame(q0: date, q1: date, curr_sun: date, prev_sun: date, f,
+               force=False, raw=None) -> pd.DataFrame:
+    """UMA linha por deal, com o estado nas duas pontas e o movimento entre elas.
+
+    Colunas que a tela consome:
+      · `b_prev` / `b_curr` — a faixa em cada domingo (uma de `_FCW_KEYS`, ou
+        `out` = fora do forecast do trimestre naquele domingo);
+      · `v_prev` / `v_curr` — o amount as-of. Deal ausente de uma foto vale 0
+        ali, e por isso `out` sempre pesa 0 na projeção;
+      · `p_prev` / `p_curr` / `dp` — o amount × peso da FAIXA, e o delta. É a
+        projeção dos diretores (Won conta 1,0), a mesma conta da série `v_dir`
+        do Histórico;
+      · `mv` — o movimento (ver `_fcw_mv`);
+      · `motivo` — só pra `saiu`/`entrou`: por onde o deal entrou ou saiu.
+
+    `raw` = as duas fotos já carregadas, com `dia` = YYYYMMDD de cada ponta. É
+    como o DoD entra: as pontas dele não são cópias do BI (ver `_fcd_raw`), mas
+    todo o resto — faixa, peso, movimento — é esta mesma conta.
+
+    Deal fora do forecast nas DUAS pontas é descartado: são ~2,8 mil linhas de
+    ruído (o funil inteiro do Sales BR) que não têm o que dizer sobre a semana."""
+    vazio = pd.DataFrame(columns=[
+        "deal_id", "deal_name", "account_executive", "leader", "region",
+        "deal_type", "b_prev", "b_curr", "v_prev", "v_curr", "p_prev", "p_curr",
+        "dp", "mv", "motivo", "fc_prev", "fc_curr", "cd_prev", "cd_curr"])
+    if not (curr_sun and prev_sun):
+        return vazio
+
+    sufixos = [d.strftime("%Y%m%d") for d in (prev_sun, curr_sun)]
+    raw = raw if raw is not None else bq.forecast_asof_series(
+        sufixos, _fc_open_stage_ids(),
+        # A faixa Lost é o motivo desta tela pedir o perdido, e a janela do
+        # trimestre é o que mantém isso barato (ver bq.forecast_asof_series).
+        lost_stage_id=_HS_LOST_STAGE,
+        lost_from=q0.isoformat(), lost_to=q1.isoformat(),
+        force_refresh=force, pipeline=_pl())
+    if not len(raw):
+        return vazio
+
+    lv = canon_ae_names(raw).copy()
+    lv["amount"] = pd.to_numeric(lv["amount"], errors="coerce").fillna(0.0)
+    for c in ("close_date", "po_emission_date"):
+        lv[c] = pd.to_datetime(lv[c], errors="coerce")
+    # Won conta pela data de VALIDAÇÃO (emissão do PO, fallback close date) — o
+    # mesmo critério da aba Forecast, que é o que joga o deal fechado em 1-3/abr
+    # e validado em março no Q1, não no Q2.
+    lv["valid_date"] = lv["po_emission_date"].fillna(lv["close_date"])
+    # O Won do trimestre é RECEITA: decide pela data com a extensão de
+    # fechamento (validado em 01–02/10/2026 é Won do Q3, e sai do Q4).
+    lv["rev_date"] = _rev_date(lv["valid_date"])
+
+    # Hierarquia + roster/allowlist/líder/região/deal type, igual `_fc_hist_frames`.
+    lv = lv.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
+    mgr = lv["account_executive"].isin(NON_AE_USERS)
+    lv.loc[mgr, "leader"] = lv.loc[mgr, "account_executive"]
+    lv.loc[mgr, "region"] = lv.loc[mgr, "region"].fillna("BR")
+    lv = _fcw_scope(f, cut_from=q0)(lv)
+    if not len(lv):
+        return vazio
+
+    lo, hi = pd.Timestamp(q0), pd.Timestamp(q1)
+    abertos = _fc_open_stage_ids()
+    no_q = lv["close_date"].notna() & (lv["close_date"] >= lo) & (lv["close_date"] <= hi)
+    won_q = lv["rev_date"].notna() & (lv["rev_date"] >= lo) & (lv["rev_date"] <= hi)
+    banda = lv["forecast_category"].map(_FCW_BAND_BY_RAW).fillna("nf")
+    b = pd.Series("out", index=lv.index)
+    _ab = lv["stage"].isin(abertos) & no_q
+    b[_ab] = banda[_ab]
+    b[lv["stage"].eq(_HS_WON_STAGE) & won_q] = "won"
+    b[lv["stage"].eq(_HS_LOST_STAGE) & no_q] = "lost"
+    lv["b"] = b
+
+    # Duas fotos → dois lados. `drop_duplicates` por (dia, deal) é cinto de
+    # segurança: a cópia do BI é uma linha por deal, mas se um dia ela deixar de
+    # ser, o pivot silenciosamente somaria o mesmo deal duas vezes.
+    lv = lv.drop_duplicates(subset=["dia", "deal_id"])
+    ant = lv[lv["dia"] == sufixos[0]].set_index("deal_id")
+    atu = lv[lv["dia"] == sufixos[1]].set_index("deal_id")
+    ids = ant.index.union(atu.index)
+
+    w = pd.DataFrame(index=ids)
+    w["b_prev"] = ant["b"].reindex(ids).fillna("out")
+    w["b_curr"] = atu["b"].reindex(ids).fillna("out")
+    # Fora nas duas pontas = ruído do funil inteiro, não notícia da semana.
+    w = w[~(w["b_prev"].eq("out") & w["b_curr"].eq("out"))]
+    ids = w.index
+    ant, atu = ant.reindex(ids), atu.reindex(ids)
+
+    w["v_prev"] = ant["amount"].fillna(0.0)
+    w["v_curr"] = atu["amount"].fillna(0.0)
+    w["fc_prev"] = ant["forecast_category"]
+    w["fc_curr"] = atu["forecast_category"]
+    w["cd_prev"] = ant["close_date"]
+    w["cd_curr"] = atu["close_date"]
+    # Identidade e hierarquia: a foto ATUAL manda; quem só existe na anterior
+    # (deal apagado do CRM, AE que saiu do escopo) fica com o que ela tinha.
+    for col in ("deal_name", "account_executive", "leader", "region", "deal_type"):
+        w[col] = atu[col].fillna(ant[col])
+
+    peso = {k: m["w"] for k, m in _FCW_META.items()}
+    w["p_prev"] = w["b_prev"].map(peso) * w["v_prev"]
+    w["p_curr"] = w["b_curr"].map(peso) * w["v_curr"]
+    w["dp"] = w["p_curr"] - w["p_prev"]
+    w["mv"] = [_fcw_mv(p, c) for p, c in zip(w["b_prev"], w["b_curr"])]
+
+    # Motivo da entrada e da saída. Só o que o dado sustenta:
+    #   · saída "data"  — o deal ESTÁ na foto de agora, em estágio aberto, mas o
+    #     close date dele já não cai no trimestre: escorregou;
+    #   · saída "funil" — não está na foto medida (mudou pra um estágio fora dos
+    #     6 abertos, saiu do pipeline Sales BR ou o registro sumiu). Aqui não dá
+    #     pra separar as três: a query só traz os 6 abertos + Won + Lost, então
+    #     No Show e deal apagado chegam do mesmo jeito — como ausência;
+    #   · saída "ext"   — o deal foi GANHO, mas a receita dele conta no
+    #     trimestre anterior pela extensão de fechamento (REALIZED_QUARTER_
+    #     EXTENSIONS): não escorregou, foi realizado antes do trimestre medido;
+    #   · entrada "novo" — deal criado DEPOIS do domingo anterior (created_date
+    #     da base de hoje, que é imutável). O resto entrou por data/estágio.
+    pipe = _get_pipeline_deals(force=force)
+    criado = dict(zip(pipe["deal_id"].astype(str),
+                      pd.to_datetime(pipe["created_date"], errors="coerce")))
+    _cr = pd.to_datetime(pd.Series(w.index.map(criado), index=w.index), errors="coerce")
+    _novo = _cr.notna() & (_cr > pd.Timestamp(prev_sun))
+    _foto = atu["stage"].notna()
+    _saiu, _ent = w["mv"].eq("saiu"), w["mv"].eq("entrou")
+    _ext = (atu["stage"].eq(_HS_WON_STAGE) & atu["rev_date"].notna()
+            & (atu["rev_date"] < lo) & atu["rev_date"].ne(atu["valid_date"])
+            ).reindex(w.index).fillna(False).astype(bool)
+    w["motivo"] = (pd.Series("", index=w.index)
+                   .mask(_saiu & _foto, "data").mask(_saiu & _foto & _ext, "ext")
+                   .mask(_saiu & ~_foto, "funil")
+                   .mask(_ent & _novo, "novo").mask(_ent & ~_novo, "veio"))
+
+    return w.reset_index().rename(columns={"index": "deal_id"})
+
+
+def _fcw_levels(w) -> list:
+    """Uma linha por faixa: nível nas duas pontas MAIS a decomposição do Δ.
+
+    A conta fecha por construção, faixa por faixa:
+        nível_atual − nível_anterior = entrou − saiu + reprecificação
+    Sem as três colunas, uma faixa que ficou parada no total mas trocou metade
+    dos deals leria como "semana sem novidade" — e é o contrário disso."""
+    rows = []
+    for k in _FCW_KEYS:
+        ip, ic = w["b_prev"].eq(k), w["b_curr"].eq(k)
+        fica = ip & ic
+        vp = float(w.loc[ip, "v_prev"].sum())
+        vc = float(w.loc[ic, "v_curr"].sum())
+        rows.append({
+            "key": k, **{x: _FCW_META[k][x] for x in ("label", "hint", "color", "ink")},
+            "w": _FCW_META[k]["w"],
+            "n_prev": int(ip.sum()), "n_curr": int(ic.sum()),
+            "v_prev": vp, "v_curr": vc, "delta": vc - vp,
+            "pct": ((vc - vp) / vp) if vp else None,
+            "p_prev": vp * _FCW_META[k]["w"], "p_curr": vc * _FCW_META[k]["w"],
+            "entrou": float(w.loc[ic & ~ip, "v_curr"].sum()),
+            "saiu": float(w.loc[ip & ~ic, "v_prev"].sum()),
+            "repreco": float((w.loc[fica, "v_curr"] - w.loc[fica, "v_prev"]).sum()),
+            "n_entrou": int((ic & ~ip).sum()), "n_saiu": int((ip & ~ic).sum()),
+        })
+    return rows
+
+
+def _fcw_bridge(w) -> list:
+    """A ponte da projeção: uma linha por movimento, com o quanto ele explica do
+    Δ da projeção dos diretores. Fecha em zero por construção — os movimentos
+    PARTICIONAM os deals, e Δprojeção é a soma de `dp`.
+
+    `bruto` é o valor que MOVEU, com uma convenção: o amount atual, exceto quando
+    o deal saiu do forecast (aí é o anterior, que é o que deixou de contar) e na
+    reprecificação (aí é a própria variação). Sem a convenção escrita, "bruto" de
+    um deal que mudou de faixa E de valor na mesma semana seria ambíguo."""
+    rows = []
+    for k in _FCW_MV_ORDER:
+        sub = w[w["mv"].eq(k)]
+        if k == "repreco":
+            sub = sub[sub["v_curr"] != sub["v_prev"]]
+            bruto = float((sub["v_curr"] - sub["v_prev"]).sum())
+        elif k in ("saiu", "recl"):
+            bruto = float(sub["v_prev"].sum())
+        else:
+            bruto = float(sub["v_curr"].sum())
+        if not len(sub):
+            continue
+        # Entrada e saída ganham o POR QUÊ na própria linha: "saiu R$ 1,09 mi" é
+        # uma notícia bem diferente de "escorregou R$ 1,09 mi de trimestre", e a
+        # segunda é a que aparece toda virada de quarter. Ver `motivo` em
+        # `_fcw_frame` pro que o dado sustenta (e o que não).
+        det = []
+        if k in ("saiu", "entrou"):
+            _lbl = {"data": "escorregaram de trimestre",
+                    "ext": "ganhos no fechamento estendido do trimestre anterior",
+                    "funil": "saíram dos 6 estágios abertos",
+                    "novo": "criados nesta semana",
+                    "veio": "vieram de fora do trimestre"}
+            for mot, txt in _lbl.items():
+                g = sub[sub["motivo"].eq(mot)]
+                if len(g):
+                    det.append({"txt": txt, "n": int(len(g)),
+                                "v": float(g["v_prev" if k == "saiu" else "v_curr"].sum())})
+        rows.append({"key": k, **_FCW_MV_META[k], "n": int(len(sub)),
+                     # A reprecificação é uma VARIAÇÃO de amount, não um valor
+                     # movido: sem sinal a tela escreveria "R$ -19k".
+                     "bruto": bruto, "assinado": k == "repreco",
+                     "det": det, "dp": float(sub["dp"].sum())})
+    return rows
+
+
+def _fcw_matrix(w) -> dict:
+    """Matriz faixa_anterior × faixa_atual, em valor BRUTO.
+
+    O eixo inclui `out` (fora do forecast do trimestre) nas duas pontas, e é ele
+    que fecha a matriz: sem a coluna, o deal que escorregou pra outubro
+    simplesmente desapareceria da linha da faixa dele; sem a linha, o que entrou
+    apareceria do nada. A célula out×out não existe (foi descartada no frame).
+
+    A célula é medida no valor de ORIGEM (o amount do domingo anterior), e a
+    linha `out` — que não tem origem — no valor de agora. Essa escolha é o que faz
+    a linha somar EXATO: "dos R$ 2,38 mi que estavam em Not forecasted, R$ 1,16
+    mi ficaram, R$ 284 mil subiram pra 25% e R$ 827 mil saíram do trimestre". Se a
+    célula fosse o valor atual, a linha não fecharia com o nível anterior sempre
+    que o amount mudasse na mesma semana.
+
+    O rodapé, por isso, NÃO é a soma das colunas: é o nível de cada faixa AGORA
+    (de `_fcw_levels`). A diferença entre uma coisa e outra é exatamente a
+    reprecificação, que o painel de faixas já mostra em coluna própria.
+
+    A intensidade de cor ignora a DIAGONAL no cálculo da escala: "ficou na mesma
+    faixa" é quase sempre a maior célula da matriz (no Q3/2026, R$ 9,6 mi de Lost
+    acumulado contra R$ 614 mil da maior migração real), e incluí-la deixava todo
+    movimento de verdade na mesma tinta pálida."""
+    eixo = list(_FCW_KEYS) + ["out"]
+    span, grid, tot_col = 0.0, [], {k: 0.0 for k in eixo}
+    for bp in eixo:
+        linha, tot_row = [], 0.0
+        for bc in eixo:
+            sub = w[w["b_prev"].eq(bp) & w["b_curr"].eq(bc)]
+            v = float((sub["v_curr"] if bp == "out" else sub["v_prev"]).sum())
+            mv = _fcw_mv(bp, bc)
+            linha.append({"de": bp, "para": bc, "n": int(len(sub)), "v": v,
+                          "mv": mv, "color": _FCW_MV_META[mv]["color"],
+                          "label": _FCW_MV_META[mv]["label"],
+                          "diag": bp == bc, "vazio": bp == "out" and bc == "out"})
+            tot_row += v
+            tot_col[bc] += v
+            if bp != bc:
+                span = max(span, abs(v))
+        grid.append({"key": bp, "label": _FCW_META[bp]["label"],
+                     "ink": _FCW_META[bp]["ink"], "cells": linha, "total": tot_row,
+                     # A linha `out` não tem nível anterior (o deal estava fora):
+                     # o total dela é o que ENTROU, medido agora.
+                     "e_nivel": bp != "out"})
+    niveis = {r["key"]: r for r in _fcw_levels(w)}
+    return {
+        "eixo": [{"key": k, **{x: _FCW_META[k][x] for x in ("label", "color", "ink")}}
+                 for k in eixo],
+        "rows": grid, "span": span or 1.0,
+        # Rodapé = nível de agora nas faixas; na coluna "Fora" o nível não existe,
+        # então ali vai a soma da coluna mesmo (o que saiu do trimestre).
+        "rodape": [(niveis[k]["v_curr"] if k in niveis else tot_col[k]) for k in eixo],
+        "saiu_total": tot_col["out"],
+    }
+
+
+# Ordem do espectro, da pior notícia pra melhor. É ela que empilha a barra da
+# esquerda pra direita: quem lê de fora entende "piorou → ficou → melhorou" sem
+# consultar legenda, do mesmo jeito que o PoP se lê pelo "moveu pra Late".
+_FCW_DEST_ORDER = ("perdido", "saiu", "desceu", "repreco", "subiu", "ganho")
+# Como cada destino entra no resumo de 4 colunas. Won é coluna PRÓPRIA e não
+# entra em "subiu": virar receita não é ganhar confiança, é acabar a aposta — e
+# é o número que a liderança pergunta primeiro. Lost é piora, junto de quem
+# desceu de faixa e de quem escorregou do trimestre.
+_FCW_DEST_GROUP = {"perdido": "piorou", "saiu": "piorou", "desceu": "piorou",
+                   "repreco": "ficou", "subiu": "subiu", "ganho": "won"}
+_FCW_DEST_RESUMO = ("subiu", "won", "ficou", "piorou")
+# `repreco` significa outra coisa AQUI: na ponte é a variação de valor de quem
+# não mudou de faixa; nesta barra é o volume que PERMANECEU na faixa (mudando de
+# tamanho ou não). Rótulo próprio, senão a legenda diz "Reprecificação" pro
+# bloco que a coluna de resumo chama de "Ficou".
+_FCW_DEST_LABEL = {"repreco": "Ficou na faixa"}
+
+
+def _fcw_destino(w) -> dict:
+    """Destino do volume de CADA faixa: das cinco faixas do parâmetro, quanto
+    ficou, quanto evoluiu, quanto piorou e por qual caminho.
+
+    É a matriz de migração relida como pergunta de negócio. A matriz tem a mesma
+    verdade, mas espalhada em 64 células onde "melhorou" é "acima da diagonal" —
+    ninguém descobre ali que o 50% está sangrando pra baixo. Aqui cada faixa é
+    uma barra, e as colunas de destino viram os seis movimentos possíveis.
+
+    A barra é medida no valor de ORIGEM (o amount do domingo anterior), a mesma
+    escolha da matriz e pelo mesmo motivo: é o que faz a barra somar EXATO o
+    nível que a faixa tinha. Se cada pedaço fosse medido agora, a barra não
+    fecharia sempre que o amount mudasse na mesma semana — e a reprecificação
+    fica registrada à parte, em `repreco_dp`.
+
+    Won e Lost NÃO são barras: como faixa de origem, os dois são acumulado do
+    trimestre (no Q3/2026, R$ 11,2 mi de Lost contra R$ 1,9 mi na maior faixa) e
+    esmagariam as cinco na mesma escala. Eles aparecem onde significam alguma
+    coisa nesta pergunta — como DESTINO, dentro da barra da faixa de onde o deal
+    saiu: é assim que "o Commit converteu R$ 123 mil em Won esta semana" vira
+    legível. `out` (entrou no forecast) também fica fora das barras: esses deals
+    não tinham faixa anterior pra decompor, e enfiá-los numa das cinco quebraria
+    a invariante que faz a barra fechar. Vão numa barra própria."""
+    bands, span = [], 0.0
+    for b in _FCW_BANDS:
+        sub_b = w[w["b_prev"].eq(b)]
+        tot = float(sub_b["v_prev"].sum())
+        span = max(span, tot)
+        segs, resumo = [], {k: {"v": 0.0, "n": 0} for k in _FCW_DEST_RESUMO}
+        for mv in _FCW_DEST_ORDER:
+            s2 = sub_b[sub_b["mv"].eq(mv)]
+            v, n = float(s2["v_prev"].sum()), int(len(s2))
+            g = resumo[_FCW_DEST_GROUP[mv]]
+            g["v"] += v
+            g["n"] += n
+            if not v:
+                continue
+            segs.append({"key": mv, "label": _FCW_DEST_LABEL.get(
+                             mv, _FCW_MV_META[mv]["label"]),
+                         "color": _FCW_MV_META[mv]["color"], "v": v, "n": n,
+                         "pct": v / tot if tot else 0.0,
+                         # `ficou` é o único pedaço que NÃO ganha cor de
+                         # movimento: ele não se moveu. Fica na cor da própria
+                         # faixa, em transparência — o bloco que permaneceu
+                         # mantém a identidade dela, e verde/vermelho ficam
+                         # reservados pro que de fato andou.
+                         "e_ficou": mv == "repreco"})
+        for g in resumo.values():
+            g["pct"] = (g["v"] / tot) if tot else 0.0
+        fic = sub_b[sub_b["mv"].eq("repreco")]
+        bands.append({
+            "key": b, "total": tot, "n": int(len(sub_b)),
+            **{x: _FCW_META[b][x] for x in ("label", "hint", "color", "ink")},
+            "segs": segs, "resumo": resumo,
+            # Reprecificação DENTRO do que ficou: o deal não mudou de faixa, mas
+            # mudou de tamanho. Sem esta linha o "ficou" leria como "nada
+            # aconteceu", e num trimestre é justamente onde o valor escorrega.
+            "repreco_dp": float((fic["v_curr"] - fic["v_prev"]).sum()),
+        })
+    # Quem veio de FORA do forecast do trimestre. Medido AGORA (v_curr): estes
+    # deals não têm valor anterior — mesma regra da linha `out` da matriz.
+    #
+    # E é decomposto, não um número só: na semana de 06/09/2026, dos 160 deals
+    # que vieram de fora, 130 (R$ 815 mil) foram marcados Lost na MESMA semana e
+    # só 29 (R$ 435 mil) entraram numa faixa de verdade. Somar os dois como
+    # "entrou no forecast" chamaria de entrada o que foi enterro.
+    ent = w[w["b_prev"].eq("out")]
+    ent_segs = []
+    for mv in ("perdido", "entrou", "ganho"):
+        s2 = ent[ent["mv"].eq(mv)]
+        if not len(s2):
+            continue
+        ent_segs.append({"key": mv, "n": int(len(s2)),
+                         "v": float(s2["v_curr"].sum()),
+                         "label": {"entrou": "Entrou numa faixa",
+                                   "ganho": "Direto pra Won",
+                                   "perdido": "Direto pra Lost"}[mv],
+                         "color": _FCW_MV_META[mv]["color"]})
+    return {
+        "bands": bands, "span": span or 1.0,
+        "entrou": {"v": float(ent["v_curr"].sum()), "n": int(len(ent)),
+                   "segs": ent_segs,
+                   # Escala PRÓPRIA: este bloco não divide um volume anterior,
+                   # então medi-lo na régua das faixas deixaria as três barras do
+                   # tamanho de um ponto e sem contraste entre si.
+                   "span": max([x["v"] for x in ent_segs], default=1.0) or 1.0,
+                   "color": _FCW_MV_META["entrou"]["color"]},
+        "legenda": [{"key": k,
+                     "label": _FCW_DEST_LABEL.get(k, _FCW_MV_META[k]["label"]),
+                     "color": _FCW_MV_META[k]["color"], "e_ficou": k == "repreco"}
+                    for k in _FCW_DEST_ORDER],
+        # Listas de `mv` prontas pro drill: o template não monta string de
+        # parâmetro na mão, senão a definição de "piorou" passaria a existir em
+        # dois lugares e um dia divergiriam.
+        "mv_todos": ",".join(_FCW_DEST_ORDER),
+        "mv_grupo": {g: ",".join(k for k in _FCW_DEST_ORDER
+                                 if _FCW_DEST_GROUP[k] == g)
+                     for g in _FCW_DEST_RESUMO},
+        "resumo_meta": [("subiu", "Subiu", "#047857"), ("won", "Won", "#065F46"),
+                        ("ficou", "Ficou", None), ("piorou", "Piorou", "#B91C1C")],
+    }
+
+
+def _fcw_people(w, grain, leader_filter) -> list:
+    """Uma linha por AE (ou por líder, com o diretor englobando o gerente): a
+    projeção nas duas pontas e o movimento que explica a diferença.
+
+    No grain de líder a soma das linhas NÃO fecha com o time, de propósito — cada
+    deal conta no gerente e no diretor, a mesma convenção das outras telas de
+    Leaders."""
+    base = (_explode_leaders(w, leader_filter) if grain == "leader"
+            else drop_non_ae_people(w))
+    if not len(base):
+        return []
+    rows = []
+    for nome, g in base.groupby("account_executive"):
+        r = {"name": nome, "short": short_name(nome),
+             "leader": (g["leader"].dropna().iloc[0] if g["leader"].notna().any() else None),
+             "p_prev": float(g["p_prev"].sum()), "p_curr": float(g["p_curr"].sum()),
+             "dp": float(g["dp"].sum())}
+        for k in _FCW_MV_ORDER:
+            sub = g[g["mv"].eq(k)]
+            r["mv_" + k] = float(sub["dp"].sum())
+            r["n_" + k] = int(len(sub)) if k != "repreco" else int(
+                (sub["v_curr"] != sub["v_prev"]).sum())
+        # Sem projeção nas duas pontas E sem movimento: a linha não diria nada
+        # (é o AE que não tem nenhum deal no trimestre).
+        if r["p_prev"] or r["p_curr"] or r["dp"]:
+            rows.append(r)
+    rows.sort(key=lambda r: r["dp"], reverse=True)
+    return rows
+
+
+def _fcw_cover(w, side: str) -> dict:
+    """Cobertura da faixa POR VALOR num dos domingos: quanto do pipeline aberto
+    do trimestre está numa das 4 faixas previstas, quanto está em Not forecasted
+    explícito e quanto está sem categoria nenhuma.
+
+    Mesma leitura (e mesmo motivo) do Histórico do Forecast: este peso é o
+    julgamento do dono do deal, então comparar duas semanas só faz sentido
+    sabendo se a categoria estava preenchida nas duas. Aqui `omit` e `sem` ficam
+    separados porque "o AE disse que não entra" é informação e "ninguém
+    preencheu" é a falta dela — e as duas caem na MESMA faixa `nf`."""
+    b, v = "b_" + side, "v_" + side
+    aberto = w[w[b].isin(_FCW_BANDS)]
+    tot = float(aberto[v].sum())
+    if not tot:
+        return {"tot": 0.0, "prev": None, "omit": None, "sem": None}
+    fc = aberto["fc_" + side]
+    vazio = fc.isna() | (fc.astype(str).str.strip() == "")
+    return {
+        "tot": tot,
+        "prev": 100.0 * float(aberto.loc[~aberto[b].eq("nf"), v].sum()) / tot,
+        "omit": 100.0 * float(aberto.loc[aberto[b].eq("nf") & ~vazio, v].sum()) / tot,
+        "sem": 100.0 * float(aberto.loc[vazio, v].sum()) / tot,
+    }
+
+
+def _fcw_done_hoje(f, q0: date, q1: date, sun: date, force=False) -> float:
+    """Won acumulado até `sun` lido da base de HOJE — que é como o Histórico do
+    Forecast monta o Done (`_fc_done_cumulative`: "um deal ganho não deixa de ter
+    sido ganho, e a data de validação não muda depois").
+
+    Esta tela usa o Won da FOTO do domingo, que é outra coisa: se um PO foi
+    lançado na terça com data de validação de sexta, a foto do domingo anterior
+    não o tinha e a base de hoje tem. As duas leituras estão certas — aqui a
+    pergunta é "o que a semana mudou", e reescrever o passado com informação de
+    hoje apagaria exatamente isso. Medido em 06/09/2026: R$ 988 mil na foto
+    contra R$ 1,006 mi na base de hoje, 0,6% da projeção.
+
+    Existe só pra a tela DIZER esse número ao lado do dela. Sem isso as duas abas
+    se contradizem em silêncio, e a pessoa fica sem saber qual acreditar."""
+    d = _get_forecast_deals(force=force)
+    lo, hi = pd.Timestamp(q0), pd.Timestamp(q1)
+    # Mesma régua do Won do `_fcw_frame`: data da receita, com a extensão.
+    d = d[d["is_won"] & d["rev_date"].notna()
+          & (d["rev_date"] >= lo) & (d["rev_date"] <= hi)]
+    d = _fcw_scope(f, cut_from=q0)(d)
+    return float(d[d["rev_date"] <= pd.Timestamp(sun)]["amount"].sum())
+
+
+def _render_forecast_wow(grain="ae"):
+    """WoW do Forecast: a migração do pipeline entre as faixas de probabilidade
+    entre dois domingos consecutivos."""
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    q0, q1 = _fc_hist_quarter(f)
+    pares, curr_sun, prev_sun, faltando = _fcw_pairs(q0, q1, force=force)
+    w = _fcw_frame(q0, q1, curr_sun, prev_sun, f, force=force)
+
+    niveis = _fcw_levels(w) if len(w) else []
+    por_faixa = {r["key"]: r for r in niveis}
+    ponte = _fcw_bridge(w) if len(w) else []
+    # Projeção dos diretores = Won do trimestre + aberto ponderado pela faixa.
+    # Sai do MESMO frame das duas pontas, então Δ = Σ dp exatamente — não é a
+    # subtração de dois números vindos de fontes diferentes.
+    proj_prev = float(w["p_prev"].sum()) if len(w) else 0.0
+    proj_curr = float(w["p_curr"].sum()) if len(w) else 0.0
+
+    def _soma(keys, side):
+        return sum(por_faixa[k]["v_" + side] for k in keys if k in por_faixa)
+
+    previstas = tuple(k for k in _FCW_BANDS if k != "nf")
+
+    # Meta: a MESMA das outras telas de forecast (Comp. Target dos líderes no
+    # recorte), e SÓ no trimestre corrente — LEADER_BOARD_TARGET é a planilha do
+    # quarter em curso, e desenhá-la sobre um trimestre passado compararia o
+    # forecast de abril com a meta de julho.
+    # "Corrente" pela data da RECEITA: durante a extensão de fechamento o
+    # trimestre que ainda acumula realizado é o anterior (02/10/2026 → Q3).
+    meta_ok = (q0 == _quarter_start_of(_rev_date(_today()))
+               and q1 == _quarter_end_of(q0))       # meta é de UM trimestre
+    lideres = sorted({L for L in w["leader"].dropna().unique()}) if len(w) else []
+    meta = _leader_meta_total(lideres) if meta_ok else 0.0
+
+    def _drill(**kw):
+        return url_for("forecast_wow_deals", grain=grain,
+                       par=(curr_sun.strftime("%Y%m%d") if curr_sun else None),
+                       date_from=f.get("date_from"), date_to=f.get("date_to"),
+                       dtype=f.get("dtype") or None,
+                       leader=(f.get("leader") if not kw.get("name") else None),
+                       region=(f.get("region") if not kw.get("name") else None),
+                       **kw)
+
+    def _chip_url(**kw):
+        args = {k: v for k, v in request.args.items() if k not in kw and v}
+        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+
+    return render_template(
+        "forecast_wow.html", ctx=ctx, grain=grain,
+        q_label=_fc_hist_label(q0, q1),
+        q_range=f"{q0.strftime('%d/%m/%Y')} → {q1.strftime('%d/%m/%Y')}",
+        curr_label=(_fmt_date_short(curr_sun) if curr_sun else "—"),
+        prev_label=(_fmt_date_short(prev_sun) if prev_sun else "—"),
+        # Chip = o domingo que FECHA a semana (a janela inteira cabe no title):
+        # 13 chips de "24 ago → 31 ago" não cabem numa linha, e a janela do par
+        # escolhido já está escrita no subtítulo da página.
+        pares=[{"key": c.strftime("%Y%m%d"), "label": _fmt_date_curta(c),
+                "title": f"semana de {_fmt_date_short(p)} a {_fmt_date_short(c)}"}
+               for c, p in pares],
+        par_sel=(curr_sun.strftime("%Y%m%d") if curr_sun else ""),
+        faltando=faltando, sem_par=not pares, sem_dado=not len(w),
+        niveis=niveis, por_faixa=por_faixa, ponte=ponte,
+        destino=(_fcw_destino(w) if len(w) else None),
+        matriz=(_fcw_matrix(w) if len(w) else None),
+        people=(_fcw_people(w, grain, f.get("leader")) if len(w) else []),
+        proj_prev=proj_prev, proj_curr=proj_curr, proj_delta=proj_curr - proj_prev,
+        meta=meta, meta_ok=meta_ok,
+        att_prev=((proj_prev / meta) if meta else None),
+        att_curr=((proj_curr / meta) if meta else None),
+        prev_bruto_curr=_soma(previstas, "curr"), prev_bruto_prev=_soma(previstas, "prev"),
+        cover_curr=(_fcw_cover(w, "curr") if len(w) else None),
+        cover_prev=(_fcw_cover(w, "prev") if len(w) else None),
+        won_hoje=(_fcw_done_hoje(f, q0, q1, curr_sun, force=force)
+                  if (curr_sun and len(w)) else None),
+        n_deals=int(len(w)),
+        bands=[por_faixa[k] for k in _FCW_BANDS if k in por_faixa],
+        mv_meta=_FCW_MV_META, mv_order=_FCW_MV_ORDER,
+        drill=_drill, chip_url=_chip_url,
+    )
+
+
+@app.route("/forecast/wow")
+def forecast_wow():
+    return _render_forecast_wow("ae")
+
+
+@app.route("/leaders/forecast/wow")
+def leaders_forecast_wow():
+    return _render_forecast_wow("leader")
+
+
+@app.route("/forecast/wow/deals")
+def forecast_wow_deals():
+    """Drill do WoW do Forecast. Aceita três recortes, e SÓ eles:
+      · `mv`         — um movimento da ponte (ou vários, separados por vírgula);
+      · `de` + `para`— uma célula da matriz de migração;
+      · `faixa` + `parte` — uma faixa e a parte do Δ dela (entrou/saiu/repreco).
+
+    O par de domingos vem em `par` (o domingo ATUAL) e é RECONSTRUÍDO pela mesma
+    `_fcw_pairs` da página, não aceito cru: assim uma URL antiga não consegue
+    pedir uma janela que a tela não desenharia (par sem foto nas duas pontas)."""
+    f = get_filters()
+    q0, q1 = _fc_hist_quarter(f)
+    pares, curr_sun, prev_sun, _falta = _fcw_pairs(q0, q1)
+    if not pares:
+        return jsonify(_empty_drill(""))
+
+    name = (request.args.get("name") or "").strip()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
+        return jsonify(_empty_drill(name))
+
+    w = _fcw_frame(q0, q1, curr_sun, prev_sun, f)
+    return _fcw_drill_json(w, name, grain, prev_sun, curr_sun, "Movimento da semana")
+
+
+def _fcw_drill_json(w, name, grain, t_prev, t_curr, sufixo_padrao):
+    """O corpo do drill do WoW, separado da escolha das pontas: o DoD usa o mesmo
+    recorte (mv, de+para, faixa+parte) sobre o frame dos DOIS DIAS dele."""
+    if not len(w):
+        return jsonify(_empty_drill(name))
+    w = _entity_filter(w, name, grain, request.args.get("leader"),
+                       request.args.get("region"))
+
+    de, para = (request.args.get("de") or ""), (request.args.get("para") or "")
+    faixa, parte = (request.args.get("faixa") or ""), (request.args.get("parte") or "")
+    mvs = [x.strip() for x in (request.args.get("mv") or "").split(",") if x.strip()]
+    mvs = [m for m in mvs if m in _FCW_MV_META]
+    # `mexeu` = o deal fez ALGO na semana. A reprecificação de valor zero (o caso
+    # do Lost acumulado, 1,6 mil deals parados) não é movimento, e sem esse corte
+    # o drill do KPI devolvia o trimestre inteiro em vez da semana.
+    mexeu = ~w["mv"].eq("repreco") | (w["v_curr"] != w["v_prev"])
+    titulo, sufixo = (name or "Forecast do trimestre — total"), sufixo_padrao
+    # `bruto` medido na ponta que o recorte descreve: o que SAIU só existe no
+    # valor anterior (agora ele vale 0 na faixa), o resto se mede agora.
+    lado = "v_curr"
+    # `parte=nivel` sem faixa = a COMPOSIÇÃO da projeção atual (o número grande
+    # do card), deal a deal com o quanto cada um soma — não o movimento da semana.
+    composicao = parte == "nivel" and not faixa
+    if composicao:
+        w = w[w["p_curr"] != 0]
+        sufixo = "composição da projeção atual"
+    elif de and para:
+        w = w[w["b_prev"].eq(de) & w["b_curr"].eq(para)]
+        sufixo = f"{_FCW_META.get(de, {}).get('label', de)} → {_FCW_META.get(para, {}).get('label', para)}"
+        # A matriz mede a célula no valor de ORIGEM (só a linha `out` não tem
+        # origem) — o subtítulo do drill tem que dar o MESMO número da célula
+        # clicada, senão a modal parece contradizer a tabela.
+        lado = "v_curr" if de == "out" else "v_prev"
+    elif de and mvs:
+        # Um pedaço da barra do "Destino de cada faixa": a faixa de ORIGEM mais a
+        # classe de movimento. Sem o `mexeu` de propósito — o bloco "ficou" da
+        # barra inclui quem não mudou nada, e o drill tem que devolver a mesma
+        # população que a barra desenhou, não um subconjunto dela.
+        w = w[w["b_prev"].eq(de) & w["mv"].isin(mvs)]
+        sufixo = (f"{_FCW_META.get(de, {}).get('label', de)} · "
+                  f"{_FCW_MV_META[mvs[0]]['label'] if len(mvs) == 1 else f'{len(mvs)} movimentos'}")
+        # A barra é medida na ORIGEM — menos a de `out`, que não tem origem.
+        lado = "v_curr" if de == "out" else "v_prev"
+    elif faixa in _FCW_KEYS and parte:
+        ip, ic = w["b_prev"].eq(faixa), w["b_curr"].eq(faixa)
+        w = {"entrou": w[ic & ~ip], "saiu": w[ip & ~ic],
+             "repreco": w[ip & ic & (w["v_curr"] != w["v_prev"])],
+             "nivel": w[ic]}.get(parte, w.iloc[0:0])
+        _p = {"entrou": "entrou na faixa", "saiu": "saiu da faixa",
+              "repreco": "reprecificado", "nivel": "nível atual"}.get(parte, parte)
+        sufixo = f"{_FCW_META[faixa]['label']} · {_p}"
+        lado = "v_prev" if parte == "saiu" else "v_curr"
+    elif mvs:
+        w = w[w["mv"].isin(mvs) & mexeu]
+        sufixo = (_FCW_MV_META[mvs[0]]["label"] if len(mvs) == 1
+                  else f"{len(mvs)} movimentos")
+        lado = "v_prev" if set(mvs) <= {"saiu", "recl"} else "v_curr"
+    else:
+        w = w[mexeu]
+
+    _mot = {"data": "escorregou de trimestre",
+            "ext": "ganho no fechamento estendido do trimestre anterior",
+            "funil": "saiu dos 6 estágios abertos",
+            "novo": "deal novo", "veio": "veio de fora do trimestre"}
+    rows = []
+    for r in w.sort_values("dp").itertuples():
+        rows.append({
+            "deal_name": r.deal_name,
+            "deal_url": _hs_deal_url(r.deal_id),
+            "ae": r.account_executive,
+            "leader": r.leader,
+            "movimento": _FCW_MV_META[r.mv]["label"],
+            "faixas": (f"{_FCW_META[r.b_prev]['label']} → {_FCW_META[r.b_curr]['label']}"
+                       if r.b_prev != r.b_curr else _FCW_META[r.b_curr]["label"]),
+            "motivo": _mot.get(r.motivo, "—"),
+            "valores": f"{fmt_brl(r.v_prev)} → {fmt_brl(r.v_curr)}",
+            "dp": float(r.p_curr if composicao else r.dp),
+        })
+    _dp = sum(x["dp"] for x in rows)
+    _n = len(rows)
+    # Na reprecificação o "bruto" é a VARIAÇÃO do amount (é o que a linha da
+    # ponte mostra), não o valor dos deals: eles não mudaram de faixa.
+    _so_repreco = (parte == "repreco") or (mvs == ["repreco"])
+    _bruto = 0.0
+    if len(w):
+        _bruto = float((w["v_curr"] - w["v_prev"]).sum() if _so_repreco
+                       else w[lado].sum())
+    _b_txt = ((('+' if _bruto >= 0 else '−') + fmt_money(abs(_bruto))) if _so_repreco
+              else fmt_money(_bruto))
+    if composicao:
+        return jsonify({
+            "title": f"{titulo} · {sufixo}",
+            "subtitle": (f"foto de {_fmt_date_short(t_curr)} · {_n} deal{'s' if _n != 1 else ''} · "
+                         f"bruto {fmt_money(_bruto)} · projeção {fmt_money(_dp)}"),
+            "columns": _with_ae_col([
+                {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+                {"key": "faixas", "label": "Faixa (de → para)"},
+                {"key": "valores", "label": "Amount (de → para)"},
+                {"key": "dp", "label": "Projeção", "type": "money"},
+            ], "leader" if (grain == "leader" or not name) else "ae"),
+            "rows": rows,
+        })
+    return jsonify({
+        "title": f"{titulo} · {sufixo}",
+        "subtitle": (f"{_fmt_date_short(t_prev)} → {_fmt_date_short(t_curr)} · "
+                     f"{_n} deal{'s' if _n != 1 else ''} · bruto {_b_txt} · "
+                     f"Δ projeção {'+' if _dp >= 0 else '−'}{fmt_money(abs(_dp))}"),
+        "columns": _with_ae_col([
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "movimento", "label": "Movimento"},
+            {"key": "faixas", "label": "Faixa (de → para)"},
+            {"key": "motivo", "label": "Por quê"},
+            {"key": "valores", "label": "Amount (de → para)"},
+            {"key": "dp", "label": "Δ projeção", "type": "money_signed"},
+        ], "leader" if (grain == "leader" or not name) else "ae"),
+        "rows": rows,
+    })
+
+
+# ===========================================================================
+# DoD do Forecast (só Leaders) — o "Destino de cada faixa" do WoW, dia a dia
+# ===========================================================================
+# Mesma pergunta do WoW ("o que o volume de cada faixa virou"), com pontas de
+# MEIA-NOITE: a foto de 00h de hoje contra a de 00h de ontem, ou seja, o dia de
+# ontem inteiro. Toda a conta (faixa, peso, movimento, barra) é a do WoW —
+# `_fcw_frame` + `_fcw_destino` —, só as pontas mudam de lugar.
+#
+# As pontas vêm de `pepeuhacker.forecast_snapshots_daily`, que o próprio app
+# grava logo depois da virada (`_snapshot_forecast_midnight`). A cópia do BI não
+# serve de ponta exata: ela é gravada às ~17h16 BRT. Mas ela é a MELHOR
+# aproximação disponível pra um dia que não tem foto própria (a série começou em
+# 24/09/2026, e um deploy ou queda pode furar uma virada): a cópia do BI da
+# VÉSPERA é o último estado conhecido antes daquela meia-noite, faltando só as
+# ~7h da noite. Quando uma ponta é aproximada, a tela diz qual e por quê.
+# ===========================================================================
+
+# Quantos dias pra trás o chip oferece. Duas semanas: o suficiente pra rever a
+# segunda-feira da semana passada, e sem virar uma fileira de 90 botões.
+_FCD_DIAS = 14
+# Captura depois disto não é "a meia-noite": é a manhã. Melhor furar o dia (e
+# a tela cair na aproximação do BI, que ela anuncia) do que gravar uma foto das
+# 9h com rótulo de 00h.
+_FCD_CAPTURA_MAX_ATRASO = timedelta(hours=2)
+
+
+def _fcd_brt(x):
+    """Timestamp do BigQuery → BRT. O parquet do cache às vezes devolve sem fuso
+    (e aí ele é UTC, que é como o BigQuery grava)."""
+    if x is None or pd.isna(x):
+        return None
+    t = pd.Timestamp(x)
+    return (t.tz_localize("UTC") if t.tzinfo is None else t).tz_convert(BRT)
+
+
+def _fcd_sides(force=False, dias=None) -> dict:
+    """{YYYYMMDD: ponta} — pra cada dia recente, de onde sai a foto da meia-noite
+    dele: a própria (`meia-noite`) ou a cópia do BI da véspera (`bi`).
+
+    `dias` = quais meias-noites procurar; padrão, as dos últimos `_FCD_DIAS`
+    dias (o DoD). O Pipeline WoW passa só as segundas-feiras."""
+    own = bq.forecast_daily_snapshots(pipeline=_pl(), force_refresh=force)
+    own = ({r.dia: r for r in own.itertuples()} if len(own) else {})
+    disp = bq.forecast_asof_snapshots(force_refresh=force)
+    bi = set(disp["dia"]) if len(disp) else set()
+    hoje = _today()
+    if dias is None:
+        dias = [hoje - timedelta(days=i) for i in range(_FCD_DIAS + 1)]
+    bi = _fcd_bi_saudaveis(bi, hoje, force=force,
+                           janela={(d - timedelta(days=1)).strftime("%Y%m%d")
+                                   for d in dias})
+    out = {}
+    for d in dias:
+        k = d.strftime("%Y%m%d")
+        if k in own:
+            r = own[k]
+            out[k] = {"dia": d, "key": k, "fonte": "meia-noite",
+                      "captured": _fcd_brt(r.captured_at),
+                      "source": _fcd_brt(r.source_at)}
+            continue
+        kb = (d - timedelta(days=1)).strftime("%Y%m%d")
+        if kb in bi:
+            out[k] = {"dia": d, "key": k, "fonte": "bi", "sufixo": kb}
+    return out
+
+
+# Uma cópia do BI só serve de ponta se tiver pelo menos esta fração dos deals
+# com AE da mediana da janela. O Sales BR cresce ~20 deals por dia; uma cópia
+# que perde 10% de um dia pro outro não é crescimento, é carga quebrada.
+_FCD_BI_MIN_FRAC = 0.9
+
+
+def _fcd_bi_saudaveis(bi: set, hoje: date, force=False, janela=None) -> set:
+    """Tira da lista as cópias do BI da janela do DoD que vieram quebradas (ver
+    `bq.forecast_asof_ae_counts`). Dia que perde a cópia volta a não ter ponta,
+    e os pares que tocam nele somem do chip — melhor do que um par em que o
+    funil inteiro "sai" num dia. Se a checagem falhar, segue sem ela.
+    `janela` = sufixos a checar; padrão, os dos últimos `_FCD_DIAS` dias."""
+    if janela is None:
+        janela = {(hoje - timedelta(days=i)).strftime("%Y%m%d")
+                  for i in range(1, _FCD_DIAS + 2)}
+    janela = set(janela) & bi
+    try:
+        cnt = bq.forecast_asof_ae_counts(sorted(janela), pipeline=_pl(),
+                                         force_refresh=force)
+    except Exception as e:  # noqa: BLE001 — sanidade é best-effort
+        print(f"pepeuhacker · checagem das cópias do BI falhou ({e})", flush=True)
+        return bi
+    if not len(cnt):
+        return bi
+    n = dict(zip(cnt["sufixo"].astype(str), cnt["n_ae"].astype(float)))
+    ref = float(pd.Series(list(n.values())).median())
+    ruins = {k for k in janela if n.get(k, 0.0) < _FCD_BI_MIN_FRAC * ref}
+    return bi - ruins
+
+
+def _fcd_pairs(force=False):
+    """(pares, curr, prev) — pares de dias CONSECUTIVOS com ponta nos dois, e o
+    escolhido pelo chip (`?dia=YYYYMMDD`, a meia-noite ATUAL do par). Padrão: o
+    mais recente, que é hoje assim que a foto das 00h existir."""
+    sides = _fcd_sides(force=force)
+    pares = []
+    for k, c in sorted(sides.items(), reverse=True):
+        kp = (c["dia"] - timedelta(days=1)).strftime("%Y%m%d")
+        if kp in sides:
+            pares.append((c, sides[kp]))
+    if not pares:
+        return [], None, None
+    sel = (request.args.get("dia") or "").strip()
+    curr, prev = next(((c, p) for c, p in pares if c["key"] == sel), pares[0])
+    return pares, curr, prev
+
+
+def _fcd_raw(sides, q0: date, q1: date, force=False) -> pd.DataFrame:
+    """As duas pontas no shape de `bq.forecast_asof_series`, com `dia` = o dia
+    da MEIA-NOITE (não o sufixo do BI, que é a véspera)."""
+    partes = []
+    for sd in sides:
+        if sd["fonte"] == "meia-noite":
+            x = bq.forecast_daily_series([sd["key"]], pipeline=_pl(),
+                                         lost_from=q0.isoformat(),
+                                         lost_to=q1.isoformat(), force_refresh=force)
+        else:
+            x = bq.forecast_asof_series(
+                [sd["sufixo"]], _fc_open_stage_ids(), lost_stage_id=_HS_LOST_STAGE,
+                lost_from=q0.isoformat(), lost_to=q1.isoformat(),
+                force_refresh=force, pipeline=_pl())
+        x = x.copy()
+        x["dia"] = sd["key"]
+        partes.append(x)
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+def _fcd_frame(q0, q1, curr, prev, f, force=False) -> pd.DataFrame:
+    if not (curr and prev):
+        return _fcw_frame(q0, q1, None, None, f)
+    raw = _fcd_raw([prev, curr], q0, q1, force=force)
+    return _fcw_frame(q0, q1, curr["dia"], prev["dia"], f, force=force, raw=raw)
+
+
+def _fcd_side_txt(sd) -> str:
+    """Como a tela descreve uma ponta — sempre dizendo de quando é o DADO."""
+    if sd["fonte"] == "meia-noite":
+        t = f"foto de {sd['captured']:%H:%M} BRT"
+        if sd["source"] is not None:
+            t += f", dado do HubSpot até {sd['source']:%d/%m %H:%M}"
+        return t
+    b = datetime.strptime(sd["sufixo"], "%Y%m%d").date()
+    return (f"aproximada: cópia do BI de {_fmt_date_curta(b)} ~17h "
+            f"(sem foto própria da meia-noite)")
+
+
+@app.route("/leaders/forecast/dod")
+def leaders_forecast_dod():
+    """DoD do Forecast: o Destino de cada faixa entre a meia-noite de um dia e a
+    do anterior. Só no Leaders, de propósito — é leitura de gestão do dia."""
+    grain = "leader"
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    q0, q1 = _fc_hist_quarter(f)
+    pares, curr, prev = _fcd_pairs(force=force)
+    w = _fcd_frame(q0, q1, curr, prev, f, force=force)
+
+    def _lbl(sd):
+        return f"00h de {_fmt_date_short(sd['dia'])}" if sd else "—"
+
+    def _drill(**kw):
+        return url_for("leaders_forecast_dod_deals", grain=grain,
+                       dia=(curr["key"] if curr else None),
+                       date_from=f.get("date_from"), date_to=f.get("date_to"),
+                       dtype=f.get("dtype") or None,
+                       leader=(f.get("leader") if not kw.get("name") else None),
+                       region=(f.get("region") if not kw.get("name") else None),
+                       **kw)
+
+    def _chip_url(**kw):
+        args = {k: v for k, v in request.args.items() if k not in kw and v}
+        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+
+    return render_template(
+        "forecast_dod.html", ctx=ctx, grain=grain,
+        q_label=_fc_hist_label(q0, q1),
+        q_range=f"{q0.strftime('%d/%m/%Y')} → {q1.strftime('%d/%m/%Y')}",
+        curr_label=_lbl(curr), prev_label=_lbl(prev),
+        # O dia que o par MEDE é o da ponta anterior: 00h de 22 → 00h de 23 é o
+        # dia 22 inteiro. O chip mostra esse dia, que é o que a pessoa procura.
+        dia_medido=(_fmt_date_short(prev["dia"]) if prev else "—"),
+        pares=[{"key": c["key"], "label": _fmt_date_curta(p["dia"]),
+                "aprox": "bi" in (c["fonte"], p["fonte"]),
+                "title": f"{_lbl(p)} → {_lbl(c)}"} for c, p in pares],
+        dia_sel=(curr["key"] if curr else ""),
+        curr_txt=(_fcd_side_txt(curr) if curr else ""),
+        prev_txt=(_fcd_side_txt(prev) if prev else ""),
+        aprox=bool(curr and "bi" in (curr["fonte"], prev["fonte"])),
+        sem_par=not pares, sem_dado=not len(w),
+        destino=(_fcw_destino(w) if len(w) else None),
+        drill=_drill, chip_url=_chip_url,
+    )
+
+
+@app.route("/leaders/forecast/dod/deals")
+def leaders_forecast_dod_deals():
+    """Drill do DoD — o mesmo contrato do drill do WoW, com o par de dias
+    reconstruído por `_fcd_pairs` (uma URL velha não pede ponta inexistente)."""
+    f = get_filters()
+    q0, q1 = _fc_hist_quarter(f)
+    pares, curr, prev = _fcd_pairs()
+    name = (request.args.get("name") or "").strip()
+    if not pares:
+        return jsonify(_empty_drill(name))
+    w = _fcd_frame(q0, q1, curr, prev, f)
+    return _fcw_drill_json(w, name, "leader", prev["dia"], curr["dia"],
+                           "Movimento do dia")
+
+
+# ===========================================================================
+# DoD do Pipeline (só Leaders) — o destino de cada ESTÁGIO entre meias-noites
+# ===========================================================================
+# A mesma pergunta do Forecast DoD ("o que o volume de ontem virou"), com o
+# eixo trocado: no lugar da faixa de probabilidade, o ESTÁGIO do funil. Pra
+# cada um dos 6 estágios abertos, o pipe que estava nele às 00h de ontem:
+# quanto ficou, quanto avançou pro próximo (ou pulou etapas, ou virou Won),
+# quanto voltou, quanto foi pra Lost e quanto sumiu do funil.
+#
+# As pontas são EXATAMENTE as do Forecast DoD (`_fcd_pairs`): a foto própria
+# das 00h BRT (`forecast_snapshots_daily`), ou a cópia do BI da véspera quando
+# a virada não tem foto — e a tela avisa. Como a foto guarda os 6 estágios +
+# Won + Lost dos últimos 200 dias, ela já é a foto do FUNIL inteiro, não só do
+# forecast: não precisa de tabela nova.
+#
+# Sem recorte de trimestre, de propósito: o pipe é o funil aberto todo. 49% dos
+# deals abertos não têm close date confiável (ver PIPELINE_TOTAL_PATHS), e
+# cortar por ele aqui esconderia metade do movimento.
+# ===========================================================================
+
+# Janela do Lost nas pontas. A foto da meia-noite já só guarda o perdido dos
+# últimos 200 dias; o mesmo corte na cópia do BI deixa as duas fontes iguais.
+# Perdido com close date mais velho que isso não é movimento do dia: o HubSpot
+# escreve o close date no dia em que o deal é marcado perdido.
+_PPD_LOST_DIAS = 199
+
+_PPD_OPEN = [s["id"] for s in STAGE_REGISTRY]
+_PPD_NUM = {s["id"]: s["num"] for s in STAGE_REGISTRY}
+# Cor de cada estágio — a mesma rampa azul→roxo do Funil, do topo pro fundo.
+_PPD_STAGE_COLOR = {1: "#93C5FD", 2: "#60A5FA", 3: "#3B82F6",
+                    4: "#6366F1", 5: "#7C3AED", 6: "#5B21B6"}
+
+# Os destinos possíveis de quem estava num estágio aberto. A ORDEM é a da barra:
+# da esquerda pra direita, do pior pro melhor, com o "ficou" no meio — o olho lê
+# "vermelho à esquerda = sangrou, verde à direita = andou".
+_PPD_MV_META = {
+    "saiu":    {"label": "Saiu do funil", "color": "#B45309",
+                "hint": "não está na foto final: No Show, outro pipeline, deal "
+                        "apagado ou sem AE"},
+    "lost":    {"label": "Lost", "color": "#B91C1C",
+                "hint": "marcado closed lost no período"},
+    "voltou":  {"label": "Voltou de estágio", "color": "#DB2777",
+                "hint": "foi pra um estágio ANTERIOR do funil"},
+    "ficou":   {"label": "Ficou no estágio", "color": "#CBD5E1",
+                "hint": "mesmo estágio nas duas meias-noites"},
+    "avancou": {"label": "Avançou pro próximo", "color": "#10B981",
+                "hint": "foi pro estágio seguinte do funil"},
+    "pulou":   {"label": "Pulou etapas", "color": "#047857",
+                "hint": "avançou dois estágios ou mais de uma vez"},
+    "won":     {"label": "Won", "color": "#065F46",
+                "hint": "virou PO Won no período"},
+}
+_PPD_MV_ORDER = ("saiu", "lost", "voltou", "ficou", "avancou", "pulou", "won")
+# Colunas-resumo da tabela: as quatro perguntas do pedido ("ficou no mesmo,
+# foi pro próximo, foi pra Lost") mais a volta, que é a que mais incomoda.
+# Somam 100% do estágio.
+_PPD_RESUMO = [
+    ("ficou",   "Ficou",   None,      ("ficou",)),
+    ("avancou", "Avançou", "#047857", ("avancou", "pulou", "won")),
+    ("voltou",  "Voltou",  "#DB2777", ("voltou",)),
+    ("perdeu",  "Lost / saiu", "#B91C1C", ("lost", "saiu")),
+]
+# "Deal novo" tolera este atraso na data de criação. A foto da meia-noite lê a
+# curated do BI, que chega a levar 2 dias pra trazer um deal recém-criado: em
+# 07/10/2026, 9 deals criados em 05/10 apareceram pela primeira vez na foto de
+# 07/10. Com a régua "criado depois da meia-noite anterior" os 9 viravam "veio
+# de fora" e o dia não tinha deal novo nenhum.
+_PPD_NOVO_ATRASO = timedelta(days=3)
+# Quem chegou num estágio aberto sem estar em nenhum na véspera.
+_PPD_IN_META = {
+    "novo":    {"label": "Deal novo", "color": "#2563EB",
+                "hint": "criado nos últimos dias (a carga do BI leva até 2 dias "
+                        "pra trazer o deal novo)"},
+    "reabriu": {"label": "Reaberto", "color": "#64748B",
+                "hint": "era Won ou Lost e voltou pra um estágio aberto"},
+    "fora":    {"label": "Veio de fora", "color": "#0891B2",
+                "hint": "deal antigo que entrou no recorte: saiu de No Show, "
+                        "trocou de pipeline ou ganhou AE"},
+}
+_PPD_IN_ORDER = ("novo", "reabriu", "fora")
+
+
+def _ppd_raw(sides, force=False) -> pd.DataFrame:
+    """As duas pontas, uma linha por (deal, dia), com `dia` = o dia da
+    MEIA-NOITE. Mesmo recorte do Forecast DoD, só que o Lost vem pela janela de
+    `_PPD_LOST_DIAS` e não pelo trimestre."""
+    lo = (min(sd["dia"] for sd in sides)
+          - timedelta(days=_PPD_LOST_DIAS)).isoformat()
+    hi = "2100-01-01"
+    partes = []
+    for sd in sides:
+        if sd["fonte"] == "meia-noite":
+            x = bq.forecast_daily_series([sd["key"]], pipeline=_pl(),
+                                         lost_from=lo, lost_to=hi,
+                                         force_refresh=force)
+        else:
+            x = bq.forecast_asof_series(
+                [sd["sufixo"]], _fc_open_stage_ids(), lost_stage_id=_HS_LOST_STAGE,
+                lost_from=lo, lost_to=hi, force_refresh=force, pipeline=_pl())
+        x = x.copy()
+        x["dia"] = sd["key"]
+        partes.append(x)
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+def _ppd_side(stage) -> str:
+    """Estado de um deal numa ponta: 's1'..'s6', 'won', 'lost' ou 'out'."""
+    if not isinstance(stage, str):
+        return "out"
+    if stage in _PPD_NUM:
+        return f"s{_PPD_NUM[stage]}"
+    if stage == _HS_WON_STAGE:
+        return "won"
+    if stage == _HS_LOST_STAGE:
+        return "lost"
+    return "out"
+
+
+def _ppd_mv(sp: str, sc: str) -> str:
+    """Movimento de quem estava ABERTO na véspera (sp = 's1'..'s6')."""
+    if sc == sp:
+        return "ficou"
+    if sc in ("won", "lost"):
+        return sc
+    if sc == "out":
+        return "saiu"
+    d = int(sc[1:]) - int(sp[1:])
+    return "avancou" if d == 1 else ("pulou" if d > 1 else "voltou")
+
+
+def _ppd_frame(curr, prev, f, force=False) -> pd.DataFrame:
+    """UMA linha por deal que estava aberto em pelo menos uma das pontas:
+      · `s_prev`/`s_curr` — estado em cada meia-noite (ver `_ppd_side`);
+      · `v_prev`/`v_curr` — amount em cada uma (0 onde o deal não existe);
+      · `mv`  — pra quem estava aberto na véspera, o destino (`_PPD_MV_META`);
+      · `ent` — pra quem NÃO estava, como chegou (`_PPD_IN_META`).
+    Deal que não estava aberto em nenhuma das duas (Won/Lost acumulado) sai."""
+    cols = ["deal_id", "deal_name", "account_executive", "leader", "region",
+            "deal_type", "s_prev", "s_curr", "v_prev", "v_curr", "mv", "ent"]
+    if not (curr and prev):
+        return pd.DataFrame(columns=cols)
+    raw = _ppd_raw([prev, curr], force=force)
+    if not len(raw):
+        return pd.DataFrame(columns=cols)
+
+    lv = canon_ae_names(raw).copy()
+    lv["amount"] = pd.to_numeric(lv["amount"], errors="coerce").fillna(0.0)
+    # Hierarquia + roster/allowlist/líder/região/deal type — o mesmo escopo do
+    # Forecast DoD, com o corte de quem saiu ancorado na véspera.
+    lv = lv.merge(_fc_asof_leader_meta(force=force), on="account_executive", how="left")
+    mgr = lv["account_executive"].isin(NON_AE_USERS)
+    lv.loc[mgr, "leader"] = lv.loc[mgr, "account_executive"]
+    lv.loc[mgr, "region"] = lv.loc[mgr, "region"].fillna("BR")
+    lv = _fcw_scope(f, cut_from=prev["dia"])(lv)
+    if not len(lv):
+        return pd.DataFrame(columns=cols)
+
+    lv = lv.drop_duplicates(subset=["dia", "deal_id"])
+    lv["s"] = lv["stage"].map(_ppd_side)
+    ant = lv[lv["dia"] == prev["key"]].set_index("deal_id")
+    atu = lv[lv["dia"] == curr["key"]].set_index("deal_id")
+    ids = ant.index.union(atu.index)
+    w = pd.DataFrame(index=ids)
+    w["s_prev"] = ant["s"].reindex(ids).fillna("out")
+    w["s_curr"] = atu["s"].reindex(ids).fillna("out")
+    _aberto = lambda s: s.str.startswith("s")  # noqa: E731
+    w = w[_aberto(w["s_prev"]) | _aberto(w["s_curr"])]
+    ids = w.index
+    ant, atu = ant.reindex(ids), atu.reindex(ids)
+    w["v_prev"] = ant["amount"].fillna(0.0)
+    w["v_curr"] = atu["amount"].fillna(0.0)
+    for col in ("deal_name", "account_executive", "leader", "region", "deal_type"):
+        w[col] = atu[col].fillna(ant[col])
+
+    w["mv"] = [(_ppd_mv(p, c) if p.startswith("s") else "")
+               for p, c in zip(w["s_prev"], w["s_curr"])]
+    # Como chegou quem não estava aberto: novo pela data de criação (imutável,
+    # com a folga de `_PPD_NOVO_ATRASO`), reaberto se a véspera o tinha como
+    # Won/Lost, e o resto veio de fora.
+    pipe = _get_pipeline_deals(force=force)
+    criado = dict(zip(pipe["deal_id"].astype(str),
+                      pd.to_datetime(pipe["created_date"], errors="coerce")))
+    _t0 = pd.Timestamp(prev["dia"] - _PPD_NOVO_ATRASO)
+    ent = []
+    for did, p, c in zip(w.index, w["s_prev"], w["s_curr"]):
+        if p.startswith("s") or not c.startswith("s"):
+            ent.append("")
+        elif p in ("won", "lost"):
+            ent.append("reabriu")
+        else:
+            cd = criado.get(str(did))
+            if cd is not None and not pd.isna(cd):
+                cd = pd.Timestamp(cd)
+                cd = (cd.tz_convert(BRT).tz_localize(None) if cd.tzinfo else cd)
+            ent.append("novo" if (cd is not None and not pd.isna(cd)
+                                  and cd >= _t0) else "fora")
+    w["ent"] = ent
+    return w.reset_index().rename(columns={"index": "deal_id"})
+
+
+def _ppd_destino(w) -> dict:
+    """A tela inteira a partir do frame: uma barra por estágio (medida no valor
+    da VÉSPERA, então soma exatamente o pipe que o estágio tinha), o bloco de
+    quem chegou, e a ponte do pipe total entre as duas meias-noites."""
+    rows, span = [], 0.0
+    for s in STAGE_REGISTRY:
+        k = f"s{s['num']}"
+        sub = w[w["s_prev"].eq(k)]
+        tot = float(sub["v_prev"].sum())
+        span = max(span, tot)
+        segs = []
+        porm = {}
+        for mv in _PPD_MV_ORDER:
+            s2 = sub[sub["mv"].eq(mv)]
+            v, n = float(s2["v_prev"].sum()), int(len(s2))
+            porm[mv] = {"v": v, "n": n}
+            if not n:
+                continue
+            segs.append({"key": mv, "label": _PPD_MV_META[mv]["label"],
+                         "color": _PPD_MV_META[mv]["color"], "v": v, "n": n,
+                         "pct": (v / tot) if tot else (n / len(sub)),
+                         "e_ficou": mv == "ficou"})
+        resumo = {}
+        for key, _lbl, _cor, mvs in _PPD_RESUMO:
+            v = sum(porm[m]["v"] for m in mvs)
+            n = sum(porm[m]["n"] for m in mvs)
+            resumo[key] = {"v": v, "n": n, "mvs": ",".join(mvs),
+                           "pct": (v / tot) if tot else 0.0}
+        # O que CHEGOU neste estágio (de qualquer lugar) e o nível de hoje —
+        # pra linha ler como conta de estoque: ontem − saiu + chegou = hoje.
+        cheg = w[w["s_curr"].eq(k) & ~w["s_prev"].eq(k)]
+        fic = sub[sub["mv"].eq("ficou")]
+        hoje = w[w["s_curr"].eq(k)]
+        rows.append({
+            "key": k, "num": s["num"], "label": s["label"],
+            "color": _PPD_STAGE_COLOR[s["num"]],
+            "total": tot, "n": int(len(sub)), "segs": segs, "resumo": resumo,
+            "repreco_dp": float((fic["v_curr"] - fic["v_prev"]).sum()),
+            "chegou_v": float(cheg["v_curr"].sum()), "chegou_n": int(len(cheg)),
+            "hoje_v": float(hoje["v_curr"].sum()), "hoje_n": int(len(hoje)),
+        })
+
+    ent = w[w["ent"].ne("")]
+    ent_segs = []
+    for e in _PPD_IN_ORDER:
+        s2 = ent[ent["ent"].eq(e)]
+        if not len(s2):
+            continue
+        ent_segs.append({"key": e, "n": int(len(s2)), "v": float(s2["v_curr"].sum()),
+                         **_PPD_IN_META[e]})
+
+    # Ponte do pipe aberto: fecha por construção. Quem estava aberto nas duas
+    # pontas contribui com a reprecificação; quem saiu, com o valor de ontem;
+    # quem chegou, com o de hoje.
+    ab_p = w["s_prev"].str.startswith("s")
+    ab_c = w["s_curr"].str.startswith("s")
+    both = w[ab_p & ab_c]
+    def _m(mvs):
+        x = w[ab_p & w["mv"].isin(mvs)]
+        return {"v": float(x["v_prev"].sum()), "n": int(len(x))}
+    ponte = {
+        "ontem": {"v": float(w.loc[ab_p, "v_prev"].sum()), "n": int(ab_p.sum())},
+        "hoje":  {"v": float(w.loc[ab_c, "v_curr"].sum()), "n": int(ab_c.sum())},
+        "entrou": {"v": float(ent["v_curr"].sum()), "n": int(len(ent))},
+        "won": _m(("won",)), "lost": _m(("lost",)), "saiu": _m(("saiu",)),
+        "repreco": float((both["v_curr"] - both["v_prev"]).sum()),
+        "avancou": _m(("avancou", "pulou")), "voltou": _m(("voltou",)),
+    }
+    return {"rows": rows, "span": span or 1.0, "ponte": ponte,
+            "entrou": {"segs": ent_segs,
+                       "span": max([x["v"] for x in ent_segs], default=0) or 1.0},
+            "legenda": [{"key": m, **_PPD_MV_META[m]} for m in _PPD_MV_ORDER],
+            "resumo_meta": [(k, l, c) for k, l, c, _ in _PPD_RESUMO],
+            "mv_todos": ",".join(_PPD_MV_ORDER)}
+
+
+def _ppd_lbl(s: str) -> str:
+    if s.startswith("s"):
+        return _STAGE_BY_NUM[int(s[1:])]["label"]
+    return {"won": "Won", "lost": "Lost", "out": "fora do funil"}.get(s, s)
+
+
+# ===========================================================================
+# Pipeline WoW (só Leaders) — o mesmo Destino de cada estágio, semana a semana
+# ===========================================================================
+# Mesma tela, mesma conta e mesmas fotos do Pipeline DoD (`_ppd_frame` +
+# `_ppd_destino`); só as pontas se afastam: a meia-noite de uma SEGUNDA-FEIRA
+# contra a da segunda anterior, ou seja, a semana de segunda a domingo inteira.
+# Segunda 00h e não domingo 12h (a ponta do PoP Early/Late) porque a foto
+# própria é a da meia-noite; a semana fica completa, sem cortar o domingo ao meio.
+#
+# Semana sem foto própria (antes de 24/09/2026, ou uma virada furada) cai na
+# cópia do BI do domingo, como no DoD — e a tela marca a ponta como aproximada.
+# Só semanas FECHADAS: a corrente ainda não tem a ponta final.
+# ===========================================================================
+
+# Quantas semanas pra trás o chip oferece: dois meses, o bastante pra ver o
+# trimestre virando sem virar uma fileira de botões.
+_PPW_SEMANAS = 8
+
+
+def _ppw_pairs(force=False):
+    """(pares, curr, prev) do Pipeline WoW — o mesmo contrato de `_fcd_pairs`,
+    com as pontas nas segundas 00h. Chip: `?semana=YYYYMMDD` (a segunda que
+    FECHA a semana). Padrão: a última semana fechada."""
+    hoje = _today()
+    seg = hoje - timedelta(days=hoje.weekday())
+    dias = [seg - timedelta(weeks=i) for i in range(_PPW_SEMANAS + 1)]
+    sides = _fcd_sides(force=force, dias=dias)
+    pares = []
+    for d in dias[:-1]:
+        k, kp = d.strftime("%Y%m%d"), (d - timedelta(days=7)).strftime("%Y%m%d")
+        if k in sides and kp in sides:
+            pares.append((sides[k], sides[kp]))
+    if not pares:
+        return [], None, None
+    sel = (request.args.get("semana") or "").strip()
+    curr, prev = next(((c, p) for c, p in pares if c["key"] == sel), pares[0])
+    return pares, curr, prev
+
+
+def _ppw_semana_txt(prev, curr) -> str:
+    """'5–11 out' / '28 set–4 out' — a semana MEDIDA (segunda a domingo)."""
+    a, b = prev["dia"], curr["dia"] - timedelta(days=1)
+    if a.month == b.month:
+        return f"{a.day}–{b.day} {PT_MONTHS_SHORT[b.month-1]}"
+    return f"{_fmt_date_curta(a)}–{_fmt_date_curta(b)}"
+
+
+# Textos que mudam entre o DoD e o WoW. Tudo o mais (conta, barra, drill) é o
+# mesmo código, de propósito: as duas telas têm de ler igual.
+_PPD_MODOS = {
+    "dod": {
+        "titulo": "Pipeline DoD", "sigla": "Day over day: o dia", "inteiro": "inteiro",
+        "chip": "dia", "pares": _fcd_pairs,
+        "page": "leaders_pipeline_dod", "drill": "leaders_pipeline_dod_deals",
+        "sem_par_h": "Sem par de dias comparável",
+        "sem_par_p": "A tela compara a foto da meia-noite de um dia com a do dia "
+                     "anterior, e ainda não há duas pontas consecutivas nos últimos dias.",
+        "depois": "dia depois", "valor_ant": "valor de ontem",
+        "foto_atual": "foto de hoje", "dentro": "DENTRO do dia",
+        "mov": "Movimento do dia", "col_estagio": "Estágio (00h ontem → 00h hoje)",
+        "col_ant": "MRR ontem", "col_atu": "MRR hoje",
+    },
+    "wow": {
+        "titulo": "Pipeline WoW", "sigla": "Week over week: a semana", "inteiro": "inteira",
+        "chip": "semana", "pares": _ppw_pairs,
+        "page": "leaders_pipeline_wow", "drill": "leaders_pipeline_wow_deals",
+        "sem_par_h": "Sem par de semanas comparável",
+        "sem_par_p": "A tela compara a foto da meia-noite de uma segunda-feira com "
+                     "a da segunda anterior, e ainda não há duas pontas assim nas "
+                     "últimas semanas.",
+        "depois": "semana depois", "valor_ant": "valor do início da semana",
+        "foto_atual": "foto do fim da semana", "dentro": "DENTRO da semana",
+        "mov": "Movimento da semana",
+        "col_estagio": "Estágio (início → fim da semana)",
+        "col_ant": "MRR início", "col_atu": "MRR fim",
+    },
+}
+
+
+@app.route("/leaders/pipeline/dod")
+def leaders_pipeline_dod():
+    """DoD do Pipeline: o destino do pipe de cada estágio entre a meia-noite de
+    um dia e a do anterior. Só no Leaders, como o Forecast DoD."""
+    return _ppd_page("dod")
+
+
+@app.route("/leaders/pipeline/wow")
+def leaders_pipeline_wow():
+    """WoW do Pipeline: o destino do pipe de cada estágio entre a meia-noite de
+    uma segunda-feira e a da anterior. Só no Leaders, como o DoD."""
+    return _ppd_page("wow")
+
+
+def _ppd_page(modo: str):
+    L = _PPD_MODOS[modo]
+    grain = "leader"
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    pares, curr, prev = L["pares"](force=force)
+    w = _ppd_frame(curr, prev, f, force=force)
+
+    def _lbl(sd):
+        return f"00h de {_fmt_date_short(sd['dia'])}" if sd else "—"
+
+    def _drill(**kw):
+        return url_for(L["drill"], grain=grain,
+                       **{L["chip"]: (curr["key"] if curr else None)},
+                       dtype=f.get("dtype") or None,
+                       leader=f.get("leader") or None,
+                       region=f.get("region") or None, **kw)
+
+    def _chip_url(**kw):
+        args = {k: v for k, v in request.args.items() if k not in kw and v}
+        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+
+    def _chip_lbl(c, p):
+        return (_fmt_date_curta(p["dia"]) if modo == "dod"
+                else _ppw_semana_txt(p, c))
+
+    if not prev:
+        periodo = "—"
+    elif modo == "dod":
+        periodo = _fmt_date_short(prev["dia"])
+    else:
+        periodo = f"{_ppw_semana_txt(prev, curr)} {curr['dia'].year}"
+
+    return render_template(
+        "pipeline_dod.html", ctx=ctx, grain=grain, L=L,
+        curr_label=_lbl(curr), prev_label=_lbl(prev),
+        dia_medido=periodo,
+        pares=[{"key": c["key"], "label": _chip_lbl(c, p),
+                "aprox": "bi" in (c["fonte"], p["fonte"]),
+                "title": f"{_lbl(p)} → {_lbl(c)}"} for c, p in pares],
+        dia_sel=(curr["key"] if curr else ""),
+        curr_txt=(_fcd_side_txt(curr) if curr else ""),
+        prev_txt=(_fcd_side_txt(prev) if prev else ""),
+        aprox=bool(curr and "bi" in (curr["fonte"], prev["fonte"])),
+        sem_par=not pares, sem_dado=not len(w),
+        destino=(_ppd_destino(w) if len(w) else None),
+        drill=_drill, chip_url=_chip_url,
+    )
+
+
+@app.route("/leaders/pipeline/dod/deals")
+def leaders_pipeline_dod_deals():
+    """Drill do Pipeline DoD. `de` = estágio de origem ('s1'..'s6') ou 'in' (quem
+    chegou); `mv` = destinos (ou modos de chegada) separados por vírgula."""
+    return _ppd_deals("dod")
+
+
+@app.route("/leaders/pipeline/wow/deals")
+def leaders_pipeline_wow_deals():
+    """Drill do Pipeline WoW — o mesmo do DoD, com as pontas da semana."""
+    return _ppd_deals("wow")
+
+
+def _ppd_deals(modo: str):
+    L = _PPD_MODOS[modo]
+    f = get_filters()
+    pares, curr, prev = L["pares"]()
+    name = (request.args.get("name") or "").strip()
+    if not pares:
+        return jsonify(_empty_drill(name))
+    w = _ppd_frame(curr, prev, f)
+    if not len(w):
+        return jsonify(_empty_drill(name))
+    de = (request.args.get("de") or "").strip()
+    mvs = [x for x in (request.args.get("mv") or "").split(",") if x]
+    if de == "in":
+        w = w[w["ent"].ne("")]
+        if mvs:
+            w = w[w["ent"].isin(mvs)]
+        titulo = "Chegou no funil"
+        if len(mvs) == 1 and mvs[0] in _PPD_IN_META:
+            titulo += f" · {_PPD_IN_META[mvs[0]]['label']}"
+    else:
+        w = w[w["s_prev"].str.startswith("s")]
+        if de:
+            w = w[w["s_prev"].eq(de)]
+        if mvs:
+            w = w[w["mv"].isin(mvs)]
+        titulo = _ppd_lbl(de) if de else "Pipe aberto"
+        if len(mvs) == 1 and mvs[0] in _PPD_MV_META:
+            titulo += f" → {_PPD_MV_META[mvs[0]]['label']}"
+        elif mvs and set(mvs) != set(_PPD_MV_ORDER):
+            titulo += " → " + " / ".join(_PPD_MV_META[m]["label"] for m in mvs
+                                         if m in _PPD_MV_META)
+
+    _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
+    rows = []
+    for r in w.itertuples():
+        mv = (_PPD_IN_META[r.ent]["label"] if r.ent
+              else _PPD_MV_META.get(r.mv, {}).get("label", r.mv))
+        rows.append({
+            "deal_name": r.deal_name or "—",
+            "deal_url": _hs_deal_url(r.deal_id),
+            "ae": r.account_executive or "—",
+            "tipo": _tipo.get(r.deal_type, r.deal_type or "—"),
+            "movimento": mv,
+            "de_para": f"{_ppd_lbl(r.s_prev)} → {_ppd_lbl(r.s_curr)}",
+            "v_prev": float(r.v_prev), "v_curr": float(r.v_curr),
+            "delta": float(r.v_curr - r.v_prev),
+        })
+    # Quem saiu é medido pelo valor de ontem, quem chegou pelo de hoje — a mesma
+    # régua da barra, pra o total do drill bater com o pedaço clicado.
+    _med = "v_curr" if de == "in" else "v_prev"
+    rows.sort(key=lambda x: x[_med], reverse=True)
+    _tot = sum(x[_med] for x in rows)
+    return jsonify({
+        "title": f"{titulo} · {L['mov']}",
+        "subtitle": (f"{_fmt_date_short(prev['dia'])} → {_fmt_date_short(curr['dia'])} · "
+                     + _drill_money_subtitle(len(rows), _tot)),
+        "columns": [
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "ae", "label": "AE"},
+            {"key": "movimento", "label": "Movimento"},
+            {"key": "de_para", "label": L["col_estagio"]},
+            {"key": "v_prev", "label": L["col_ant"], "type": "money"},
+            {"key": "v_curr", "label": L["col_atu"], "type": "money"},
+        ],
+        "rows": rows,
+    })
+
+
 @app.route("/forecast")
 def forecast():
     return _forecast_page("ae")
@@ -6867,10 +13418,29 @@ def leaders_forecast():
     return _forecast_page("leader")
 
 
+def _forecast_hold_by_ae(f, from_d, to_d, force=False):
+    """(aep recortado, on-hold MRR por AE) do período — `total_mrr_on_hold_brl`
+    da curated, com gestores. Compartilhado pela aba Forecast e pelo Modelo
+    Analytics, pra o card On-hold ser o MESMO número nas duas."""
+    aep = _get_ae_perf_with_managers(force=force)
+    aep = aep[(aep["quarter_end"] >= from_d) & (aep["quarter"] <= to_d)]
+    aep = aep[~aep["account_executive"].isin(DEPARTED_AES)]
+    aep = aep[aep["leader"].isin(ALLOWED_LEADERS)]
+    if f["region"]:
+        aep = aep[aep["region"] == f["region"]]
+    if f["leader"]:
+        aep = aep[aep["leader"].isin(expand_leader(f["leader"]))]
+    if f["ae"]:
+        aep = aep[aep["account_executive"] == f["ae"]]
+    hold = (aep.groupby("account_executive")["total_mrr_on_hold_brl"].sum()
+            if len(aep) else pd.Series(dtype=float))
+    return aep, hold
+
+
 def _forecast_page(grain="ae"):
     """Forecast ponderado: deals com close date no quarter, nos estágios 1-6
-    (Scheduled→Procurement), ponderados pela % da forecast category do HubSpot
-    (Funnel 25 · Probable 50 · Best Case 75 · Commit 100 · Not forecasted 0).
+    (Scheduled→Procurement), ponderados pela % da forecast category do HubSpot,
+    que na tela é nomeada pelo próprio peso (100% · 75% · 50% · 25% · 0%).
     Mesma parametrização de líder/região/AE de Demanda e Pipeline.
     grain='leader' → a tabela/gráfico por AE vira por líder (soma do time)."""
     ctx = base_context()
@@ -6896,6 +13466,20 @@ def _forecast_page(grain="ae"):
         dd = dd[dd["leader"].isin(expand_leader(f["leader"]))]
     if f["ae"]:
         dd = dd[dd["account_executive"] == f["ae"]]
+    # Deal Type — mesma chave curta da URL (dtype=acq/exp) e o mesmo helper do
+    # Pipeline Total e do WoW, pra o corte significar a mesma coisa em toda aba.
+    # Recorta o frame ANTES do split won/pipe, então realizado e ponderado falam
+    # do mesmo universo e a Projeção continua fechando.
+    dtype_sel = (f.get("dtype") or "").strip()
+    dd = _pt_apply_dim_filter(dd, "dtype", dtype_sel)
+    # Duas coisas desta tela NÃO se dividem por deal type, e a tela prefere
+    # apagá-las a mostrar um número que não responde à pergunta:
+    #   · On-hold vem de `ae_performance` — é MRR agregado POR AE, sem deal do
+    #     lado, então não há como saber quanto do hold é aquisição;
+    #   · Comp. Target é meta de receita CHEIA do líder, não tem versão "só
+    #     aquisição" — dividir a projeção de um tipo por ela daria um
+    #     atingimento sistematicamente baixo e falso.
+    hold_ok = meta_ok = not dtype_sel
 
     lo, hi = pd.Timestamp(from_d), pd.Timestamp(to_d)
     # Pipeline aberto (estágios 1-6): recorte pelo CLOSE DATE (quando esperam fechar).
@@ -6904,28 +13488,24 @@ def _forecast_page(grain="ae"):
     # Realizado (PO Won): quarter definido pela DATA DE VALIDAÇÃO (po_emission,
     # fallback close date) — priorizada sobre o close date do HubSpot. É isso que
     # joga os deals fechados em 1-3/abr (validados em março) pro Q1, não pro Q2.
-    won = dd[dd["is_won"] & dd["valid_date"].notna()
-             & (dd["valid_date"] >= lo) & (dd["valid_date"] <= hi)]
+    # Mais a extensão de fechamento (`rev_date`): validado em 01–02/10/2026 é
+    # realizado do Q3. `realized_deals` sai deste mesmo frame de propósito — é a
+    # legenda do card ("N PO Won"), a composição do próprio R$ do Realizado.
+    won = dd[dd["is_won"] & dd["rev_date"].notna()
+             & (dd["rev_date"] >= lo) & (dd["rev_date"] <= hi)]
 
+    # `label` = o parâmetro cru do HubSpot; `pct` = o peso EFETIVO, o que de fato
+    # multiplica o amount (mesma convenção do `_pt_dim_meta`).
     cats = [{"key": _fc_key(c), "raw": c, "label": FORECAST_CATEGORY_LABEL[c],
-             "pct": FORECAST_CATEGORY_PCT[c], "color": FORECAST_CATEGORY_COLOR[c],
+             "pct": FORECAST_CATEGORY_PCT_EFF[c], "color": FORECAST_CATEGORY_COLOR[c],
              "ink": FORECAST_CATEGORY_INK[c]}
             for c in FORECAST_CATEGORY_ORDER]
 
     # ----- on-hold (MRR) por AE — total_mrr_on_hold_brl da curated (escolha do
     # usuário pro hold). Inclui gestores. Unidade = MRR → mostrado à parte. -----
-    aep = _get_ae_perf_with_managers(force=force)
-    aep = aep[(aep["quarter_end"] >= from_d) & (aep["quarter"] <= to_d)]
-    aep = aep[~aep["account_executive"].isin(DEPARTED_AES)]
-    aep = aep[aep["leader"].isin(ALLOWED_LEADERS)]
-    if f["region"]:
-        aep = aep[aep["region"] == f["region"]]
-    if f["leader"]:
-        aep = aep[aep["leader"].isin(expand_leader(f["leader"]))]
-    if f["ae"]:
-        aep = aep[aep["account_executive"] == f["ae"]]
-    hold_by_ae = (aep.groupby("account_executive")["total_mrr_on_hold_brl"].sum()
-                  if len(aep) else pd.Series(dtype=float))
+    aep, hold_by_ae = _forecast_hold_by_ae(f, from_d, to_d, force=force)
+    if not hold_ok:
+        hold_by_ae = pd.Series(dtype=float)
 
     # ----- agrega por AE: pipeline ponderado + realizado (amount) + hold (MRR) -----
     rows = {}
@@ -6933,7 +13513,7 @@ def _forecast_page(grain="ae"):
         r = rows.get(ae_name)
         if r is None:
             r = {"account_executive": ae_name, "leader": leader, "region": region,
-                 "is_manager": ae_name in NON_AE_USERS,
+                 "is_manager": ae_name in _managers_in(_roster_window(from_d, to_d)),
                  "gross": 0.0, "weighted": 0.0, "deals": 0,
                  "realized": 0.0, "realized_deals": 0, "hold": 0.0,
                  **{"w_" + c["key"]: 0.0 for c in cats}}
@@ -6982,12 +13562,23 @@ def _forecast_page(grain="ae"):
     for r in by_ae:
         r["projection"] = r["realized"] + r["weighted"]   # realizado + ponderado (ambos amount)
         r["pct_of_gross"] = (r["weighted"] / r["gross"]) if r["gross"] else 0.0
+
+    # Meta do líder (Comp. Target) — MESMO número do Modelo Analytics, pra que as
+    # duas telas de forecast comparem a projeção contra o mesmo alvo. Só existe no
+    # grain de líder: no grain de AE a meta é a quota individual, que esta tela
+    # (composição por forecast category) não usa.
+    _fc_targets = _leader_targets(_roster_window(from_d, to_d))
+    if grain == "leader" and meta_ok:
+        _apply_leader_meta(by_ae, targets=_fc_targets)
     by_ae.sort(key=lambda r: r["projection"], reverse=True)
 
     # Gráfico = Realizado (Won) + forecast ponderado por AE/líder (ambos deal amount).
     # Gestores ficam fora das barras; inclui quem tem realizado mesmo sem pipeline.
     chart_rows = [r for r in by_ae if not r["is_manager"] and (r["weighted"] > 0 or r["realized"] > 0)]
     max_projection = max((r["projection"] for r in chart_rows), default=0.0)
+    # Escala do gráfico inclui a meta: sem isso a tracejada da meta de quem está
+    # abaixo do alvo (meta > projeção do topo) sairia fora da área plotada.
+    chart_max = max([max_projection] + [float(r.get("quota") or 0.0) for r in chart_rows])
 
     # ----- composição por forecast category (só pipeline aberto) -----
     by_cat = []
@@ -7018,13 +13609,27 @@ def _forecast_page(grain="ae"):
     }
     totals["projection"] = totals["realized"] + totals["weighted"]
     totals["blended"] = (totals["weighted"] / totals["gross"]) if totals["gross"] else 0.0
+    # Meta do time = soma dos Comp. Targets dos líderes de TOPO no recorte
+    # (_leader_meta_total tira o gerente que já está dentro do diretor). Igual ao
+    # rodapé do Modelo Analytics.
+    if grain == "leader" and meta_ok:
+        totals["quota"] = _leader_meta_total([r["leader"] for r in by_ae], targets=_fc_targets)
+        totals["attainment"] = ((totals["projection"] / totals["quota"])
+                                if totals["quota"] else None)
+        totals["gap"] = (totals["quota"] - totals["projection"]) if totals["quota"] else None
+    else:
+        totals["quota"] = 0.0
+        totals["attainment"] = None
+        totals["gap"] = None
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
     return render_template(
         "forecast.html", ctx=ctx, cats=cats,
         by_ae=by_ae, chart_rows=chart_rows, by_cat=by_cat, totals=totals,
         not_forecasted=not_forecasted, max_projection=max_projection,
-        range_label=range_label, grain=grain)
+        chart_max=chart_max, range_label=range_label, grain=grain,
+        dtype_sel=dtype_sel, dtype_label=_pt_dim_label("dtype", dtype_sel),
+        hold_ok=hold_ok, meta_ok=meta_ok)
 
 
 @app.route("/forecast/model")
@@ -7063,8 +13668,9 @@ def _forecast_model_page(grain="ae"):
         dd = dd[dd["account_executive"] == f["ae"]]
 
     # Done = PO Won no período (data de validação).
-    won = dd[dd["is_won"] & dd["valid_date"].notna()
-             & (dd["valid_date"] >= lo) & (dd["valid_date"] <= hi)]
+    # Done = receita realizada: data de validação com a extensão de fechamento.
+    won = dd[dd["is_won"] & dd["rev_date"].notna()
+             & (dd["rev_date"] >= lo) & (dd["rev_date"] <= hi)]
     done_by_ae = won.groupby("account_executive")["amount"].sum()
 
     # Forecast por conversão = deals ABERTOS nos 3 estágios modelados, com close
@@ -7074,19 +13680,21 @@ def _forecast_model_page(grain="ae"):
                & (dd["close_date"] >= lo) & (dd["close_date"] <= hi)].copy()
     if len(openm):
         openm["prob"] = openm.apply(
-            lambda r: _model_prob(r["leader"], r["dealstage"], r["deal_type"]), axis=1)
+            lambda r: _model_prob(r["leader"], r["dealstage"], r["deal_type"],
+                                  r.get("account_executive")), axis=1)
         openm["weighted_model"] = openm["amount"] * openm["prob"]
         fc_by_ae = openm.groupby("account_executive")["weighted_model"].sum()
     else:
         fc_by_ae = pd.Series(dtype=float)
 
-    # Quota por AE — MESMA fonte do overview/pipeline (Q3_ROSTER no Q3, senão curated).
-    period_is_q3 = (from_d >= Q3_START and to_d <= Q3_END)
+    # Quota por AE — MESMA fonte do overview/pipeline (roster do trimestre, senão curated).
+    rq = _roster_window(from_d, to_d)
+    period_is_q3 = rq is not None
     if period_is_q3:
         scope = expand_leader(f["leader"]) if f["leader"] else None
         quota_by_ae = {}
-        for name, v in Q3_ROSTER.items():
-            if f["region"] and Q3_ROSTER_REGION != f["region"]:
+        for name, v in _roster_of(rq).items():
+            if f["region"] and (_roster_region() != f["region"]):
                 continue
             if scope is not None and v["leader"] not in scope:
                 continue
@@ -7110,7 +13718,7 @@ def _forecast_model_page(grain="ae"):
         meta[r["account_executive"]] = {"leader": r["leader"], "region": r["region"]}
     if period_is_q3:
         for name in quota_by_ae:
-            meta.setdefault(name, {"leader": Q3_ROSTER[name]["leader"], "region": Q3_ROSTER_REGION})
+            meta.setdefault(name, {"leader": _roster_of(rq)[name]["leader"], "region": _roster_region()})
 
     ae_names = sorted(set(done_by_ae.index) | set(fc_by_ae.index)
                       | {a for a, q in quota_by_ae.items() if q > 0})
@@ -7120,7 +13728,7 @@ def _forecast_model_page(grain="ae"):
         m = meta.get(a, {}); lead = m.get("leader")
         by_ae.append({
             "account_executive": a, "leader": lead, "region": m.get("region"),
-            "is_manager": a in NON_AE_USERS,
+            "is_manager": a in _managers_in(rq),
             "segment": SEGMENT_LABEL.get(LEADER_SEGMENT.get(lead), "—"),
             "done": done, "forecast": fc, "projection": done + fc,
             "quota": float(quota_by_ae.get(a, 0.0) or 0.0),
@@ -7128,9 +13736,9 @@ def _forecast_model_page(grain="ae"):
 
     if grain == "leader":
         rows = _leader_rollup(by_ae, f["leader"], ["done", "forecast", "projection", "quota"])
-        # Meta do líder = Board Target (planilha), não a soma das quotas do time.
-        for r in rows:
-            r["quota"] = LEADER_BOARD_TARGET.get(r["leader"], r["quota"])
+        # Meta do líder = Comp. Target da planilha, não a soma das quotas do time.
+        # Mesmo helper do forecast ponderado — os dois modelos leem o mesmo alvo.
+        _apply_leader_meta(rows, targets=_leader_targets(rq))
         mpath, dkey, unit = "/leaders/forecast/model", "leader", "líder"
     else:
         rows = [r for r in by_ae if not r["is_manager"]]
@@ -7159,10 +13767,34 @@ def _forecast_model_page(grain="ae"):
         "done": sum(r["done"] for r in by_ae),
         "forecast": sum(r["forecast"] for r in by_ae),
         "projection": sum(r["projection"] for r in by_ae),
-        "quota": (_leader_meta_total([r["leader"] for r in rows]) if grain == "leader"
+        "quota": (_leader_meta_total([r["leader"] for r in rows], targets=_leader_targets(rq)) if grain == "leader"
                   else sum(r["quota"] for r in by_ae)),
     }
     totals["attainment"] = (totals["projection"] / totals["quota"]) if totals["quota"] else None
+    totals["gap"] = (totals["quota"] - totals["projection"]) if totals["quota"] else None
+
+    # ---- Cards — os mesmos 6 da aba Forecast, com o ponderado do MODELO. ----
+    # Pipeline bruto = TODO o aberto (estágios 1-6) com close date no período, a
+    # mesma base da aba Forecast: as duas telas mostram o mesmo bruto e só
+    # diferem no peso. Aqui só Negotiation/Decision/Procurement pesam (o resto
+    # vale 0 no modelo), então a parte que pesa vai no rodapé do card.
+    pipe_all = dd[(~dd["is_won"]) & dd["close_date"].notna()
+                  & (dd["close_date"] >= lo) & (dd["close_date"] <= hi)]
+    _aep, hold_by_ae = _forecast_hold_by_ae(f, from_d, to_d, force=force)
+    mgr = [r for r in by_ae if r["is_manager"]]
+    totals.update({
+        "realized_deals": int(len(won)),
+        "gross": float(pipe_all["amount"].sum()),
+        "deals": int(len(pipe_all)),
+        "gross_model": float(openm["amount"].sum()) if len(openm) else 0.0,
+        "deals_model": int(len(openm)),
+        "hold": float(hold_by_ae.sum()) if len(hold_by_ae) else 0.0,
+        "n_ae": sum(1 for r in by_ae if not r["is_manager"] and (r["forecast"] or r["done"])),
+        "mgr_done": float(sum(r["done"] for r in mgr)),
+        "mgr_forecast": float(sum(r["forecast"] for r in mgr)),
+        "mgr_count": sum(1 for r in mgr if r["forecast"] or r["done"]),
+    })
+    totals["blended"] = (totals["forecast"] / totals["gross"]) if totals["gross"] else 0.0
 
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
     return render_template("forecast_model.html", ctx=ctx, grain=grain, unit=unit,
@@ -7170,6 +13802,69 @@ def _forecast_model_page(grain="ae"):
                            prob=FORECAST_MODEL_PROB, seg_label=SEGMENT_LABEL,
                            stage_order=MODEL_STAGE_ORDER, stage_label=MODEL_STAGE_LABEL,
                            safety=MODEL_SAFETY_FACTOR)
+
+
+@app.route("/forecast/model/deals")
+def forecast_model_deals():
+    """Drill da projeção do Modelo Analytics: Done (PO Won pela data de validação,
+    com a extensão de fechamento) + os deals abertos em Negotiation/Decision/
+    Procurement com close date no período, cada um com a probabilidade do modelo
+    e o ponderado. Mesmo recorte do `_forecast_model_page`, então a soma da
+    coluna Ponderado é a Projeção do card."""
+    name = (request.args.get("name") or "").strip()
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
+        return jsonify(_empty_drill(name))
+    lo, hi = _forecast_window(request.args)
+    dd = _get_forecast_deals()
+    dd = dd[~dd["account_executive"].isin(DEPARTED_AES)]
+    dd = dd[dd["leader"].isin(ALLOWED_LEADERS)]
+    dd = _entity_filter(dd, name, grain, request.args.get("leader"), request.args.get("region"))
+
+    won = dd[dd["is_won"] & dd["rev_date"].notna()
+             & (dd["rev_date"] >= lo) & (dd["rev_date"] <= hi)]
+    openm = dd[(~dd["is_won"]) & dd["dealstage"].isin(MODEL_STAGE.keys())
+               & dd["close_date"].notna()
+               & (dd["close_date"] >= lo) & (dd["close_date"] <= hi)]
+    _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
+    rows = []
+    for _, r in won.iterrows():
+        amt = float(r["amount"] or 0)
+        _tag = _rev_tag(r["valid_date"])
+        rows.append({"deal_name": r.get("deal_name") or "—", "deal_url": _hs_deal_url(r.get("deal_id")),
+                     "ae": r["account_executive"],
+                     "deal_type": _tipo.get(r.get("deal_type"), r.get("deal_type") or "—"),
+                     "categoria": f"Done (realizado · {_tag})" if _tag else "Done (realizado)",
+                     "prob": 1.0, "amount": amt, "ponderado": amt,
+                     "data": r["valid_date"].date().isoformat() if pd.notna(r["valid_date"]) else ""})
+    for _, r in openm.iterrows():
+        p = _model_prob(r["leader"], r["dealstage"], r["deal_type"], r.get("account_executive"))
+        amt = float(r["amount"] or 0)
+        rows.append({"deal_name": r.get("deal_name") or "—", "deal_url": _hs_deal_url(r.get("deal_id")),
+                     "ae": r["account_executive"],
+                     "deal_type": _tipo.get(r.get("deal_type"), r.get("deal_type") or "—"),
+                     "categoria": stage_display(r["dealstage"]),
+                     "prob": p, "amount": amt, "ponderado": amt * p,
+                     "data": r["close_date"].date().isoformat() if pd.notna(r["close_date"]) else ""})
+    for x in rows:
+        x["prob_txt"] = f"{round(x['prob'] * 100)}%"
+    rows.sort(key=lambda x: x["ponderado"], reverse=True)
+    proj = float(sum(x["ponderado"] for x in rows))
+    return jsonify({
+        "title": (name or "Modelo Analytics — total") + " · Projeção",
+        "subtitle": (f"{len(won)} done + {len(openm)} em Negotiation/Decision/Procurement · "
+                     f"projeção {fmt_money(proj)}"),
+        "columns": _with_ae_col([
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "deal_type", "label": "Tipo"},
+            {"key": "categoria", "label": "Done / estágio"},
+            {"key": "prob_txt",  "label": "Prob.", "align": "right", "sortKey": "prob"},
+            {"key": "amount",    "label": "Valor bruto", "type": "money"},
+            {"key": "ponderado", "label": "Ponderado",   "type": "money"},
+            {"key": "data",      "label": "Data",        "type": "date"},
+        ], "leader" if (grain == "leader" or not name) else "ae"),
+        "rows": rows,
+    })
 
 
 _GZIP_STATIC_CACHE = {}
@@ -7292,6 +13987,12 @@ def _warm_all(force: bool = False):
     _try(_get_demand_deals, force=force)
     _try(_get_pipeline_deals, force=force)
     _try(_get_forecast_deals, force=force)
+    # Aba Legal: só o lado BARATO (7 MB varridos). `legal_mail_touch_raw` fica
+    # FORA de propósito — são ~25 GB por execução, e este refresher roda de 45
+    # em 45 min com force=True: aquecê-la aqui custaria ~800 GB/dia pra um sinal
+    # que não muda de hora em hora. Ela popula sozinha no 1º acesso à aba, com
+    # TTL de 6h (ver LEGAL_MAIL_TTL).
+    _try(bq.legal_deals_raw, force_refresh=force)
     # /confirm é live BQ (cache 5min) — aquece o range default da rota
     _try(bq.confirm_totals,
          _quarter_start_of(date(2025, 4, 1)).isoformat(),
@@ -7352,20 +14053,979 @@ def access_link():
     return render_template("link.html", urls=u, ctx=base_context())
 
 
-def _refresh_loop(interval: int = 2700):
-    """Reaquece os caches principais a cada `interval`s (45min, < TTL de 1h),
-    ANTES de vencerem. Junto com o stale-while-revalidate do bq.query, garante que
-    nenhuma visita — nem a primeira do dia — pague o round-trip do BigQuery."""
+def _snapshot_forecast_week():
+    """Grava o snapshot semanal do forecast do último domingo, se ainda não
+    existir. Best-effort: NUNCA pode derrubar o app nem o reaquecimento — se o
+    BigQuery recusar (permissão, cota), o dashboard segue funcionando e só a
+    série ponderada futura deixa de ganhar mais um ponto.
+
+    DEIXOU DE SER A FONTE DA TELA em 31/08/2026: descobrimos que o próprio BI
+    já guarda uma cópia DIÁRIA da curated em `materialized_data_source`, com
+    forecast category e close date as-of desde 23/03/2026 (ver
+    `bq.forecast_asof_series`) — o Histórico do Forecast lê de lá. Esta tabela
+    continua sendo gravada por dois motivos: ela é a validação independente da
+    outra fonte (nos domingos 23/08 e 30/08/2026 o ponderado bate na 3ª casa) e
+    é a garantia de que a série sobrevive se o BI parar de materializar, como já
+    aconteceu com `close_date_history_df`. Custo: um INSERT por semana.
+
+    A validação bate exato nos domingos capturados NO DIA (23/08 e 30/08/2026:
+    R$ 2.374.652,04 e R$ 2.301.495,12 nas duas fontes). No de 16/08 há 2,1% de
+    diferença — e a culpada é esta tabela, não a do BI: a captura dela só rodou
+    em 18/08, dois dias depois, quando 17 deals já tinham mudado."""
+    try:
+        last_sun, _ = _last_two_sundays()
+        n = bq.forecast_snapshot_write(last_sun.isoformat(), _fc_open_stage_ids())
+        if n:
+            print(f"pepeuhacker · snapshot do forecast {last_sun}: {n} linhas",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001 — best-effort, ver docstring
+        print(f"pepeuhacker · snapshot do forecast falhou ({e})", flush=True)
+
+
+def _snapshot_forecast_midnight() -> None:
+    """Grava a foto das 00h BRT de HOJE, se ainda não existe e se ainda dá tempo
+    de ela ser "a meia-noite" (ver `_FCD_CAPTURA_MAX_ATRASO`). Best-effort, como
+    o semanal: falha aqui só fura um dia do DoD, que cai na aproximação do BI."""
+    agora = datetime.now(BRT)
+    virada = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+    if agora - virada > _FCD_CAPTURA_MAX_ATRASO:
+        return
+    # Os dois funis, no MESMO instante (pedido do Pedro, 12/10/2026: "pode ser no
+    # mesmo horário"). Um por vez e cada um no seu try: o México falhar não pode
+    # custar a foto do Brasil, que é a série mais antiga.
+    for pl in (bq.SALES_BR, _MX_PIPELINE):
+        try:
+            n = bq.forecast_daily_write(virada.date().isoformat(), _fc_open_stage_ids(),
+                                        won_stage_id=_HS_WON_STAGE,
+                                        lost_stage_id=_HS_LOST_STAGE, pipeline=pl)
+            if n:
+                bq.forecast_daily_snapshots(pipeline=pl, force_refresh=True)
+                print(f"pepeuhacker · foto da meia-noite {pl} {virada:%d/%m}: {n} "
+                      f"linhas ({agora:%H:%M:%S} BRT)", flush=True)
+        except Exception as e:  # noqa: BLE001 — best-effort, ver docstring
+            print(f"pepeuhacker · foto da meia-noite {pl} falhou ({e})", flush=True)
+
+
+def _midnight_loop() -> None:
+    """Dorme até a próxima 00:00 BRT e tira a foto. Laço próprio, e não o
+    `_refresh_loop`: aquele gira de 15 em 15 min e pula volta quando o
+    reaquecimento demora, então a foto sairia em qualquer ponto até 00h15+ — e o
+    DoD promete meia-noite. A 1ª chamada, no boot, cobre um deploy que caia
+    entre 00h e 02h."""
+    _snapshot_forecast_midnight()
     while True:
+        agora = datetime.now(BRT)
+        prox = (agora + timedelta(days=1)).replace(hour=0, minute=0, second=5,
+                                                     microsecond=0)
+        time.sleep(max(1.0, (prox - agora).total_seconds()))
+        _snapshot_forecast_midnight()
+
+
+# Estado do frescor, preenchido pelo `_refresh_loop` e lido pelo selo das telas.
+# (epoch da última gravação NA FONTE, epoch do último reaquecimento daqui)
+_FRESH_LOCK = threading.Lock()
+_FRESH = {"source_epoch": 0.0, "warmed_epoch": 0.0,
+          # da sonda de dev (ver _fresh_probe_async)
+          "probed_epoch": 0.0, "probing": False}
+
+
+def _fresh_probe_async():
+    """Lê o frescor da fonte FORA do request. Em produção quem mantém o valor em
+    dia é o `_refresh_loop`; isto cobre o caso em que ele não está rodando —
+    `flask run` do dev, que nem chega no bloco `__main__`. Dedup por flag: uma
+    sondagem por vez, e nenhum request espera por ela."""
+    with _FRESH_LOCK:
+        if _FRESH["probing"] or time.time() - _FRESH["probed_epoch"] < 900:
+            return
+        _FRESH["probing"] = True
+
+    def _run():
+        try:
+            src = bq.hs_data_last_modified()
+            with _FRESH_LOCK:
+                if src:
+                    _FRESH["source_epoch"] = src
+                _FRESH["probed_epoch"] = time.time()
+        except Exception as e:  # noqa: BLE001 — selo nunca derruba tela
+            print(f"pepeuhacker · sonda de frescor falhou ({e})", flush=True)
+        finally:
+            with _FRESH_LOCK:
+                _FRESH["probing"] = False
+
+    threading.Thread(target=_run, name="fresh-probe", daemon=True).start()
+
+
+def source_freshness() -> dict:
+    """O que o selo das telas mostra: idade do DADO, não idade do cache.
+
+    A diferença importa. O cache pode ter 1 minuto de vida e conter um funil de
+    3 dias atrás — foi exatamente o que aconteceu entre 11 e 14/09/2026, quando
+    a tabela legada do HubSpot parou de receber sync e o dashboard seguiu
+    mostrando número velho com cara de número novo. Quem olha a tela em fim de
+    trimestre precisa saber de QUANDO é o dado."""
+    _fresh_probe_async()
+    with _FRESH_LOCK:
+        src, warm = _FRESH["source_epoch"], _FRESH["warmed_epoch"]
+    if not src:
+        return {"ok": False}
+    age_min = int((time.time() - src) / 60)
+    return {
+        "ok": True,
+        # Em BRT: o selo é lido por gente em São Paulo, e num container UTC
+        # ele mostrava hora à frente do relógio de quem olhava.
+        "source_dt": datetime.fromtimestamp(src, BRT),
+        "source_age_min": age_min,
+        "warmed_dt": datetime.fromtimestamp(warm, BRT) if warm else None,
+        # A ingestão do HubSpot roda de ~2 em 2h, com pausa de madrugada. O
+        # limiar é 4h — dois ciclos — pra um atraso isolado não acender o alerta
+        # à toa: alarme que toca todo dia é alarme que ninguém olha. De
+        # madrugada e no fim de semana ele acende mesmo, e está certo: o dado é
+        # velho de verdade, e quem abre a tela às 8h precisa saber disso.
+        "stale": age_min > 240,
+    }
+
+
+def _refresh_loop(interval: int = 900):
+    """Reaquece os caches principais a cada `interval`s — 15 min desde
+    14/09/2026 (antes: 45), pedido do Pedro pra operar o fim de trimestre.
+
+    O laço é DISPARADO POR MUDANÇA, não por relógio: a cada volta pergunta ao
+    BigQuery quando a tabela de deals do HubSpot foi gravada pela última vez
+    (`bq.hs_source_last_modified`, metadado, 0 byte varrido) e só re-consulta as
+    queries caras se a fonte de fato mudou. Por que assim: a ingestão do HubSpot
+    roda de ~2 em 2 horas, então um ciclo cego de 15 min pagaria 8 rodadas de
+    BigQuery pra reescrever parquet idêntico. Com o gate, o dado novo chega à
+    tela em no máximo 15 min e o custo fica no mesmo patamar do ciclo de 45.
+
+    Junto com o stale-while-revalidate do bq.query, nenhuma visita — nem a
+    primeira do dia — paga o round-trip do BigQuery.
+
+    Também é aqui que o snapshot semanal do forecast é tentado: o laço já roda
+    sempre, então não precisa de um 2º agendador só pra isso, e a gravação é
+    idempotente por domingo."""
+    _snapshot_forecast_week()          # 1ª tentativa já no boot
+    last_src = 0.0
+    while True:
+        try:
+            # Duas perguntas diferentes, de propósito (ver as docstrings das duas
+            # em bq.py): o GATE pergunta se alguma fonte foi gravada — metadado,
+            # 0 byte, pode ser generoso e reaquecer à toa; o SELO pergunta de
+            # quando é o dado que está lá dentro, que é o que a tela promete.
+            src = bq.hs_source_last_modified()
+            mudou = src > last_src
+            if mudou:
+                _warm_all(force=True)
+                last_src = src
+            dado = bq.hs_data_last_modified()
+            with _FRESH_LOCK:
+                # Fonte parada também registra: se o selo sumisse, sumiria
+                # justamente quando o dado está envelhecendo e alguém precisa ver.
+                _FRESH["source_epoch"] = dado or _FRESH["source_epoch"]
+                if mudou:
+                    _FRESH["warmed_epoch"] = time.time()
+            if mudou:
+                print(f"pepeuhacker · fonte nova (dado de "
+                      f"{datetime.fromtimestamp(dado, BRT):%d/%m %H:%M} BRT)"
+                      " — caches reaquecidos (bg)", flush=True)
+            _snapshot_forecast_week()
+        except Exception as e:  # noqa: BLE001 — o refresher NUNCA pode morrer
+            print(f"pepeuhacker · refresher falhou ({e}); segue no próximo ciclo",
+                  flush=True)
         time.sleep(interval)
-        _warm_all(force=True)
-        print("pepeuhacker · caches reaquecidos (bg)", flush=True)
+
+
+# ============================================================
+# Sales MX — dashboard do time do México
+# ============================================================
+# Espelha o Sales AE BR, com três diferenças que NÃO são cosméticas:
+#
+#   1) o funil é `Sales MX` (query própria em bq.mx_deals_raw);
+#   2) TUDO é ARR em dólar. O BR alterna MRR R$ / ARR US$ num toggle; aqui não
+#      há toggle, porque o time é medido em dólar e um deal em peso não tem
+#      leitura em real. A conversão de moeda acontece na query (ver a nota longa
+#      em bq.mx_deals_raw), então o que chega aqui já é MRR USD e só falta ×12;
+#   3) o roster é chaveado pelo nome EXATO do BigQuery, com o nome de exibição à
+#      parte. Três dos sete chegaram com grafia diferente da que o time usa no
+#      Slack — "Santiago Oriol" é "Santiago de Oriol" na base, "Viri Garza" é
+#      "Viridiana Garza" e "Adrián Hernández" está sem acento nenhum. Casar pelo
+#      nome bonito daria zero calado, que foi exatamente o caso do Diego Loures.
+MX_LEADER = "Mauricio Del Hierro"
+
+# Estágios do funil MX. São OUTROS ids: o México é um pipeline separado no
+# HubSpot e não compartilha nenhum id com o BR (lá é 'closedwon'/'appointment...',
+# aqui é numérico). Ordem = ordem do funil, com No Show entre Scheduled e
+# Qualifying, igual ao BR.
+MX_STAGES = [
+    ("8352441",  "Scheduled"),
+    ("61414206", "No Show"),
+    ("8352512",  "Qualifying"),
+    ("94159788", "Scoping"),
+    ("8352513",  "Negotiation"),
+    ("89673855", "Decision"),
+    ("66011247", "Procurement"),
+]
+MX_STAGE_LABEL = dict(MX_STAGES)
+MX_STAGE_ORDER = {sid: i for i, (sid, _) in enumerate(MX_STAGES)}
+MX_WON_STAGE, MX_LOST_STAGE = "13023548", "8352516"
+
+# nome no BigQuery -> {display: como o time chama, tier: segmento}
+MX_ROSTER = {
+    "Santiago de Oriol": {"display": "Santiago Oriol",   "tier": "Enterprise"},
+    "Sabina Diaz":       {"display": "Sabina Diaz",      "tier": "Mid Market"},
+    "Viridiana Garza":   {"display": "Viri Garza",       "tier": "Account Executive"},
+    "Adrian Hernandez":  {"display": "Adrián Hernández", "tier": "Account Executive"},
+    "Adolfo Mora":       {"display": "Adolfo Mora",      "tier": "Enterprise"},
+    "Armando Roman":     {"display": "Armando Roman",    "tier": "Mid Market"},
+    "Luis Terrazas":     {"display": "Luis Terrazas",    "tier": "Mid Market"},
+}
+MX_DISPLAY = {k: v["display"] for k, v in MX_ROSTER.items()}
+# Único gestor do país: os 7 respondem a ele, e ele ao VP (ver ORG_CHART).
+MX_LEADER_BY_AE = {ae: MX_LEADER for ae in MX_ROSTER}
+# O gestor do México fecha deal próprio (US$ 540 mil desde 2025), mas NÃO é
+# vendedor: sem isto ele ganhava barra no ranking, card no Funil e linha na
+# matriz do PoP, competindo com o time que ele lidera. Mesma regra que
+# NON_AE_USERS já aplica aos diretores brasileiros.
+NON_AE_USERS_MX = {MX_LEADER}
+
+_MX_ROSTER_CACHE: dict = {}
+
+
+# Meta do México por trimestre, em ARR USD, por vendedor. Fonte: o painel de
+# Coverage do Mauricio (coluna cinza, print do Pedro em 12/10/2026 — "meta do
+# México é a coluna em cinza"). Substitui a tabela do BI a partir do Q4/26: lá
+# só 2 dos 7 vendedores tinham meta, e os outros 5 apareciam com zero.
+# Trimestre novo sem entrada aqui segue o último declarado (mesma regra do
+# roster do Brasil); trimestre ANTERIOR ao primeiro declarado segue a tabela do
+# BI, porque o pedido foi "Q4 pra frente".
+MX_QUOTAS_ARR_USD = {
+    date(2026, 10, 1): {
+        "Armando Roman":     106_300,
+        "Adolfo Mora":       300_000,
+        "Sabina Diaz":        88_500,
+        "Viridiana Garza":   177_100,
+        "Adrian Hernandez":  212_500,
+        "Luis Terrazas":     212_500,
+        "Santiago de Oriol": 300_000,
+    },
+}
+
+
+def _mx_quota_declarada(q) -> dict | None:
+    """{AE: quota MRR USD} do trimestre `q` pelo registro acima, ou None se `q`
+    é anterior ao primeiro trimestre declarado. ARR ÷ 12 porque o roster guarda
+    meta na unidade dos `amount` do México (MRR USD)."""
+    if q is None:
+        return None
+    validos = [k for k in MX_QUOTAS_ARR_USD if k <= q]
+    if not validos:
+        return None
+    return {ae: v / MONTHS_PER_YEAR for ae, v in MX_QUOTAS_ARR_USD[max(validos)].items()}
+
+
+def _mx_roster(q) -> dict:
+    """Roster do México no trimestre `q`, no formato dos rosters do Brasil.
+
+    Existe pra o México ter o MESMO universo de vendedores que o BR tem: sem uma
+    lista, o ranking só mostrava quem teve deal na janela (5 de 7 no Q3), e quem
+    não vendeu sumia — que é justamente a informação que um ranking de meta
+    precisa dar. Com a lista, os 7 aparecem, e quem está sem meta cadastrada
+    aparece com quota 0 em vez de sumir.
+
+    Quota em MRR USD — a mesma unidade dos `amount` do México, que a query
+    converte na volta. Do Q4/26 em diante vem de `MX_QUOTAS_ARR_USD` (o painel do
+    Mauricio); antes, da tabela do BI (`sales_rep_monthly_quota`, região MX),
+    onde só 2 dos 7 tinham meta.
+
+    O quarter é o pedido (o da janela, via `_roster_of`), não o de hoje: a
+    partir de 01/10/2026 o "quarter de hoje" passou a trazer a quota do Q4 pra
+    medir o Q3. A lista de pessoas é a mesma em todo trimestre."""
+    if q in _MX_ROSTER_CACHE:
+        return _MX_ROSTER_CACHE[q]
+    quotas = _mx_quota_declarada(q)
+    if quotas is None:      # antes do Q4/26: a tabela do BI, como sempre foi
+        quotas = {}
+        try:
+            qdf = bq.mx_quota()
+            if qdf is not None and len(qdf):
+                qdf = qdf[pd.to_datetime(qdf["quarter"]).dt.date == q]
+                for r in qdf.itertuples(index=False):
+                    ae = getattr(r, "account_executive", None)
+                    if ae:
+                        quotas[ae] = float(getattr(r, "quota_usd_mrr", 0) or 0)
+        except Exception:
+            pass
+    out = {ae: {"leader": MX_LEADER, "tier": meta["tier"],
+                "quota": quotas.get(ae, 0.0), "new_logos": 0}
+           for ae, meta in MX_ROSTER.items()}
+    _MX_ROSTER_CACHE[q] = out
+    return out
+
+
+def _mx_deals(force: bool = False) -> pd.DataFrame:
+    """Deals do Sales MX restritos ao roster atual, com `arr` em USD.
+
+    O funil MX tem 52 nomes historicamente; o roster são os 7 de hoje. Quem saiu
+    fica de fora — mesma política do BR, e sem isso o histórico de um vendedor
+    que não existe mais entraria no total do time."""
+    df = bq.mx_deals_raw(force_refresh=force).copy()
+    df = df[df["account_executive"].isin(MX_ROSTER)]
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["arr"] = df["amount"] * MONTHS_PER_YEAR      # MRR USD -> ARR USD
+    df["display"] = df["account_executive"].map(MX_DISPLAY)
+    for c in ("close_date", "po_emission_date", "created_date"):
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    # Data da RECEITA REALIZADA (validação com a extensão de fechamento): só as
+    # somas de realizado leem esta coluna; contagem e ticket seguem o calendário.
+    df["rev_date"] = _rev_date(df["po_emission_date"].fillna(df["close_date"]))
+    return df
+
+
+def _mx_quota_arr(quarter) -> dict:
+    """Quota do trimestre por AE, em ARR USD. Só quem tem linha na tabela do BI —
+    hoje 2 dos 7 (Adolfo e Santiago); os outros aparecem SEM meta, e a tela diz
+    isso em vez de fingir meta zero (que leria como 'bateu infinito%')."""
+    try:
+        q = bq.mx_quota()
+    except Exception:
+        return {}
+    if not len(q):
+        return {}
+    q = q[pd.to_datetime(q["quarter"]).dt.date == quarter]
+    out = {}
+    for r in q.itertuples(index=False):
+        ae = getattr(r, "account_executive", None)
+        if ae in MX_ROSTER:
+            out[ae] = float(getattr(r, "quota_usd_mrr", 0) or 0) * MONTHS_PER_YEAR
+    return {k: v for k, v in out.items() if v > 0}
+
+
+def _mx_realized_official(quarter) -> dict:
+    """Realizado do trimestre por AE em ARR USD, direto da curada
+    `account_executives_performance` (`new_arr_in_usd`) — o número OFICIAL do BI.
+
+    Existe separado da soma deal-a-deal porque os dois DISCORDAM, e muito: no
+    Q2/2026 o funil soma US$ 325.688 pro Adolfo contra US$ 222.455 da curada
+    (+46%), e US$ 72.310 contra US$ 34.624 pro Adrian (+109%). Os deals do funil
+    são todos legítimos (closed-won, em dólar, com PO no trimestre), então a
+    diferença é de REGRA e não de dado — provavelmente o mesmo tipo de exclusão
+    que o BR trata via on-hold, ou uma data de atribuição diferente. Enquanto
+    isso não for reconciliado com o time de BI, a tela mostra as duas e diz qual
+    é qual: sumir com uma delas seria escolher um número sem base pra escolher."""
+    try:
+        raw = bq.ae_performance()
+    except Exception:
+        return {}
+    if raw is None or not len(raw):
+        return {}
+    df = raw.copy()
+    df["quarter"] = pd.to_datetime(df["quarter"]).dt.date
+    df = df[(df["quarter"] == quarter) & df["account_executive"].isin(MX_ROSTER)]
+    if "new_arr_in_usd" not in df.columns:
+        return {}
+    return {r.account_executive: float(r.new_arr_in_usd or 0.0)
+            for r in df.itertuples(index=False)}
+
+
+def _mx_window(f):
+    """Janela da tela: o filtro de período, ou o trimestre corrente."""
+    today = _today()
+    lo = pd.to_datetime(f["date_from"]).date() if f.get("date_from") else _quarter_start_of(today)
+    hi = pd.to_datetime(f["date_to"]).date() if f.get("date_to") else _quarter_end_of(today)
+    return lo, hi
+
+
+@app.route("/mx/overview")
+def mx_overview():
+    """Sales MX · Overview — realizado × meta por vendedor e pipeline aberto,
+    tudo em ARR USD."""
+    ctx = base_context()
+    f = ctx["filters"]
+    force = request.args.get("refresh") == "1"
+    lo, hi = _mx_window(f)
+    lo_ts, hi_ts = pd.Timestamp(lo), pd.Timestamp(hi)
+
+    df = _mx_deals(force=force)
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+
+    # Realizado = deal ganho com PO emitida na janela; se não houver PO, cai no
+    # close date — no MX a PO não é preenchida em todo deal, e exigir PO como no
+    # BR esconderia ganho real.
+    # Janela pela data da RECEITA (validação com a extensão de fechamento). Os
+    # "N deals" e o ticket desta tela são a composição de "Ganhos no funil" (o
+    # card e a coluna ao lado, e o drill deles), então saem da mesma população.
+    won = df[df["is_won"]].copy()
+    won = won[won["rev_date"].notna() & (won["rev_date"] >= lo_ts) & (won["rev_date"] <= hi_ts)]
+    # Pipeline aberto = close date na janela; deal sem close date entra à parte,
+    # senão metade do funil sumiria sem aviso (mesmo problema do Pipeline Total).
+    op = df[df["is_open"]]
+    pipe = op[op["close_date"].notna() & (op["close_date"] >= lo_ts) & (op["close_date"] <= hi_ts)]
+    pipe_sem_data = op[op["close_date"].isna()]
+
+    q_ini = _quarter_start_of(lo)
+    quota = _mx_quota_arr(q_ini)
+    oficial = _mx_realized_official(q_ini)
+    # O ranking usa o número OFICIAL quando ele existe: é contra ele que a
+    # diretoria compara. O deal-a-deal vira coluna ao lado, com o drill.
+    rows = []
+    for ae, meta in MX_ROSTER.items():
+        w = won[won["account_executive"] == ae]
+        p = pipe[pipe["account_executive"] == ae]
+        funil = float(w["arr"].sum())
+        of = oficial.get(ae)
+        realized = of if of is not None else funil
+        qt = quota.get(ae)
+        rows.append({
+            "account_executive": ae, "display": meta["display"], "tier": meta["tier"],
+            "realized": realized, "funil": funil, "tem_oficial": of is not None,
+            "deals": int(len(w)),
+            "ticket": (funil / len(w)) if len(w) else 0.0,
+            "pipe": float(p["arr"].sum()), "pipe_deals": int(len(p)),
+            "quota": qt or 0.0, "has_quota": qt is not None,
+            "attainment": (realized / qt) if qt else None,
+        })
+    rows.sort(key=lambda r: (r["attainment"] is not None,
+                            r["attainment"] if r["attainment"] is not None else -1.0,
+                            r["realized"]), reverse=True)
+
+    _drill_base = {k: v for k, v in (("date_from", f["date_from"]),
+                                     ("date_to", f["date_to"])) if v}
+    rank = _build_rank_chart(
+        [{"name": r["account_executive"], "short": short_name(r["display"]),
+          "leader": MX_LEADER, "realized": r["realized"], "quota": r["quota"],
+          "attainment": r["attainment"]} for r in rows],
+        _drill_base, axis_mode="usd", drill_path="/mx/overview")
+
+    total_funil = float(won["arr"].sum())
+    total_real = float(sum(r["realized"] for r in rows))
+    total_quota = float(sum(v for v in quota.values()))
+    divergencia = total_real - total_funil
+    return render_template(
+        "mx_overview.html", ctx=ctx, rows=rows, rank=rank,
+        leader=MX_LEADER,
+        range_label=_format_period(f, ctx["presets"], ctx["active_preset"]),
+        total_real=total_real, total_funil=total_funil, divergencia=divergencia,
+        total_deals=int(len(won)),
+        total_ticket=(total_funil / len(won)) if len(won) else 0.0,
+        total_quota=total_quota,
+        total_att=(total_real / total_quota) if total_quota else None,
+        total_pipe=float(pipe["arr"].sum()), pipe_deals=int(len(pipe)),
+        pipe_sem_data=float(pipe_sem_data["arr"].sum()),
+        pipe_sem_data_deals=int(len(pipe_sem_data)),
+        sem_quota=[r["display"] for r in rows if not r["has_quota"]],
+    )
+
+
+# Dimensões de corte do pipeline MX. Mesmo papel do `_PT_DIMS` do BR (filtro E
+# empilhamento pelo mesmo registro), mas com os valores que o México realmente
+# usa — reaproveitar o registro do BR traria "Expansion" como source, que aqui
+# quase não existe, e deixaria de fora o que existe.
+MX_DIMS = {
+    "dtype": {"col": "deal_type", "label": "Deal Type", "values": [
+        ("acq", "Aquisition",      "Aquisição", "#2563EB", "#1D4ED8"),
+        ("exp", "Up & cross sell", "Expansão",  "#047857", "#065F46"),
+    ]},
+    "source": {"col": "deal_source_agg", "label": "Source", "values": [
+        ("inbound",   "Inbound",   "Inbound",   "#10B981", "#047857"),
+        ("outbound",  "Outbound",  "Outbound",  "#6366F1", "#4338CA"),
+        ("expansion", "Expansion", "Expansion", "#0891B2", "#0E7490"),
+    ]},
+    "fcat": {"col": "forecast_category", "label": "Forecast Category", "values": [
+        ("commit",   "COMMIT",    "100%",          "#047857", "#065F46"),
+        ("bestcase", "BEST_CASE", "75%",           "#10B981", "#047857"),
+        ("probable", "PROBABLE",  "50%",           "#2563EB", "#1D4ED8"),
+        ("funnel",   "PIPELINE",  "25%",           "#93C5FD", "#1E40AF"),
+        ("omit",     "OMIT",      "0%",            "#F59E0B", "#B45309"),
+        ("nocat",    None,        "Sem categoria", "#94A3B8", "#475569"),
+    ]},
+}
+
+
+def _mx_dim_meta(dim):
+    out = []
+    for k, raw, lbl, c, ink in MX_DIMS[dim]["values"]:
+        item = {"key": k, "raw": raw, "label": lbl, "color": c, "ink": ink}
+        if dim == "fcat":
+            # Peso efetivo (com DIR_FORECAST_FACTOR) — mesma convenção do BR.
+            item["pct"] = (FORECAST_CATEGORY_PCT_EFF.get(raw)
+                           if raw is not None else None)
+        out.append(item)
+    return out
+
+
+def _mx_dim_key(df, dim):
+    """Coluna crua -> chave curta, com o que não mapeia caindo no bucket vazio.
+    Garante soma dos segmentos == total da barra (mesma invariante do BR)."""
+    col = MX_DIMS[dim]["col"]
+    lookup = {raw: k for k, raw, *_ in MX_DIMS[dim]["values"] if raw is not None}
+    return df[col].map(lookup).fillna("nocat")
+
+
+def _mx_dim_filter(df, dim, sel):
+    if not sel:
+        return df
+    entry = next((v for v in MX_DIMS[dim]["values"] if v[0] == sel), None)
+    if entry is None:
+        return df
+    col, raw = MX_DIMS[dim]["col"], entry[1]
+    if raw is None:
+        return df[df[col].isna() | (df[col].astype(str).str.strip() == "")]
+    return df[df[col] == raw]
+
+
+def _mx_stage_rows(df, by=""):
+    """Uma linha por estágio do funil MX, na ordem do funil. Estágio sem pipe
+    continua na lista (barra vazia) — sumir daria a impressão de funil menor."""
+    if by:
+        df = df.copy()
+        df["_seg"] = _mx_dim_key(df, by)
+    segs = _mx_dim_meta(by) if by else []
+    rows = []
+    for sid, label in MX_STAGES:
+        g = df[df["dealstage"] == sid]
+        row = {"sid": sid, "label": label,
+               "arr": float(g["arr"].sum()), "deals": int(len(g))}
+        if by:
+            row["segs"] = {s["key"]: float(g.loc[g["_seg"] == s["key"], "arr"].sum())
+                           for s in segs}
+        rows.append(row)
+    if by:
+        live = set(df["_seg"].unique())
+        segs = [s for s in segs if s["key"] in live]
+    return rows, segs
+
+
+@app.route("/mx/pipeline")
+def mx_pipeline():
+    """Sales MX · Pipeline — ARR aberto por estágio do funil, cortável por deal
+    type, source e forecast category."""
+    ctx = base_context()
+    f = ctx["filters"]
+    df = _mx_deals(force=request.args.get("refresh") == "1")
+    df = df[df["is_open"]]
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+    for dim in MX_DIMS:
+        df = _mx_dim_filter(df, dim, f.get(dim, ""))
+
+    by = request.args.get("by", "")
+    if by not in MX_DIMS:
+        by = ""
+    rows, segs = _mx_stage_rows(df, by)
+    total = float(df["arr"].sum())
+    keep = {k: v for k, v in f.items() if v and k in ("ae", "dtype", "source", "fcat")}
+
+    seg_totals = []
+    if by and len(df):
+        key = _mx_dim_key(df, by)
+        for sdef in segs:
+            amt = float(df.loc[key == sdef["key"], "arr"].sum())
+            n = int((key == sdef["key"]).sum())
+            if n:
+                seg_totals.append({**sdef, "arr": amt, "deals": n,
+                                   "share": (amt / total) if total else 0.0})
+        seg_totals.sort(key=lambda r: r["arr"], reverse=True)
+
+    return render_template(
+        "mx_pipeline.html", ctx=ctx, rows=rows, segs=segs, by=by, keep=keep,
+        seg_totals=seg_totals, total=total, deals=int(len(df)),
+        max_arr=max([r["arr"] for r in rows], default=0.0),
+        dims=[{"key": k, "label": v["label"]} for k, v in MX_DIMS.items()],
+        leader=MX_LEADER,
+        sem_close=int(df["close_date"].isna().sum()),
+    )
+
+
+@app.route("/mx/forecast")
+def mx_forecast():
+    """Sales MX · Forecast — pipeline aberto com close date no período, ponderado
+    pelo peso da forecast category."""
+    ctx = base_context()
+    f = ctx["filters"]
+    lo, hi = _mx_window(f)
+    lo_ts, hi_ts = pd.Timestamp(lo), pd.Timestamp(hi)
+    df = _mx_deals(force=request.args.get("refresh") == "1")
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+    pipe = df[df["is_open"] & df["close_date"].notna()
+              & (df["close_date"] >= lo_ts) & (df["close_date"] <= hi_ts)].copy()
+
+    cats = _mx_dim_meta("fcat")
+    pipe["_cat"] = _mx_dim_key(pipe, "fcat")
+    bruto = float(pipe["arr"].sum())
+    linhas, ponderado, sem_peso = [], 0.0, 0.0
+    for c in cats:
+        sub = pipe[pipe["_cat"] == c["key"]]
+        if not len(sub):
+            continue
+        amt = float(sub["arr"].sum())
+        w = c.get("pct")
+        pond = (amt * w) if w is not None else None
+        if pond is None:
+            sem_peso += amt
+        else:
+            ponderado += pond
+        linhas.append({**c, "arr": amt, "deals": int(len(sub)), "ponderado": pond,
+                       "share": (amt / bruto) if bruto else 0.0})
+    linhas.sort(key=lambda r: r["arr"], reverse=True)
+
+    # Realizado do período pela mesma regra do Overview, pra a projeção fechar.
+    # Realizado = receita: janela pela data com a extensão de fechamento.
+    won = df[df["is_won"]].copy()
+    won = won[won["rev_date"].notna() & (won["rev_date"] >= lo_ts) & (won["rev_date"] <= hi_ts)]
+
+    return render_template(
+        "mx_forecast.html", ctx=ctx, linhas=linhas, bruto=bruto,
+        ponderado=ponderado, sem_peso=sem_peso,
+        cobertura=(1 - sem_peso / bruto) if bruto else 0.0,
+        deals=int(len(pipe)), realizado=float(won["arr"].sum()),
+        projecao=float(won["arr"].sum()) + ponderado, leader=MX_LEADER,
+        range_label=_format_period(f, ctx["presets"], ctx["active_preset"]),
+    )
+
+
+@app.route("/mx/funnel")
+def mx_funnel():
+    """Sales MX · Funil — conversão de estágio a estágio e win rate.
+
+    A conversão é medida sobre deals que JÁ SAÍRAM do estágio (ganho, perdido ou
+    avançado). Deal ainda parado no estágio não conta como falha de conversão —
+    ele só não decidiu ainda, e contá-lo puxaria a taxa pra baixo todo dia."""
+    ctx = base_context()
+    f = ctx["filters"]
+    lo, hi = _mx_window(f)
+    df = _mx_deals(force=request.args.get("refresh") == "1")
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+    for dim in ("dtype", "source"):
+        df = _mx_dim_filter(df, dim, f.get(dim, ""))
+    # Coorte por criação: um funil precisa de uma coorte, senão mistura deal de
+    # 2022 com deal de ontem e a taxa não descreve período nenhum.
+    if f.get("date_from") or f.get("date_to"):
+        cd = df["created_date"]
+        df = df[cd.notna() & (cd >= pd.Timestamp(lo)) & (cd <= pd.Timestamp(hi))]
+
+    # "Alcançou o estágio" vem da DATA DE ENTRADA, não do estágio atual.
+    # A 1ª versão usava o estágio atual e os perdidos sumiam do denominador (o
+    # estágio atual deles é "Lost"): dava 383 no topo do funil com 760 perdidos
+    # na base, e conversões infladas. Com a data de entrada, o deal perdido conta
+    # em todas as etapas por onde passou, que é como uma taxa de conversão tem
+    # que ser lida.
+    ETAPAS = [
+        ("hs_date_entered_scheduled",       "Scheduled"),
+        ("hs_date_entered_qualification",   "Qualifying"),
+        ("hs_date_entered_project_scoping", "Scoping"),
+        ("hs_date_entered_negotiation",     "Negotiation"),
+        ("hs_date_entered_consensus",       "Decision"),
+        ("hs_date_entered_procurement",     "Procurement"),
+    ]
+    won = df[df["dealstage"] == MX_WON_STAGE]
+    reached = {col: df[pd.to_datetime(df[col], errors="coerce").notna()]
+               for col, _ in ETAPAS}
+
+    rows = []
+    for i, (col, label) in enumerate(ETAPAS):
+        atual = reached[col]
+        prox = reached[ETAPAS[i + 1][0]] if i + 1 < len(ETAPAS) else won
+        n, nn = len(atual), len(prox)
+        rows.append({
+            "sid": col, "label": label,
+            "deals": n, "arr": float(atual["arr"].sum()),
+            "next_deals": nn,
+            "conv": (nn / n) if n else None,
+            "next_label": (ETAPAS[i + 1][1] if i + 1 < len(ETAPAS) else "Ganho"),
+        })
+    topo = rows[0]["deals"] if rows else 0
+    perdidos = df[df["dealstage"] == MX_LOST_STAGE]
+    return render_template(
+        "mx_funnel.html", ctx=ctx, rows=rows, leader=MX_LEADER,
+        topo=topo, won_deals=int(len(won)), won_arr=float(won["arr"].sum()),
+        lost_deals=int(len(perdidos)),
+        win_rate=(len(won) / (len(won) + len(perdidos))) if (len(won) + len(perdidos)) else None,
+        e2e=(len(won) / topo) if topo else None,
+        range_label=_format_period(f, ctx["presets"], ctx["active_preset"]),
+        tem_coorte=bool(f.get("date_from") or f.get("date_to")),
+    )
+
+
+@app.route("/mx/coverage")
+def mx_coverage():
+    """Sales MX · Cobertura — quanto de pipeline existe pra cada dólar que falta
+    da meta. Olha pra FRENTE: o que já foi ganho abate a meta."""
+    ctx = base_context()
+    f = ctx["filters"]
+    lo, hi = _mx_window(f)
+    lo_ts, hi_ts = pd.Timestamp(lo), pd.Timestamp(hi)
+    df = _mx_deals(force=request.args.get("refresh") == "1")
+    q_ini = _quarter_start_of(lo)
+    quota = _mx_quota_arr(q_ini)
+    oficial = _mx_realized_official(q_ini)
+
+    # Realizado = receita: janela pela data com a extensão de fechamento.
+    won = df[df["is_won"]].copy()
+    won = won[won["rev_date"].notna() & (won["rev_date"] >= lo_ts) & (won["rev_date"] <= hi_ts)]
+    op = df[df["is_open"]]
+    pipe = op[op["close_date"].notna() & (op["close_date"] >= lo_ts) & (op["close_date"] <= hi_ts)]
+
+    rows = []
+    for ae, meta in MX_ROSTER.items():
+        qt = quota.get(ae)
+        real = oficial.get(ae, float(won.loc[won["account_executive"] == ae, "arr"].sum()))
+        p = float(pipe.loc[pipe["account_executive"] == ae, "arr"].sum())
+        falta = max((qt or 0.0) - real, 0.0)
+        rows.append({
+            "display": meta["display"], "account_executive": ae, "tier": meta["tier"],
+            "quota": qt or 0.0, "has_quota": qt is not None, "realizado": real,
+            "falta": falta, "pipe": p,
+            # Cobertura só existe se ainda falta meta. Quem já bateu não tem
+            # "quantas vezes cobre" — dividir por zero viraria infinito na tela.
+            "cob": (p / falta) if falta > 0 else None,
+            "bateu": bool(qt and real >= qt),
+        })
+    rows.sort(key=lambda r: (r["cob"] is None, -(r["cob"] or 0)))
+    tq = sum(r["quota"] for r in rows)
+    tr = sum(r["realizado"] for r in rows)
+    tf = max(tq - tr, 0.0)
+    tp = sum(r["pipe"] for r in rows)
+    return render_template(
+        "mx_coverage.html", ctx=ctx, rows=rows, leader=MX_LEADER,
+        total_quota=tq, total_real=tr, total_falta=tf, total_pipe=tp,
+        total_cob=(tp / tf) if tf > 0 else None,
+        sem_quota=[r["display"] for r in rows if not r["has_quota"]],
+        range_label=_format_period(f, ctx["presets"], ctx["active_preset"]),
+    )
+
+
+# Faixas de inatividade, em dias sem atividade registrada no HubSpot.
+MX_STALE_BUCKETS = [(0, 7, "até 7d", "#10B981"), (7, 15, "8–15d", "#84CC16"),
+                    (15, 30, "16–30d", "#F59E0B"), (30, 60, "31–60d", "#F97316"),
+                    (60, 10**6, "60d+", "#DC2626")]
+
+
+@app.route("/mx/stale")
+def mx_stale():
+    """Sales MX · Inatividade — pipeline aberto por tempo sem atividade.
+
+    Mede `last_activity_date`, e deal SEM data nenhuma entra num bucket próprio
+    em vez de virar "infinitamente parado": nunca ter registrado atividade é um
+    problema de CRM diferente de ter parado há 3 meses."""
+    ctx = base_context()
+    f = ctx["filters"]
+    df = _mx_deals(force=request.args.get("refresh") == "1")
+    df = df[df["is_open"]]
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+    hoje = pd.Timestamp(_today())
+    la = pd.to_datetime(df["last_activity_date"], errors="coerce")
+    dias = (hoje - la).dt.days
+    sem_data = df[la.isna()]
+
+    buckets = []
+    for lo_d, hi_d, label, color in MX_STALE_BUCKETS:
+        m = dias.notna() & (dias > lo_d) & (dias <= hi_d) if lo_d else dias.notna() & (dias <= hi_d)
+        g = df[m]
+        buckets.append({"label": label, "color": color, "deals": int(len(g)),
+                        "arr": float(g["arr"].sum())})
+    por_ae = []
+    for ae, meta in MX_ROSTER.items():
+        m = df["account_executive"] == ae
+        d_ae = dias[m]
+        parados = df[m & dias.notna() & (dias > 30)]
+        por_ae.append({"display": meta["display"], "account_executive": ae,
+                       "deals": int(m.sum()), "arr": float(df.loc[m, "arr"].sum()),
+                       "mediana": float(d_ae.median()) if d_ae.notna().any() else None,
+                       "parados_deals": int(len(parados)),
+                       "parados_arr": float(parados["arr"].sum())})
+    por_ae.sort(key=lambda r: r["parados_arr"], reverse=True)
+    return render_template(
+        "mx_stale.html", ctx=ctx, buckets=buckets, por_ae=por_ae, leader=MX_LEADER,
+        total_deals=int(len(df)), total_arr=float(df["arr"].sum()),
+        sem_data_deals=int(len(sem_data)), sem_data_arr=float(sem_data["arr"].sum()),
+        max_arr=max([b["arr"] for b in buckets], default=0.0),
+    )
+
+
+
+# Colunas do drill do MX. Traz a moeda ORIGINAL junto do ARR convertido: sem
+# isso, um deal digitado em peso apareceria com um número que não existe em
+# lugar nenhum do HubSpot e pareceria erro.
+_DRILL_MX_COLUMNS = [
+    {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+    {"key": "ae",        "label": "AE"},
+    {"key": "stage",     "label": "Estágio"},
+    {"key": "arr",       "label": "ARR US$", "type": "money"},
+    {"key": "original",  "label": "Valor no HubSpot"},
+    {"key": "deal_type", "label": "Tipo"},
+    {"key": "data",      "label": "Data", "type": "date"},
+]
+
+
+@app.route("/mx/overview/deals")
+def mx_overview_deals():
+    """Drill do Sales MX: ganhos e/ou pipeline de um AE na janela da tela."""
+    f = get_filters()
+    lo, hi = _mx_window(f)
+    lo_ts, hi_ts = pd.Timestamp(lo), pd.Timestamp(hi)
+    name = (request.args.get("name") or "").strip()
+    kind = request.args.get("kind") or "won"
+
+    df = _mx_deals()
+    if name:
+        df = df[df["account_executive"] == name]
+    # Filtro de AE da barra por cima do clique — a tela já recorta por ele.
+    if f.get("ae"):
+        df = df[df["account_executive"] == f["ae"]]
+    if kind == "pipe":
+        d = df[df["is_open"] & df["close_date"].notna()
+               & (df["close_date"] >= lo_ts) & (df["close_date"] <= hi_ts)].copy()
+        d["data"] = d["close_date"]
+    else:
+        # Mesma régua do realizado da tela (data da receita, com a extensão);
+        # a coluna Data mostra a validação real.
+        d = df[df["is_won"]].copy()
+        d["data"] = d["po_emission_date"].fillna(d["close_date"])
+        d = d[d["rev_date"].notna() & (d["rev_date"] >= lo_ts) & (d["rev_date"] <= hi_ts)]
+
+    d = d.sort_values("arr", ascending=False)
+    rows = [{
+        "deal_name": r.deal_name or "—",
+        "deal_url": _hs_deal_url(r.deal_id),
+        "ae": MX_DISPLAY.get(r.account_executive, r.account_executive),
+        "stage": r.stage_label or "—",
+        "arr": float(r.arr or 0),
+        "original": (f"{r.deal_currency} {r.amount_orig:,.0f}".replace(",", ".")
+                     if pd.notna(r.amount_orig) else "—"),
+        "deal_type": r.deal_type or "—",
+        "data": r.data.date().isoformat() if pd.notna(r.data) else "",
+    } for r in d.itertuples(index=False)]
+    total = sum(x["arr"] for x in rows)
+    return jsonify({
+        "title": MX_DISPLAY.get(name, name) or ("Pipeline aberto" if kind == "pipe" else "Realizado"),
+        "subtitle": f"{len(rows)} deal(s) · ARR US$ {round(total):,}".replace(",", "."),
+        "columns": _DRILL_MX_COLUMNS,
+        "rows": rows,
+    })
+
+
+# ============================================================
+# Sales MX — as MESMAS telas do BR, servidas sob /mx/
+# ============================================================
+# Nenhuma tela nova: cada rota aponta pra a MESMA função de view do Brasil. O que
+# troca o funil é `_pl()`, lido do caminho; o que traduz o vocabulário do México
+# é a volta da query (`bq.to_usd` converte moeda, `bq.normalize_stages` reescreve
+# os ids de estágio pro canônico do BR); e o que neutraliza a camada de time é o
+# ramo MX de `_apply_roster_current`. Por isso "idêntico" é literal, e continua
+# idêntico quando alguém mexer numa tela — não existe segunda cópia pra esquecer.
+_MX_ESPELHO = [
+    ("/mx/pipeline/total",            "mx_pipeline_total",       "pipeline_total"),
+    ("/mx/pipeline/total/deals",      "mx_pipeline_total_deals", "pipeline_total_deals"),
+    ("/mx/forecast/full",             "mx_forecast_full",        "forecast"),
+    ("/mx/forecast/deals",            "mx_forecast_deals",       "forecast_deals"),
+    ("/mx/pipeline/funnel",           "mx_pipeline_funnel",      "pipeline_funnel"),
+    ("/mx/pipeline/funnel/deals",     "mx_pipeline_funnel_deals","pipeline_funnel_deals"),
+    ("/mx/pipeline/stalled",          "mx_pipeline_stalled",     "pipeline_stalled"),
+    ("/mx/pipeline/stalled/deals",    "mx_pipeline_stalled_deals","pipeline_stalled_deals"),
+    ("/mx/pipeline/wow/history",      "mx_wow_history",          "pipeline_wow_history"),
+    ("/mx/pipeline/wow/history/deals","mx_wow_history_deals",    "pipeline_wow_history_deals"),
+    ("/mx/overview/sales",            "mx_overview_sales",       "overview"),
+    # Geração de Demanda. Substitui a tela própria que existia aqui antes (deals
+    # criados × 1ªs reuniões por semana): metade dela era `first_meeting_eb`, que
+    # no México está morto desde 11/04/2024, e a outra metade (criados por semana)
+    # é o gráfico de tendência desta, com grão de semana. Como toda tela espelho,
+    # o recorte de quem aparece vem do data layer — ver o ramo MX de
+    # _get_demand_deals, que corta pelos 7 vendedores do organograma do Mauricio.
+    ("/mx/demand",                    "mx_demand",               "demand"),
+    ("/mx/demand/deals",              "mx_demand_deals",         "demand_deals"),
+    ("/mx/overview/full-deals",       "mx_overview_full_deals",  "overview_deals"),
+    ("/mx/pipeline/cobertura",        "mx_pipeline_cob",         "pipeline"),
+    ("/mx/pipeline/deals",            "mx_pipeline_deals",       "pipeline_coverage_deals"),
+    ("/mx/pipeline/stalled/wow-deals","mx_stalled_wow_deals",    "pipeline_stalled_wow_deals"),
+    ("/mx/pipeline/stalled-activity", "mx_pipeline_activity",    "pipeline_activity"),
+    ("/mx/pipeline/stalled-activity/deals","mx_activity_deals",  "pipeline_activity_deals"),
+    ("/mx/pipeline/stalled-activity/wow-deals","mx_activity_wow_deals","pipeline_activity_wow_deals"),
+    ("/mx/pipeline/funnel/moves",     "mx_funnel_moves",         "pipeline_funnel_moves"),
+    ("/mx/pipeline/funnel/moves/deals","mx_funnel_move_deals",   "pipeline_funnel_move_deals"),
+    # 12/10/2026 — o resto do AE BR ("layout das abas e subabas idêntico ao AE
+    # Br", pedido do Pedro). Sales Overtime fica de fora a pedido dele. O México
+    # tem uma visão só (um gestor), então o DoD e o WoW — que no BR são só do
+    # Leaders — entram aqui, senão a foto do México não teria onde aparecer.
+    ("/mx/overview/ae",               "mx_overview_ae",          "overview_ae"),
+    ("/mx/overview/funnel-stages",    "mx_overview_funnel_stages","overview_funnel_stages"),
+    ("/mx/overview/funnel-stages/deals","mx_overview_funnel_stage_deals","overview_funnel_stage_deals"),
+    ("/mx/forecast/model",            "mx_forecast_model",       "forecast_model"),
+    ("/mx/forecast/model/deals",      "mx_forecast_model_deals", "forecast_model_deals"),
+    ("/mx/forecast/wow",              "mx_forecast_wow",         "forecast_wow"),
+    ("/mx/forecast/wow/deals",        "mx_forecast_wow_deals",   "forecast_wow_deals"),
+    ("/mx/forecast/dod",              "mx_forecast_dod",         "leaders_forecast_dod"),
+    ("/mx/forecast/dod/deals",        "mx_forecast_dod_deals",   "leaders_forecast_dod_deals"),
+    ("/mx/forecast/history",          "mx_forecast_history",     "forecast_history"),
+    ("/mx/forecast/history/deals",    "mx_forecast_history_deals","forecast_history_deals"),
+    ("/mx/pipeline/dod",              "mx_pipeline_dod",         "leaders_pipeline_dod"),
+    ("/mx/pipeline/dod/deals",        "mx_pipeline_dod_deals",   "leaders_pipeline_dod_deals"),
+    ("/mx/pipeline/wow",              "mx_pipeline_wow",         "leaders_pipeline_wow"),
+    ("/mx/pipeline/wow/deals",        "mx_pipeline_wow_deals",   "leaders_pipeline_wow_deals"),
+    ("/mx/pipeline/legal",            "mx_pipeline_legal",       "pipeline_legal"),
+    ("/mx/pipeline/legal/deals",      "mx_pipeline_legal_deals", "pipeline_legal_deals"),
+    ("/mx/pipeline/funnel-ii",        "mx_pipeline_funnel2",     "pipeline_funnel2"),
+    ("/mx/pipeline/funnel-ii/deals",  "mx_pipeline_funnel2_deals","pipeline_funnel2_deals"),
+    ("/mx/pipeline/visits",           "mx_pipeline_visits",      "pipeline_visits"),
+]
+def _regra_do_endpoint(nome):
+    """Caminho registrado de um endpoint (o 1o, ignorando variantes)."""
+    for r in app.url_map.iter_rules():
+        if r.endpoint == nome and "<" not in r.rule:
+            return r.rule
+    return None
+
+
+for _rule, _endpoint, _target in _MX_ESPELHO:
+    _br_rule = _regra_do_endpoint(_target)
+    app.add_url_rule(_rule, _endpoint, app.view_functions[_target])
+    _MX_ENDPOINT_BY_TARGET[_target] = _endpoint
+    if _br_rule:
+        _MX_PATH_TO_BR[_rule] = _br_rule
+# Os PoP têm foco no path e não entram na lista acima.
+_MX_ENDPOINT_BY_TARGET.update({
+    "pipeline_wow_early": "mx_wow_early", "pipeline_wow_late": "mx_wow_late",
+    "pipeline_wow_deals": "mx_wow_deals",
+})
+_MX_PATH_TO_BR.update({
+    "/mx/pipeline/wow/early": "/pipeline/wow/early",
+    "/mx/pipeline/wow/late":  "/pipeline/wow/late",
+})
+
+
+@app.route("/mx/pipeline/wow/early", endpoint="mx_wow_early")
+def _mx_wow_early():
+    return _render_pipeline_wow("early")
+
+
+@app.route("/mx/pipeline/wow/late", endpoint="mx_wow_late")
+def _mx_wow_late():
+    return _render_pipeline_wow("late")
+
+
+@app.route("/mx/pipeline/wow/<focus>/deals", endpoint="mx_wow_deals")
+def _mx_wow_deals(focus):
+    return pipeline_wow_deals(focus)
+
+
+# Servidor MCP pros agentes de IA. Fica DEPOIS de todas as rotas: o catálogo de
+# telas que ele oferece sai do url_map. K_REVISION = revisão do Cloud Run.
+agent_api.init(app, base_context, versao_app=os.environ.get("K_REVISION", ""))
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
-    _prewarm()
-    threading.Thread(target=_refresh_loop, name="cache-refresher", daemon=True).start()
+    # PEPEU_PAPEL=api é o gêmeo `pepeuhacker-api` (AGENTES.md), que só atende
+    # agente. Sem pré-aquecimento: com min-instances 0 o boot tem que caber no
+    # probe de inicialização, e o _prewarm leva ~3,5 min. Sem os dois laços:
+    # são eles que gravam as fotos do forecast no BigQuery, e quem grava é o
+    # serviço principal — duas instâncias gravando a mesma foto não ajuda ninguém.
+    if os.environ.get("PEPEU_PAPEL") != "api":
+        _prewarm()
+        threading.Thread(target=_refresh_loop, name="cache-refresher", daemon=True).start()
+        threading.Thread(target=_midnight_loop, name="forecast-midnight", daemon=True).start()
     from waitress import serve
     # HOST: 127.0.0.1 (padrão, só local) ou 0.0.0.0 (exposto na rede/VPN p/ o time
     # testar). SEM autenticação — usar só em rede interna/VPN confiável.

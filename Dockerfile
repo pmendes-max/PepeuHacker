@@ -20,7 +20,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py bq.py hubspot.py wa_notes.py ./
+# Módulo novo de .py na raiz entra AQUI, senão o container morre no import
+# (foi o que derrubou a revisão 00064 com o agent_api.py, em 19/10/2026).
+COPY app.py bq.py hubspot.py wa_notes.py agent_api.py ./
 COPY templates/ ./templates/
 COPY static/ ./static/
 

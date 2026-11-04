@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Funil · pepeuhacker{% endblock %}
+{% from "_mx_head.html" import usd %}
+{% block content %}
+<h1>Sales MX · Funil</h1>
+<div class="page-sub">
+  Conversão de estágio a estágio · time de <b>{{ leader }}</b> ·
+  {% if tem_coorte %}coorte de deals <b>criados em {{ range_label }}</b>
+  {% else %}<b>todos os deals</b> do funil MX — use o filtro de período para uma coorte{% endif %}
+</div>
+
+{# A taxa só é honesta se o denominador for "quem já teve chance de converter".
+   Dizer isso na tela evita a leitura de que 30% dos deals "falharam". #}
+<div class="mx-note">
+  <b>Como ler.</b> A conversão de cada linha é sobre quem <b>alcançou</b> o
+  estágio — está nele ou já passou dele. Deal ainda parado no estágio não conta
+  como perda: ele só não decidiu. Por isso a taxa não muda quando entra deal novo.
+</div>
+
+<div class="stats-strip">
+  <div class="stat c-slate">
+    <div class="stat-l">Entraram no funil</div>
+    <div class="stat-v">{{ topo|intg }}</div>
+    <div class="stat-s">alcançaram Scheduled</div>
+  </div>
+  <div class="stat c-green">
+    <div class="stat-l">Ganhos</div>
+    <div class="stat-v">{{ won_deals|intg }}</div>
+    <div class="stat-s">{{ usd(won_arr) }} ARR</div>
+  </div>
+  <div class="stat c-slate">
+    <div class="stat-l">Win rate <span class="stat-q">· ganho ÷ (ganho + perdido)</span></div>
+    <div class="stat-v">{% if win_rate is not none %}{{ (win_rate*100)|round|int }}%{% else %}—{% endif %}</div>
+    <div class="stat-s">{{ lost_deals|intg }} perdidos</div>
+  </div>
+  <div class="stat is-total">
+    <div class="stat-l">Ponta a ponta</div>
+    <div class="stat-v">{% if e2e is not none %}{{ (e2e*100)|round(1) }}%{% else %}—{% endif %}</div>
+    <div class="stat-s">do topo até ganho</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Escada de conversão</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Estágio</th><th class="n">Alcançaram</th><th class="n">ARR no estágio</th>
+        <th class="n">Avançaram</th><th class="n">Conversão</th>
+        <th style="width:30%">Funil</th>
+      </tr></thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td class="first"><b>{{ r.label }}</b>
+            <span class="th-q">→ {{ r.next_label }}</span></td>
+          <td class="n">{{ r.deals|intg }}</td>
+          <td class="n">{{ usd(r.arr) }}</td>
+          <td class="n">{{ r.next_deals|intg }}</td>
+          <td class="n"><b>{% if r.conv is not none %}{{ (r.conv*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          <td><div style="height:12px;border-radius:6px;background:#7C3AED;min-width:2px;
+                     width:{{ (r.deals / topo * 100)|round(1) if topo else 0 }}%"></div></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<style>
+  .mx-note{margin:0 0 18px;padding:11px 15px;border-radius:10px;font-size:12.5px;
+    line-height:1.6;border:1px solid #2563EB44;color:var(--muted);
+    background:color-mix(in srgb,#2563EB 6%,transparent)}
+  .mx-note b{color:var(--fg)}
+  .th-q{font-weight:400;color:var(--muted);font-size:11px}
+</style>
+{% endblock %}

@@ -4,13 +4,13 @@
 {% block content %}
 <h1>Inatividade</h1>
 <div class="page-sub">
-  SLAs por stage (desde o <b>último retorno de contato</b>):
-  <b>Qualifying</b> 14d ·
-  <b>Scoping</b> 21d ·
-  <b>Negotiation</b> 14d ·
-  <b>Decision</b> 14d ·
-  <b>Procurement</b> 21d
-  · Retorno = e-mail recebido ou ligação conectada{% if wa_active %} ou WhatsApp{% endif %}
+  Entra todo deal com <b>mais de {{ sla_days }} dias</b> sem <b>retorno do cliente</b>, em qualquer estágio
+  (Scheduled a Procurement; deal sem retorno nenhum conta desde a entrada no estágio)
+  {%- if n_mgr_stalled and grain != 'leader' %} · inclui <b>{{ n_mgr_stalled|intg }}</b> deals de gestores (no total e na visão de Líderes, sem barra de vendedor){% endif %}
+  · Retorno = e-mail recebido, ligação conectada, mensagem do cliente no WhatsApp ou reunião gravada no Gong com um contato do deal
+  {%- if wa and wa.active %} (WhatsApp lido até <b>{{ wa.until_label }}</b>{% if wa.stale %} · <span class="warn">carga semanal atrasada — deal com resposta recente pode aparecer inativo</span>{% endif %}{% if n_wa_returns %} · em <b>{{ n_wa_returns|intg }}</b> deals o retorno mais recente foi pelo WhatsApp{% endif %}){% else %} (WhatsApp ainda não carregado){% endif %}
+  {%- if gong and gong.active %} · Gong lido até <b>{{ gong.until_label }}</b>{% if gong.stale %} · <span class="warn">carga semanal do Gong atrasada — deal com reunião recente pode aparecer inativo</span>{% endif %}{% if n_gong_returns %} · em <b>{{ n_gong_returns|intg }}</b> deals o retorno mais recente foi uma reunião do Gong{% endif %}{% endif %}
+  {%- for c in sync_parado %} · <span class="warn">{{ c.nome }} sem dado novo desde {{ c.until_label }} (sync do HubSpot parado) — deal com resposta recente por {{ c.nome }} pode aparecer inativo</span>{% endfor %}
   · Cobertura: <b>{{ n_with_activity|intg }}</b>/<b>{{ n_deals_total|intg }}</b> deals com retorno real.
 </div>
 
@@ -29,6 +29,7 @@
       </div>
     {% endfor %}
     <div class="stl-summary-cell stl-summary-total" id="stl-total-cell"
+         {% for s in summary_by_stage %} data-tot-{{ s.key }}="{{ s.n_deals }}"{% endfor %}
          data-drill="{{ url_for('pipeline_activity_deals', grain=grain, leader=ctx.filters.leader, region=ctx.filters.region) }}"
          title="Explodir todos os deals sem retorno">
       <div>
@@ -44,7 +45,7 @@
    `stages=` nos drills — mesmo padrão da página Stale. #}
 <div class="panel">
   <h2>Deals sem retorno de contato por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
-  <div class="dchart" data-chart="stl-stack">
+  <div class="dchart" data-chart="stl-stack" data-drill-chips="stages">
     <div class="legend legend-toggle">
       {% for s in summary_by_stage %}
         <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}" style="--c:{{ s.color }};--ci:{{ s.ink or s.color }}">
@@ -62,9 +63,7 @@
                data-name="{{ r.account_executive }}"
                data-drill="{{ url_for('pipeline_activity_deals', name=r.account_executive, grain=grain) }}"
                data-total="{{ r.total }}"
-               data-qual="{{ r.n_qual }}" data-proj="{{ r.n_proj }}"
-               data-nego="{{ r.n_nego }}" data-cons="{{ r.n_cons }}"
-               data-proc="{{ r.n_proc }}">
+               {% for s in summary_by_stage %} data-{{ s.key }}="{{ r['n_' + s.key] }}"{% endfor %}>
             {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
             <div class="vbar-track" style="--h:{{ h_pct }}%">
               <div class="vbar-val">{{ r.total }}</div>
@@ -103,7 +102,7 @@
       {% endfor %}
     </div>
 
-    <div class="stl-wow-tot">
+    <div class="stl-wow-tot"{% for k, v in (wow_stage_totals or {}).items() %} data-saiu-tot-{{ k }}="{{ v.saiu }}" data-entrou-tot-{{ k }}="{{ v.entrou }}"{% endfor %}>
       <div class="stl-wow-tot-cell stl-wow-pos" style="cursor:pointer"
            data-drill="{{ url_for('pipeline_activity_wow_deals', grain=grain, dir='saiu', leader=ctx.filters.leader, region=ctx.filters.region) }}"
            title="Explodir os deals que saíram da inatividade">
@@ -135,12 +134,7 @@
           {% set h_pos = (r.saiu   / wow_y_max * 100) if wow_y_max else 0 %}
           {% set h_neg = (r.entrou / wow_y_max * 100) if wow_y_max else 0 %}
           <div class="wow-col" data-net="{{ r.net }}"
-               data-saiu-qual="{{ r.saiu_qual }}" data-saiu-proj="{{ r.saiu_proj }}"
-               data-saiu-nego="{{ r.saiu_nego }}" data-saiu-cons="{{ r.saiu_cons }}"
-               data-saiu-proc="{{ r.saiu_proc }}"
-               data-entrou-qual="{{ r.entrou_qual }}" data-entrou-proj="{{ r.entrou_proj }}"
-               data-entrou-nego="{{ r.entrou_nego }}" data-entrou-cons="{{ r.entrou_cons }}"
-               data-entrou-proc="{{ r.entrou_proc }}">
+               {% for s in summary_by_stage %} data-saiu-{{ s.key }}="{{ r['saiu_' + s.key] }}" data-entrou-{{ s.key }}="{{ r['entrou_' + s.key] }}"{% endfor %}>
             {# Sem tooltip de hover (pedido) — os rótulos de dados já mostram tudo. #}
             <div class="wow-pos-area">
               <div class="wow-seg stl-wow-seg-saiu" style="height:{{ h_pos }}%"
@@ -207,7 +201,7 @@
 <script>
 (function(){
   "use strict";
-  const KEYS = ['qual','proj','nego','cons','proc'];
+  const KEYS = {{ summary_by_stage|map(attribute='key')|list|tojson }};
   const fmt = n => Number(n||0).toLocaleString('pt-BR');
 
   // Injeta/atualiza `stages=` na URL do drill conforme a seleção dos chips —
@@ -241,7 +235,11 @@
       b.classList.toggle('is-empty', t <= 0);
       setDrill(b, active, all);
     });
-    const sum = totals.reduce((a,b) => a+b, 0);
+    // Total por ESTÁGIO (contagem de deals do servidor), não soma das barras: em
+    // Líderes o diretor engloba o gerente, e na Inatividade o deal de gestor
+    // está no total sem ter barra.
+    const totCell = document.getElementById('stl-total-cell');
+    const sum = active.reduce((s,k) => s + (+(totCell && totCell.getAttribute('data-tot-'+k)) || 0), 0);
     const numEl = document.getElementById('stl-total-num'); if (numEl) numEl.textContent = fmt(sum);
     setDrill(document.getElementById('stl-total-cell'), active, all);
   }
@@ -269,7 +267,9 @@
                nn.classList.toggle('is-pos', net >= 0); nn.classList.toggle('is-neg', net < 0); }
       c.dataset.net = net;
     });
-    const tSaiu = data.reduce((s,d) => s+d.saiu, 0), tEnt = data.reduce((s,d) => s+d.entrou, 0);
+    const tw = wow.querySelector('.stl-wow-tot');
+    const tSaiu = active.reduce((s,k) => s + (+(tw && tw.getAttribute('data-saiu-tot-'+k)) || 0), 0);
+    const tEnt  = active.reduce((s,k) => s + (+(tw && tw.getAttribute('data-entrou-tot-'+k)) || 0), 0);
     const net = tSaiu - tEnt;
     const eS = document.getElementById('stl-wow-saiu');   if (eS) eS.textContent = '+' + fmt(tSaiu);
     const eE = document.getElementById('stl-wow-entrou'); if (eE) eE.textContent = '−' + fmt(tEnt);

@@ -1,0 +1,3 @@
+{% macro usd(v) -%}
+US$ {{ '{:,.0f}'.format(v|float|round|int).replace(',', '.') }}
+{%- endmacro %}

@@ -1,0 +1,319 @@
+{% extends "base.html" %}
+{% block title %}{{ L.titulo }} · pepeuhacker{% endblock %}
+
+{% macro sgn(v) %}{{ '+' if v >= 0 else '−' }}{{ (v if v >= 0 else -v)|brl }}{% endmacro %}
+
+{% block content %}
+<h1>{{ L.titulo }}</h1>
+<p class="page-sub">
+  {{ L.sigla }} <b>{{ dia_medido }}</b> {{ L.inteiro }} — <b>{{ prev_label }}</b> contra
+  <b>{{ curr_label }}</b> · para onde foi o pipe de cada estágio: ficou, avançou,
+  voltou ou foi pra Lost · funil {{ ctx.pipeline_label }} aberto inteiro, sem corte de close date
+</p>
+
+{% if pares %}
+<div class="hist-chips">
+  <div class="grain-switch">
+    {% for p in pares %}
+      <a class="grain-btn {% if dia_sel == p.key %}active{% endif %}"
+         title="{{ p.title }}{% if p.aprox %} · ponta aproximada pela cópia do BI{% endif %}"
+         href="{{ chip_url(**{L.chip: p.key}) }}">{{ p.label }}{% if p.aprox %}<sup>*</sup>{% endif %}</a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if sem_par %}
+<div class="panel">
+  <h2>{{ L.sem_par_h }}</h2>
+  <p class="ph" style="margin:6px 0 0">
+    {{ L.sem_par_p }}
+  </p>
+</div>
+
+{% elif sem_dado %}
+<div class="panel">
+  <p style="color:var(--muted);padding:8px 0">
+    Nenhum deal aberto no funil nas duas meias-noites, para os filtros atuais.
+  </p>
+</div>
+
+{% else %}
+{% set pt = destino.ponte %}
+
+<div class="hist-bridge{% if aprox %} is-aprox{% endif %}">
+  <span class="hb-lbl">{{ prev_label }}:</span> {{ prev_txt }}
+  <span class="hb-sep">·</span>
+  <span class="hb-lbl">{{ curr_label }}:</span> {{ curr_txt }}
+  {% if aprox %}
+  <span class="hb-aprox">* ponta aproximada: as ~7h da noite anterior à virada não
+    estão nela. A foto própria da meia-noite é gravada pelo app a cada virada
+    desde 24/09/2026.</span>
+  {% endif %}
+</div>
+
+{# Ponte do pipe aberto: ontem − saídas + entradas ± reprecificação = hoje.
+   Fecha por construção (ver `_ppd_destino`). Avançou/voltou não entram na
+   conta: é pipe mudando de estágio, não entrando nem saindo do funil. #}
+<div class="ppd-kpis">
+  <div class="ppd-k">
+    <span class="ppd-kl">Pipe {{ prev_label }}</span>
+    <b data-drill="{{ drill() }}">{{ pt.ontem.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.ontem.n }} deals abertos</span>
+  </div>
+  <div class="ppd-op">+</div>
+  <div class="ppd-k">
+    <span class="ppd-kl">Chegou</span>
+    <b class="is-pos" data-drill="{{ drill(de='in') }}">{{ pt.entrou.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.entrou.n }} deals</span>
+  </div>
+  <div class="ppd-op">−</div>
+  <div class="ppd-k">
+    <span class="ppd-kl">Won</span>
+    <b style="color:#065F46" data-drill="{{ drill(mv='won') }}">{{ pt.won.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.won.n }} deals</span>
+  </div>
+  <div class="ppd-op">−</div>
+  <div class="ppd-k">
+    <span class="ppd-kl">Lost</span>
+    <b class="is-neg" data-drill="{{ drill(mv='lost') }}">{{ pt.lost.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.lost.n }} deals</span>
+  </div>
+  <div class="ppd-op">−</div>
+  <div class="ppd-k">
+    <span class="ppd-kl">Saiu do funil</span>
+    <b style="color:#B45309" data-drill="{{ drill(mv='saiu') }}">{{ pt.saiu.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.saiu.n }} deals</span>
+  </div>
+  <div class="ppd-op">±</div>
+  <div class="ppd-k">
+    <span class="ppd-kl">Reprecificação</span>
+    <b>{{ sgn(pt.repreco) }}</b>
+    <span class="ppd-ks">amount alterado</span>
+  </div>
+  <div class="ppd-op">=</div>
+  <div class="ppd-k is-tot">
+    <span class="ppd-kl">Pipe {{ curr_label }}</span>
+    <b>{{ pt.hoje.v|brl }}</b>
+    <span class="ppd-ks">{{ pt.hoje.n }} deals · {{ sgn(pt.hoje.v - pt.ontem.v) }}</span>
+  </div>
+</div>
+<p class="ppd-mov">
+  Dentro do funil: <b class="is-pos" data-drill="{{ drill(mv='avancou,pulou') }}">{{ pt.avancou.v|brl }}
+  avançaram</b> ({{ pt.avancou.n }} deals) e
+  <b style="color:#DB2777" data-drill="{{ drill(mv='voltou') }}">{{ pt.voltou.v|brl }} voltaram</b>
+  ({{ pt.voltou.n }} deals) de estágio.
+</p>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Destino de cada estágio <span class="h2-sub">· o pipe de {{ prev_label }}, {{ L.depois }}</span></h2>
+    <div class="dst-unit" role="group" aria-label="Unidade da barra">
+      <button type="button" class="dst-u active" data-unit="pct">% do estágio</button>
+      <button type="button" class="dst-u" data-unit="abs">{{ ctx.money_sym }}</button>
+    </div>
+  </div>
+  <span class="ph" style="margin:0 0 2px">
+    barra = o pipe que o estágio tinha em {{ prev_label }}, medido no {{ L.valor_ant }} ·
+    em <b>% do estágio</b> as barras têm o mesmo tamanho e comparam TAXAS; em <b>{{ ctx.money_sym }}</b>
+    comparam TAMANHOS · clique em qualquer pedaço
+  </span>
+
+  <div class="legend" style="margin:12px 0 14px">
+    {% for l in destino.legenda %}
+      <span class="leg-item" title="{{ l.hint }}"><i class="leg-sq{% if l.key == 'ficou' %} is-ficou{% endif %}"
+            style="background:{{ l.color }}"></i>{{ l.label }}</span>
+    {% endfor %}
+  </div>
+
+  <div class="tbl-wrap">
+    <table class="fw-tbl dst-tbl">
+      <thead>
+        <tr>
+          <th>Estágio em {{ prev_label }}</th>
+          <th class="n">Pipe</th>
+          <th style="width:38%">← perdeu · voltou · ficou · avançou →</th>
+          {% for key, lbl, cor in destino.resumo_meta %}<th class="n">{{ lbl }}</th>{% endfor %}
+          <th class="n" title="Chegaram neste estágio vindos de outro estágio, novos, reabertos ou de fora">Chegou</th>
+          <th class="n">Pipe {{ curr_label }}</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for b in destino.rows %}
+        <tr>
+          <td class="first" data-drill="{{ drill(de=b.key) }}"
+              title="Explodir os {{ b.n }} deals que estavam em {{ b.label }}">
+            <span class="leg-dot" style="background:{{ b.color }}"></span>
+            <b>{{ b.num }}. {{ b.label }}</b>
+          </td>
+          <td class="n" data-drill="{{ drill(de=b.key) }}">
+            <b>{{ b.total|brl }}</b><span class="dst-sub">{{ b.n }} deals</span>
+          </td>
+          <td class="dst-cell">
+            {% if b.n %}
+            <div class="dst-bar" data-w-pct="100"
+                 data-w-abs="{{ (b.total / destino.span * 100)|round(2) }}"
+                 style="width:100%">
+              {% for sg in b.segs %}
+                <span class="dst-sg{% if sg.e_ficou %} is-ficou{% endif %}"
+                      data-drill="{{ drill(de=b.key, mv=sg.key) }}"
+                      style="width:{{ (sg.pct * 100)|round(3) }}%;
+                             {% if sg.e_ficou %}background:{{ b.color }}44;box-shadow:inset 0 0 0 1px {{ b.color }};color:var(--fg){% else %}background:{{ sg.color }}{% endif %}"
+                      title="{{ b.label }} · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}">
+                  {% if sg.pct >= 0.09 %}{{ (sg.pct * 100)|round|int }}%{% endif %}
+                </span>
+              {% endfor %}
+            </div>
+            {% else %}<span class="dst-sub">sem pipe em {{ prev_label }}</span>{% endif %}
+          </td>
+          {% for key, lbl, cor in destino.resumo_meta %}
+            {% set g = b.resumo[key] %}
+            <td class="n" data-drill="{{ drill(de=b.key, mv=g.mvs) }}"
+                title="{{ lbl }} · {{ g.v|brl }} · {{ g.n }} deal{{ 's' if g.n != 1 else '' }}">
+              <b style="color:{{ cor or 'var(--fg)' }}">{% if not g.n %}·{% elif g.pct < 0.005 %}&lt;1%{% else %}{{ (g.pct * 100)|round|int }}%{% endif %}</b>
+              <span class="dst-sub">{% if g.n %}{{ g.v|brl }} · {{ g.n }}{% endif %}</span>
+            </td>
+          {% endfor %}
+          <td class="n" title="{{ b.chegou_n }} deals chegaram em {{ b.label }}">
+            <b class="is-pos">{% if b.chegou_n %}+{{ b.chegou_v|brl }}{% else %}·{% endif %}</b>
+            <span class="dst-sub">{% if b.chegou_n %}{{ b.chegou_n }} deals{% endif %}</span>
+          </td>
+          <td class="n">
+            <b>{{ b.hoje_v|brl }}</b>
+            <span class="dst-sub">{{ b.hoje_n }} deals · {{ sgn(b.hoje_v - b.total) }}</span>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if destino.entrou.segs %}
+  <div class="dst-fora">
+    <div class="dst-f-head">
+      <b>Chegou no funil</b>
+      <span class="dst-e-sub">{{ pt.entrou.n }} deals · não estavam em estágio aberto às {{ prev_label }} · medido no valor de agora</span>
+    </div>
+    <div class="dst-f-row">
+      {% for sg in destino.entrou.segs %}
+        <div class="dst-f-item" data-drill="{{ drill(de='in', mv=sg.key) }}"
+             title="{{ sg.hint }} · {{ sg.v|brl }} · {{ sg.n }} deals">
+          <span class="dst-f-bar" style="width:{{ (sg.v / destino.entrou.span * 76 + 6)|round }}px;background:{{ sg.color }}"></span>
+          <span class="dst-f-txt">
+            <b style="color:{{ sg.color }}">{{ sg.v|brl }}</b>
+            <span class="dst-sub">{{ sg.label }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}</span>
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="hm-note">
+    Cada barra é medida no <b>{{ L.valor_ant }}</b> e por isso soma exatamente o pipe
+    que o estágio tinha em {{ prev_label }}; as quatro colunas de resumo somam 100%.
+    <b>Avançou</b> inclui quem foi pro estágio seguinte, quem pulou etapas e quem
+    virou Won. <b>Saiu do funil</b> é quem não aparece na {{ L.foto_atual }} — No Show,
+    troca de pipeline, deal apagado ou sem AE; a foto não separa os quatro.
+    O que ficou no estágio e mudou de tamanho aparece como
+    reprecificação{% for b in destino.rows if b.repreco_dp|round(0) != 0 %}{% if loop.first %}: {% else %} · {% endif %}<b>{{ b.label }}</b> {{ sgn(b.repreco_dp) }}{% endfor %}.
+    Movimento {{ L.dentro }} não aparece: o deal que avançou e voltou entre as
+    duas meias-noites conta como "ficou".
+  </div>
+</div>
+{% endif %}
+
+<style>
+  .hist-chips{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px}
+  .hist-bridge{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;
+    margin:-8px 0 18px;padding:12px 16px;border:1px solid var(--border);
+    border-radius:10px;background:var(--surface);font-size:13px;color:var(--muted)}
+  .hb-lbl{font-weight:600;color:var(--fg)}
+  .hb-sep{color:var(--muted-2)}
+  .hist-bridge.is-aprox{border-color:#F59E0B66}
+  .hb-aprox{flex-basis:100%;font-size:12px;color:#B45309}
+  .h2-sub{font-size:13px;font-weight:400;color:var(--muted)}
+  .hm-note{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);
+    font-size:12px;color:var(--muted);line-height:1.6}
+  .is-pos{color:#15803d}
+  .is-neg{color:#dc2626}
+
+  /* ---- Ponte do pipe ---- */
+  .ppd-kpis{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;margin:0 0 8px}
+  .ppd-k{flex:1 1 120px;padding:12px 14px;border:1px solid var(--border);
+    border-radius:10px;background:var(--surface);display:flex;flex-direction:column;gap:2px}
+  .ppd-k.is-tot{border-color:var(--blue,#2563EB)66}
+  .ppd-k b{font-size:18px;font-variant-numeric:tabular-nums}
+  .ppd-k b[data-drill]{cursor:pointer}
+  .ppd-k b[data-drill]:hover{text-decoration:underline}
+  .ppd-kl{font-size:11.5px;color:var(--muted);font-weight:600}
+  .ppd-ks{font-size:11px;color:var(--muted-2)}
+  .ppd-op{align-self:center;font-size:18px;font-weight:700;color:var(--muted-2)}
+  .ppd-mov{font-size:13px;color:var(--muted);margin:4px 0 18px}
+  .ppd-mov b[data-drill]{cursor:pointer}
+  .ppd-mov b[data-drill]:hover{text-decoration:underline}
+  @media (max-width:760px){ .ppd-op{display:none} }
+
+  /* ---- Tabela ---- */
+  .fw-tbl td[data-drill]{cursor:pointer}
+  .fw-tbl td[data-drill]:hover{outline:2px solid var(--blue,#2563EB);outline-offset:-2px}
+  .dst-unit{display:inline-flex;border:1px solid var(--border);border-radius:8px;
+    overflow:hidden;background:var(--surface)}
+  .dst-u{border:0;background:transparent;color:var(--muted);font-size:12px;
+    font-weight:600;padding:5px 12px;cursor:pointer;font-family:inherit}
+  .dst-u.active{background:var(--blue,#2563EB);color:#fff}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:var(--muted)}
+  .leg-item{display:inline-flex;align-items:center;gap:6px}
+  .leg-sq{width:10px;height:10px;border-radius:2px;display:inline-block}
+  .leg-sq.is-ficou{box-shadow:inset 0 0 0 1px #94A3B8}
+  .dst-tbl td{vertical-align:middle}
+  .dst-tbl td.n b,.dst-tbl td.n .dst-sub,.dst-tbl th.n{white-space:nowrap}
+  .dst-cell{padding-right:18px}
+  .dst-bar{display:flex;height:26px;border-radius:5px;overflow:hidden;
+    transition:width .18s ease}
+  .dst-sg{display:flex;align-items:center;justify-content:center;min-width:2px;
+    font-size:10.5px;font-weight:700;color:#fff;cursor:pointer;overflow:hidden}
+  .dst-sg:hover{outline:2px solid var(--fg);outline-offset:-2px;position:relative;z-index:1}
+  .dst-sub{display:block;font-size:10.5px;font-weight:400;color:var(--muted-2);margin-top:1px}
+  .dst-fora{margin-top:16px;padding:12px 14px;border:1px solid var(--border);
+    border-radius:9px;background:var(--surface-2);font-size:12.5px}
+  .dst-f-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .dst-f-head b{color:var(--fg)}
+  .dst-f-row{display:flex;gap:26px;flex-wrap:wrap}
+  .dst-f-item{display:flex;align-items:center;gap:9px;cursor:pointer;
+    padding:4px 8px;margin:-4px -8px;border-radius:6px}
+  .dst-f-item:hover{background:var(--surface)}
+  .dst-f-bar{height:20px;border-radius:4px;flex:0 0 auto;min-width:6px}
+  .dst-f-txt{line-height:1.25}
+  .dst-e-sub{color:var(--muted-2)}
+</style>
+
+<script>
+/* Troca a unidade da barra: só o COMPRIMENTO muda, a composição é a mesma. */
+(function(){
+  "use strict";
+  function init(){
+    var box = document.querySelector('.dst-unit');
+    if (!box || box.dataset.wired) return;
+    box.dataset.wired = '1';
+    var bars = [].slice.call(document.querySelectorAll('.dst-bar'));
+    box.addEventListener('click', function(ev){
+      var btn = ev.target.closest('.dst-u');
+      if (!btn) return;
+      [].forEach.call(box.querySelectorAll('.dst-u'), function(b){
+        b.classList.toggle('active', b === btn);
+      });
+      var unit = btn.dataset.unit;
+      bars.forEach(function(bar){
+        bar.style.width = (unit === 'abs' ? bar.dataset.wAbs : bar.dataset.wPct) + '%';
+      });
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else { init(); }
+})();
+</script>
+
+{% include "_drilldown.html" %}
+{% endblock %}

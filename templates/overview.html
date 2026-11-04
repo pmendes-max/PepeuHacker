@@ -74,6 +74,7 @@
             {% else %}
               <span style="font-size:11.5px;font-weight:600;color:var(--green-ink);background:#D1FAE5;padding:2px 8px;border-radius:20px">validado</span>
             {% endif %}
+            {% if d.rev_tag %}<span style="font-size:11px;color:var(--muted);margin-left:6px">{{ d.rev_tag }}</span>{% endif %}
           </td>
           <td class="n">{{ d.date }}</td>
         </tr>
@@ -111,13 +112,13 @@
     <div class="kpi-l">Meta de receita</div>
     <div class="kpi-v">{{ kpis.quota|brl if kpis.quota else '—' }}</div>
   </div>
-  <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) }}" title="Explodir os deals realizados (validado + hold)">
+  <div class="kpi grn" data-drill="{{ url_for('overview_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir os deals realizados (validado + hold)">
     <div class="kpi-l">Realizado de receita</div>
     <div class="kpi-v">{{ kpis.realized|brl }}</div>
-    {# Venda fechada com PO em aprovação financeira (hold) JÁ ESTÁ no realizado
-       (regra de 03/nov/2026); esta linha só mostra quanto dele ainda está em
-       aprovação. #}
+    {# Venda fechada com PO em validação financeira (hold) já está somada acima. #}
     {% if kpis.hold %}<div class="kpi-s">dos quais {{ kpis.hold|brl }} em validação financeira</div>{% endif %}
+    {% set _ext = rev_ext_note(ctx.filters.date_from, ctx.filters.date_to) %}
+    {% if _ext %}<div class="kpi-s">{{ _ext }}</div>{% endif %}
   </div>
   <div class="kpi {% if kpis.rev_att and kpis.rev_att >= 1 %}grn{% else %}warn{% endif %}">
     <div class="kpi-l">% realizado de receita</div>
@@ -134,7 +135,7 @@
     <div class="kpi-l">Meta de new logo</div>
     <div class="kpi-v">{{ kpis.nl_goal if kpis.has_newlogos else '—' }}</div>
   </div>
-  {% set _nl_drill = url_for('overview_deals', kind='newlogo', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
+  {% set _nl_drill = url_for('overview_deals', kind='newlogo', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
   <div class="kpi grn" data-drill="{{ _nl_drill }}" title="Ver quais são as new logos">
     <div class="kpi-l">Realizado de new logo</div>
     <div class="kpi-v">{{ kpis.nl_real }}</div>
@@ -147,14 +148,14 @@
 
 {# ===== Aquisição × Expansão — valor total (macro) · deals · ticket médio ===== #}
 <div class="kpis-4" style="margin-top:16px">
-  {% set _acq_drill = url_for('overview_deals', kind='acq', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
-  {% set _exp_drill = url_for('overview_deals', kind='exp', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, ae=ctx.filters.ae) %}
+  {% set _acq_drill = url_for('overview_deals', kind='acq', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
+  {% set _exp_drill = url_for('overview_deals', kind='exp', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) %}
   <div class="kpi acc" data-drill="{{ _acq_drill }}" title="Ver os deals de aquisição">
     <div class="kpi-l"><span class="leg-dot" style="background:#2563EB;display:inline-block;vertical-align:middle;margin-right:6px"></span>Total em aquisição</div>
     <div class="kpi-v">{{ acq.mrr|brl }}</div>
     <div class="kpi-deals">{{ acq.deals }} deals</div>
   </div>
-  <div class="kpi acc" data-drill="{{ _acq_drill }}" title="Ver os deals de aquisição">
+  <div class="kpi acc" data-drill="{{ _acq_drill }}&basis=cal" title="Ver os deals de aquisição">
     <div class="kpi-l">Ticket médio · aquisição</div>
     <div class="kpi-v">{{ acq.ticket|brl }}</div>
   </div>
@@ -163,7 +164,7 @@
     <div class="kpi-v">{{ exp.mrr|brl }}</div>
     <div class="kpi-deals">{{ exp.deals }} deals</div>
   </div>
-  <div class="kpi grn" data-drill="{{ _exp_drill }}" title="Ver os deals de expansão">
+  <div class="kpi grn" data-drill="{{ _exp_drill }}&basis=cal" title="Ver os deals de expansão">
     <div class="kpi-l">Ticket médio · expansão</div>
     <div class="kpi-v">{{ exp.ticket|brl }}</div>
   </div>

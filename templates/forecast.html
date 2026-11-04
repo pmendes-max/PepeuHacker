@@ -7,33 +7,41 @@
 {# Parágrafo explicativo virou linha de parâmetros: mantém o que o leitor
    precisa pra interpretar (janela + pesos) e devolve a área pro dado. #}
 <p class="page-sub">
-  Close date em <b>{{ range_label }}</b> · pesos por forecast category:
-  Funnel <b>25</b> · Probable <b>50</b> · Best Case <b>75</b> · Commit <b>100</b>
+  Close date em <b>{{ range_label }}</b> · segmentado pela <i>forecast category</i>
+  do HubSpot, nomeada pelo <b>peso</b> que ela vale no ponderado · ponderado já com
+  <b>fator de correção de {{ ((1-dir_factor)*100)|round|int }}%</b>{% if dtype_sel %} ·
+  só <b>{{ dtype_label }}</b>{% endif %}
 </p>
 
 {# Cores vêm dos modificadores (acc/grn/warn), não de style inline no número —
    inline sobrescrevia o --c do card e gerava card cinza com número azul. #}
 {# 3+3: linha 1 = o que se projeta, linha 2 = a base de cálculo. #}
 <div class="kpis-3">
-  <div class="kpi acc" data-drill="{{ url_for('forecast_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region) }}" title="Explodir todos os deals da projeção">
+  <div class="kpi acc" data-drill="{{ url_for('forecast_deals', grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, leader=ctx.filters.leader, region=ctx.filters.region, dtype=(ctx.filters.dtype or None)) }}" title="Explodir todos os deals da projeção">
     <div class="kpi-l">Projeção do quarter <span class="kpi-q">· amount</span></div>
     <div class="kpi-v">{{ totals.projection|brl }}</div>
-    <div class="kpi-s">realizado + ponderado</div>
+    <div class="kpi-s">realizado + ponderado{% if totals.attainment is not none %} ·
+      <b>{{ (totals.attainment*100)|round|int }}%</b> da meta{% endif %}</div>
   </div>
   <div class="kpi grn">
     <div class="kpi-l">Realizado <span class="kpi-q">· amount</span></div>
     <div class="kpi-v">{{ totals.realized|brl }}</div>
-    <div class="kpi-s">{{ totals.realized_deals }} PO Won · por data de validação</div>
+    <div class="kpi-s">{{ totals.realized_deals }} PO Won · por data de validação
+      {%- set _ext = rev_ext_note(ctx.filters.date_from, ctx.filters.date_to) %}{% if _ext %} · {{ _ext }}{% endif %}</div>
   </div>
   <div class="kpi acc">
     <div class="kpi-l">Forecast ponderado <span class="kpi-q">· amount</span></div>
     <div class="kpi-v">{{ totals.weighted|brl }}</div>
     <div class="kpi-s">pipeline aberto × %</div>
   </div>
+  {# On-hold sai de `ae_performance`: é MRR agregado por AE, sem deal do lado.
+     Com um corte de Deal Type ligado não há como dizer quanto do hold é
+     aquisição — o card vira "—" e diz por quê, em vez de repetir o total cheio
+     ao lado de números já recortados. #}
   <div class="kpi warn">
     <div class="kpi-l">On-hold <span class="kpi-q">· MRR</span></div>
-    <div class="kpi-v">{{ totals.hold|brl }}</div>
-    <div class="kpi-s">MRR em validação financeira</div>
+    <div class="kpi-v">{% if hold_ok %}{{ totals.hold|brl }}{% else %}—{% endif %}</div>
+    <div class="kpi-s">{% if hold_ok %}MRR em validação financeira{% else %}não se divide por deal type{% endif %}</div>
   </div>
   <div class="kpi">
     <div class="kpi-l">Pipeline bruto <span class="kpi-q">· amount</span></div>
@@ -46,6 +54,22 @@
     <div class="kpi-s">ponderado ÷ bruto (pipeline)</div>
   </div>
 </div>
+
+{% if grain == 'leader' and totals.quota %}
+{# Meta = Comp. Target dos diretores (planilha da liderança), somando só os
+   líderes de TOPO do recorte — o gerente já está dentro do diretor. É o MESMO
+   número do Modelo Analytics. #}
+<p style="margin:-8px 0 18px;font-size:13px;color:var(--muted)">
+  <b style="color:var(--fg)">Meta dos diretores · Comp. Target:</b>
+  <b style="color:var(--fg)">{{ totals.quota|brl }}</b> no período ·
+  projeção <b style="color:{{ '#0F6E56' if (totals.attainment and totals.attainment >= 1) else '#185FA5' }}">{{ (totals.attainment*100)|round|int }}%</b>
+  {% if totals.gap is not none and totals.gap > 0 %}
+    · faltam <b style="color:#185FA5">{{ totals.gap|brl }}</b> pra meta
+  {% elif totals.gap is not none %}
+    · <b style="color:#0F6E56">{{ (-totals.gap)|brl }}</b> acima da meta
+  {% endif %}
+</p>
+{% endif %}
 
 {% if totals.mgr_count %}
 <p style="margin:-10px 0 20px;font-size:12.5px;color:var(--muted)">
@@ -62,29 +86,44 @@
     <h2>Realizado + Forecast ponderado por {{ 'líder' if grain == 'leader' else 'AE' }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· deal amount</span></h2>
     <span class="ph" style="margin:0">barra = Realizado (Won) + Σ amount × % do pipeline · clique na legenda pra filtrar</span>
   </div>
-  <div class="dchart fc-chart" data-channels="realized {% for c in cats %}{{ c.key }} {% endfor %}">
+  <div class="dchart fc-chart" data-drill-chips="cat" data-channels="realized {% for c in cats %}{{ c.key }} {% endfor %}{% if grain == 'leader' %}meta{% endif %}">
     <div class="legend legend-toggle">
       <button type="button" class="leg-toggle is-on" data-ch="realized" style="--c:#065F46">
         <span class="leg-dot" style="background:#065F46"></span>Realizado (Won)
       </button>
       {% for c in cats %}
       <button type="button" class="leg-toggle is-on" data-ch="{{ c.key }}" style="--c:{{ c.color }};--ci:{{ c.ink or c.color }}">
-        <span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }} · {{ (c.pct*100)|int }}%
+        <span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }}
       </button>
       {% endfor %}
+      {% if grain == 'leader' %}
+      {# Meta não é segmento da pilha: é a tracejada de referência de cada barra
+         (o JS separa 'meta' dos canais empilhados). #}
+      <button type="button" class="leg-toggle is-on leg-goal" data-ch="meta" data-drill-skip style="--c:var(--blue)">
+        <span class="leg-dot" style="background:var(--blue);border:1.5px dashed #fff;box-shadow:0 0 0 1px var(--blue)"></span>Meta (Comp. Target)
+      </button>
+      {% endif %}
     </div>
     <div class="vbars" style="--count:{{ chart_rows|length }}">
       {% for r in chart_rows %}
         {% set ptot = r.projection|round|int %}
-        {% set h_pct = (ptot / max_projection * 100) if max_projection else 0 %}
+        {% set scale = chart_max or max_projection %}
+        {% set h_pct = (ptot / scale * 100) if scale else 0 %}
+        {% set meta_v = (r.quota|round|int) if r.quota else 0 %}
+        {% set meta_pct = (meta_v / scale * 100) if (scale and meta_v) else 0 %}
         <div class="vbar{% if ptot <= 0 %} is-empty{% endif %}"
              data-name="{{ r.account_executive }}" data-leader="{{ r.leader or '' }}"
-             {% if ptot > 0 %}data-drill="{{ url_for('forecast_deals', name=r.account_executive, grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}"{% endif %}
+             {% if ptot > 0 %}data-drill="{{ url_for('forecast_deals', name=r.account_executive, grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, dtype=(ctx.filters.dtype or None)) }}"{% endif %}
              data-gross="{{ r.gross|round|int }}" data-hold="{{ r.hold|round|int }}"
-             data-realized="{{ r.realized|round|int }}"
+             data-realized="{{ r.realized|round|int }}" data-meta="{{ meta_v }}"
              {% for c in cats %}data-{{ c.key }}="{{ r['w_' ~ c.key]|round|int }}" {% endfor %}>
           <div class="vbar-tip"></div>
           <div class="vbar-track" style="--h:{{ h_pct }}%">
+            {% if meta_v > 0 %}
+            <div class="vbar-mark" style="--gp:{{ meta_pct }}%" data-ch="meta">
+              <span class="vbar-mark-label">{{ r.quota|brl }}</span>
+            </div>
+            {% endif %}
             <div class="vbar-val">{{ r.projection|brl }}</div>
             <div class="vbar-col">
               {% set rv = r.realized|round|int %}
@@ -109,7 +148,7 @@
     <table>
       <thead>
         <tr>
-          <th>Categoria</th><th class="n">Prob.</th><th class="n">Deals</th>
+          <th>Categoria</th><th class="n">Deals</th>
           <th class="n">Bruto</th><th class="n">Ponderado</th>
           <th style="width:34%">Peso no forecast</th>
         </tr>
@@ -119,7 +158,6 @@
       {% for c in by_cat %}
         <tr>
           <td class="first"><span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }}</td>
-          <td class="n">{{ (c.pct*100)|int }}%</td>
           <td class="n">{{ c.deals }}</td>
           <td class="n">{{ c.gross|brl }}</td>
           <td class="n"><b>{{ c.weighted|brl }}</b></td>
@@ -128,7 +166,6 @@
       {% endfor %}
         <tr style="border-top:2px solid var(--border)">
           <td class="first"><b>Total pipeline</b></td>
-          <td class="n">—</td>
           <td class="n">{{ by_cat|sum(attribute='deals') }}</td>
           <td class="n">{{ (by_cat|sum(attribute='gross'))|brl }}</td>
           <td class="n"><b style="color:#185FA5">{{ totals.weighted|brl }}</b></td>
@@ -142,7 +179,9 @@
 {# ------- Detalhe por AE ------- #}
 <div class="panel">
   <h2>Detalhe por {{ 'líder' if grain == 'leader' else 'AE' }}</h2>
-  <p class="ph" style="margin:-2px 0 14px">Ponderado, Realizado e Projeção em <b>deal amount</b>; On-hold em <b>MRR</b>.</p>
+  <p class="ph" style="margin:-2px 0 14px">Ponderado, Realizado e Projeção em <b>deal amount</b>; On-hold em <b>MRR</b>.{% if grain == 'leader' and meta_ok %}
+    <b>Meta</b> = Comp. Target do líder (planilha da liderança) — não é a soma das quotas dos AEs do time.{% endif %}
+    {% if dtype_sel %}Recorte <b>{{ dtype_label }}</b>: On-hold (MRR por AE) e Meta (Comp. Target, receita cheia) não se dividem por deal type e por isso saem da tela.{% endif %}</p>
   <div class="tbl-wrap">
     <table>
       <thead>
@@ -152,6 +191,8 @@
           <th class="n">Ponderado</th>
           <th class="n grp">Realizado</th>
           <th class="n grp">Projeção</th>
+          {% if grain == 'leader' and meta_ok %}<th class="n">Meta<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">Comp. Target</span></th>
+          <th class="n grp">% atingimento</th>{% endif %}
           <th class="n">On-hold<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">MRR</span></th>
         </tr>
       </thead>
@@ -167,9 +208,31 @@
           <td class="n" style="color:#2563EB">{{ r.weighted|brl }}</td>
           <td class="n grp" style="color:#0F6E56">{% if r.realized %}{{ r.realized|brl }}{% else %}—{% endif %}</td>
           <td class="n grp"><b>{{ r.projection|brl }}</b></td>
+          {% if grain == 'leader' and meta_ok %}
+          <td class="n">{% if r.quota %}{{ r.quota|brl }}{% else %}—{% endif %}</td>
+          <td class="n grp"><b style="color:{{ '#0F6E56' if (r.attainment and r.attainment >= 1) else '#185FA5' }}">{% if r.attainment is not none %}{{ (r.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          {% endif %}
           <td class="n" style="color:#854F0B">{% if r.hold %}{{ r.hold|brl }}{% else %}—{% endif %}</td>
         </tr>
       {% endfor %}
+      {% if grain == 'leader' %}
+      {# Total vem dos totais do TIME (verdade por-AE), não da soma das linhas:
+         no grain de líder o deal conta no gerente E no diretor, e somar a coluna
+         dobraria. A meta usa só os líderes de topo, pela mesma razão. #}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          <td></td>
+          {% for c in by_cat %}<td class="n" style="color:{{ c.ink or c.color }}">{{ c.weighted|brl }}</td>{% endfor %}
+          <td class="n" style="color:#2563EB"><b>{{ totals.weighted|brl }}</b></td>
+          <td class="n grp" style="color:#0F6E56"><b>{{ totals.realized|brl }}</b></td>
+          <td class="n grp"><b>{{ totals.projection|brl }}</b></td>
+          {% if meta_ok %}
+          <td class="n"><b>{{ totals.quota|brl }}</b></td>
+          <td class="n grp"><b style="color:{{ '#0F6E56' if (totals.attainment and totals.attainment >= 1) else '#185FA5' }}">{% if totals.attainment is not none %}{{ (totals.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          {% endif %}
+          <td class="n" style="color:#854F0B">{% if hold_ok %}<b>{{ totals.hold|brl }}</b>{% else %}—{% endif %}</td>
+        </tr>
+      {% endif %}
       </tbody>
     </table>
   </div>
@@ -191,14 +254,20 @@
   const fmtBRL = (n) => window.fmtBRLCompact(n);
   function refresh(chart){
     const active = (chart.dataset.channels || '').split(' ').filter(Boolean);
+    // 'meta' é linha de referência, não segmento: fica fora da soma da pilha,
+    // mas ENTRA no max da escala (senão a tracejada de quem está abaixo da meta
+    // sairia pra fora da área plotada).
+    const metaOn = active.includes('meta');
+    const barCh = active.filter(ch => ch !== 'meta');
     const cont = chart.querySelector('.vbars');
     const rows = Array.from(cont.children).filter(c => c.classList.contains('vbar'));
     const labelFor = ch => {
       const b = chart.querySelector('.leg-toggle[data-ch="'+ch+'"]');
       return b ? b.textContent.trim() : ch;
     };
-    rows.forEach(r => { let t=0; active.forEach(ch => t += parseFloat(r.dataset[ch]||'0')); r._t = t; });
-    const max = Math.max(1, ...rows.map(r => r._t));
+    rows.forEach(r => { let t=0; barCh.forEach(ch => t += parseFloat(r.dataset[ch]||'0')); r._t = t; });
+    const metaMax = metaOn ? Math.max(0, ...rows.map(r => parseFloat(r.dataset.meta||'0'))) : 0;
+    const max = Math.max(1, metaMax, ...rows.map(r => r._t));
     rows.sort((a,b) => b._t - a._t);
     const frag = document.createDocumentFragment(); let vis = 0;
     rows.forEach(r => {
@@ -211,11 +280,28 @@
       });
       r.querySelector('.vbar-val').textContent = fmtBRL(r._t);
       if (r._t > 0) { r.classList.remove('is-empty'); vis++; } else r.classList.add('is-empty');
+      // Tracejada da meta: reposiciona no max vigente e some com o toggle.
+      const meta = parseFloat(r.dataset.meta||'0');
+      const mark = r.querySelector('.vbar-mark');
+      if (mark) {
+        if (metaOn && meta > 0) {
+          mark.style.display = '';
+          mark.style.setProperty('--gp', (meta/max*100) + '%');
+        } else mark.style.display = 'none';
+      }
       const tip = r.querySelector('.vbar-tip');
       const parts = ['<b>'+r.dataset.name+'</b>'];
-      if (r.dataset.leader) parts.push('<span style="opacity:.7">'+r.dataset.leader+'</span>');
-      active.forEach(ch => { const v = parseFloat(r.dataset[ch]||'0'); if (v>0) parts.push(labelFor(ch)+': '+fmtBRL(v)); });
+        // No grain de líder o 'leader' É o próprio nome da barra — não repete a linha.
+      if (r.dataset.leader && r.dataset.leader !== r.dataset.name)
+        parts.push('<span style="opacity:.7">'+r.dataset.leader+'</span>');
+      barCh.forEach(ch => { const v = parseFloat(r.dataset[ch]||'0'); if (v>0) parts.push(labelFor(ch)+': '+fmtBRL(v)); });
       parts.push('Projeção: <b>'+fmtBRL(r._t)+'</b> <span style="opacity:.6">amount</span>');
+      if (metaOn && meta > 0) {
+        const pace = r._t >= meta ? '✓ ' + fmtBRL(r._t - meta) + ' acima'
+                                  : '−' + fmtBRL(meta - r._t) + ' pra meta';
+        parts.push('Meta: <b>'+fmtBRL(meta)+'</b> · '
+                   + Math.round(r._t/meta*100) + '% · ' + pace);
+      }
       const hold = parseFloat(r.dataset.hold||'0');
       if (hold > 0) parts.push('On-hold (MRR): '+fmtBRL(hold));
       tip.innerHTML = parts.join('<br>');

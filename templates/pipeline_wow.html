@@ -53,7 +53,7 @@
 {# ---- Chart por AE ---- #}
 <div class="panel">
   <h2>Por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
-  <div class="dchart" data-chart="wow-{{ focus }}">
+  <div class="dchart" data-chart="wow-{{ focus }}" data-drill-chips="cat">
     <div class="legend legend-toggle">
       {# cor = preenchimento (ponto/barra) · ink = texto do chip. Os dois pastéis
          (cresceu/encolheu) precisam de ink próprio: como texto de 12px eles
@@ -65,7 +65,7 @@
         ('lost',     'Lost',               '#dc2626', '#B91C1C'),
         ('won',      fifth_label,          '#94a3b8', '#475569'),
       ] %}
-        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}" style="--c:{{ cor }};--ci:{{ ink }}">
+        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}"{% if key == 'won' %} data-drill-val="{{ fifth_cat }}"{% endif %} style="--c:{{ cor }};--ci:{{ ink }}">
           <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
         </button>
       {% endfor %}

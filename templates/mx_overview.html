@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Overview · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Sales MX · Overview</h1>
+<div class="page-sub">
+  <b>{{ range_label }}</b> · time de <b>{{ leader }}</b> · {{ rows|length }} vendedores ·
+  todos os valores em <b>ARR US$</b> (anual)
+</div>
+
+{# A conversão é o ponto mais frágil desta tela: 9% dos deals do MX não estão em
+   dólar, e a taxa que existe no warehouse é FIXA, não cotação por data. Dizer
+   isso aqui é mais barato que alguém descobrir depois conferindo no HubSpot. #}
+<div class="mx-fx-note">
+  <b>Moeda.</b> Deal em peso ou real é convertido pela tabela de câmbio do BI
+  (<i>currency_conversion_rates</i>): MXN 0,05 e BRL 0,20 por dólar. Essa tabela
+  <b>não tem série por data</b> — é taxa fixa, não a cotação do dia do deal. O
+  valor como foi digitado no HubSpot aparece no drill, ao lado do ARR.
+</div>
+
+{% macro usd(v) -%}
+US$ {{ '{:,.0f}'.format(v|float|round|int).replace(',', '.') }}
+{%- endmacro %}
+
+<div class="stats-strip">
+  <div class="stat c-blue">
+    <div class="stat-l">Realizado <span class="stat-q">· ARR US$ · fonte BI</span></div>
+    <div class="stat-v">{{ usd(total_real) }}</div>
+    <div class="stat-s">new_arr_in_usd da curada</div>
+  </div>
+  <div class="stat c-slate" data-drill="{{ url_for('mx_overview_deals', kind='won', **ctx.filters) }}"
+       title="Explodir os deals ganhos do funil">
+    <div class="stat-l">Ganhos no funil <span class="stat-q">· deal a deal</span></div>
+    <div class="stat-v">{{ usd(total_funil) }}</div>
+    <div class="stat-s">{{ total_deals }} deal{{ 's' if total_deals != 1 }} · ticket {{ usd(total_ticket) }}</div>
+  </div>
+  <div class="stat c-slate" data-drill="{{ url_for('mx_overview_deals', kind='pipe', **ctx.filters) }}"
+       title="Explodir o pipeline aberto">
+    <div class="stat-l">Pipeline aberto <span class="stat-q">· close date na janela</span></div>
+    <div class="stat-v">{{ usd(total_pipe) }}</div>
+    <div class="stat-s">{{ pipe_deals }} deal{{ 's' if pipe_deals != 1 }}</div>
+  </div>
+  <div class="stat is-total">
+    <div class="stat-l">Meta do time <span class="stat-q">· ARR US$</span></div>
+    <div class="stat-v">{% if total_quota %}{{ usd(total_quota) }}{% else %}—{% endif %}</div>
+    <div class="stat-s">
+      {%- if total_att is not none %}{{ (total_att*100)|round|int }}% de atingimento
+      {%- else %}sem meta cadastrada no período{% endif %}
+    </div>
+  </div>
+</div>
+
+{% if divergencia|abs > 1 %}
+{# Os dois números existem e discordam. Escondê-la seria escolher um lado sem
+   base; mostrá-la é o que faz alguém ir reconciliar com o BI. #}
+<div class="mx-warn">
+  <b>As duas fontes de realizado discordam em {{ usd(divergencia|abs) }}.</b>
+  O card <i>Realizado</i> usa a curada do BI, que é contra o que a diretoria
+  compara; <i>Ganhos no funil</i> soma os closed-won deal a deal e é o que o
+  drill explode. Os deals do funil conferem (todos closed-won, com PO no período),
+  então a diferença é de <b>regra de atribuição</b>, não de dado — precisa ser
+  reconciliada com o time de BI antes de escolher um número só.
+</div>
+{% endif %}
+
+{% if pipe_sem_data_deals %}
+{# Mesmo problema do Pipeline Total do BR: deal sem close date não cai em janela
+   nenhuma. Contar quantos ficaram de fora evita o total parecer menor do que é. #}
+<p class="ph" style="margin:14px 2px 0">
+  <b>{{ pipe_sem_data_deals }}</b> deal{{ 's' if pipe_sem_data_deals != 1 }} aberto{{ 's' if pipe_sem_data_deals != 1 }}
+  ({{ usd(pipe_sem_data) }} ARR) não têm close date no HubSpot e
+  ficaram fora do card de pipeline — a janela de datas não consegue classificá-los.
+</p>
+{% endif %}
+
+{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
+{{ rank_chart(rank, 'Resultado dos vendedores', sub='realizado × meta · % atingimento · ARR US$',
+              currency=true, usd=true, legend_real='Realizado', legend_quota='Meta',
+              tip_real='Vendido', tip_quota='Meta', tip_line='Atingimento', toggle=true) }}
+{% if rank.rows %}{{ rank_chart_script() }}{% endif %}
+
+{% if sem_quota %}
+<p class="ph" style="margin:-6px 2px 18px">
+  Sem meta cadastrada na tabela do BI neste trimestre: <b>{{ sem_quota|join(' · ') }}</b>.
+  Aparecem com barra de meta zerada e sem % de atingimento — é ausência de
+  cadastro, não meta batida.
+</p>
+{% endif %}
+
+<div class="panel">
+  <h2>Detalhe por vendedor</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Vendedor</th><th>Segmento</th>
+          <th class="n">Realizado <span class="th-q">· BI</span></th>
+          <th class="n">Ganhos no funil</th><th class="n">Deals</th>
+          <th class="n grp">Meta</th><th class="n">Atingimento</th>
+          <th class="n grp">Pipeline aberto</th><th class="n">Deals no pipe</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td class="first" data-drill="{{ url_for('mx_overview_deals', name=r.account_executive, kind='won', **ctx.filters) }}"
+              title="Explodir os deals ganhos de {{ r.display }}"><b>{{ r.display }}</b></td>
+          <td>{{ r.tier }}</td>
+          <td class="n"><b>{{ usd(r.realized) }}</b>{% if not r.tem_oficial %} <span class="th-q">(funil)</span>{% endif %}</td>
+          <td class="n">{{ usd(r.funil) }}</td>
+          <td class="n">{{ r.deals|intg }}</td>
+          <td class="n grp">{% if r.has_quota %}{{ usd(r.quota) }}{% else %}—{% endif %}</td>
+          <td class="n">{% if r.attainment is not none %}{{ (r.attainment*100)|round|int }}%{% else %}—{% endif %}</td>
+          <td class="n grp" data-drill="{{ url_for('mx_overview_deals', name=r.account_executive, kind='pipe', **ctx.filters) }}"
+              title="Explodir o pipeline de {{ r.display }}">{{ usd(r.pipe) }}</td>
+          <td class="n">{{ r.pipe_deals|intg }}</td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td><td></td>
+          <td class="n"><b>{{ usd(total_real) }}</b></td>
+          <td class="n">{{ usd(total_funil) }}</td>
+          <td class="n"><b>{{ total_deals|intg }}</b></td>
+          <td class="n grp"><b>{% if total_quota %}{{ usd(total_quota) }}{% else %}—{% endif %}</b></td>
+          <td class="n"><b>{% if total_att is not none %}{{ (total_att*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          <td class="n grp"><b>{{ usd(total_pipe) }}</b></td>
+          <td class="n">{{ pipe_deals|intg }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% include "_drilldown.html" %}
+
+<style>
+  .mx-fx-note{margin:0 0 18px;padding:11px 15px;border-radius:10px;font-size:12.5px;
+    line-height:1.6;border:1px solid #2563EB44;color:var(--muted);
+    background:color-mix(in srgb,#2563EB 6%,transparent)}
+  .mx-fx-note b{color:var(--fg)}
+  .mx-warn{margin:16px 0 0;padding:11px 15px;border-radius:10px;font-size:12.5px;
+    line-height:1.6;border:1px solid #F59E0B55;color:var(--muted);
+    background:color-mix(in srgb,#F59E0B 7%,transparent)}
+  .mx-warn b{color:var(--fg)}
+  .th-q{font-weight:400;color:var(--muted);font-size:10.5px}
+</style>
+{% endblock %}

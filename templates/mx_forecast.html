@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Sales MX · Forecast · pepeuhacker{% endblock %}
+{% macro usd(v) -%}
+US$ {{ '{:,.0f}'.format(v|float|round|int).replace(',', '.') }}
+{%- endmacro %}
+
+{% block content %}
+<h1>Sales MX · Forecast</h1>
+<div class="page-sub">
+  Close date em <b>{{ range_label }}</b> · time de <b>{{ leader }}</b> ·
+  ponderado pelo peso da <i>forecast category</i> (já com fator de correção de
+  {{ ((1-dir_factor)*100)|round|int }}%) · valores em <b>ARR US$</b>
+</div>
+
+{# A cobertura é o número mais importante desta tela, não o ponderado. Com 92%
+   do pipe sem categoria no HubSpot, o ponderado descreve um oitavo do funil —
+   mostrá-lo como "o forecast" seria enganoso, então o aviso vem ANTES. #}
+{% if cobertura < 0.9 %}
+<div class="mx-warn">
+  <b>O ponderado cobre {{ (cobertura*100)|round|int }}% do pipeline do período.</b>
+  {{ usd(sem_peso) }} de {{ usd(bruto) }} estão <b>sem forecast category</b> no
+  HubSpot e não entram na conta — não existe peso pra aplicar. Isso é preenchimento
+  no HubSpot, não cálculo do dashboard: enquanto o time não classificar os deals,
+  o ponderado descreve só a fatia classificada.
+</div>
+{% endif %}
+
+<div class="stats-strip">
+  <div class="stat c-slate">
+    <div class="stat-l">Pipeline bruto <span class="stat-q">· close date no período</span></div>
+    <div class="stat-v">{{ usd(bruto) }}</div>
+    <div class="stat-s">{{ deals|intg }} deal{{ 's' if deals != 1 }}</div>
+  </div>
+  <div class="stat c-blue">
+    <div class="stat-l">Forecast ponderado</div>
+    <div class="stat-v">{{ usd(ponderado) }}</div>
+    <div class="stat-s">cobre {{ (cobertura*100)|round|int }}% do pipe do período</div>
+  </div>
+  <div class="stat c-green">
+    <div class="stat-l">Realizado <span class="stat-q">· ganhos no funil</span></div>
+    <div class="stat-v">{{ usd(realizado) }}</div>
+  </div>
+  <div class="stat is-total">
+    <div class="stat-l">Projeção <span class="stat-q">· realizado + ponderado</span></div>
+    <div class="stat-v">{{ usd(projecao) }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Composição do pipeline por forecast category</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Categoria</th><th class="n">Deals</th><th class="n">Bruto</th>
+        <th class="n">Ponderado</th><th class="n">% do pipe</th>
+        <th style="width:26%">Peso no forecast</th>
+      </tr></thead>
+      <tbody>
+      {% set mx = (linhas|map(attribute='arr')|max) or 1 %}
+      {% for c in linhas %}
+        <tr>
+          <td class="first"><span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }}</td>
+          <td class="n">{{ c.deals|intg }}</td>
+          <td class="n">{{ usd(c.arr) }}</td>
+          {# "—" e não zero: sem categoria não é peso 0, é ausência de peso. #}
+          <td class="n"><b>{% if c.ponderado is not none %}{{ usd(c.ponderado) }}{% else %}—{% endif %}</b></td>
+          <td class="n">{{ (c.share*100)|round|int }}%</td>
+          <td><div style="height:11px;border-radius:6px;background:{{ c.color }};min-width:2px;width:{{ (c.arr/mx*100)|round(1) }}%"></div></td>
+        </tr>
+      {% endfor %}
+        <tr style="border-top:2px solid var(--border)">
+          <td class="first"><b>Total</b></td>
+          <td class="n"><b>{{ deals|intg }}</b></td>
+          <td class="n"><b>{{ usd(bruto) }}</b></td>
+          <td class="n"><b>{{ usd(ponderado) }}</b></td>
+          <td class="n"><b>100%</b></td><td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<style>
+  .mx-warn{margin:0 0 18px;padding:11px 15px;border-radius:10px;font-size:12.5px;
+    line-height:1.6;border:1px solid #F59E0B55;color:var(--muted);
+    background:color-mix(in srgb,#F59E0B 7%,transparent)}
+  .mx-warn b{color:var(--fg)}
+</style>
+{% endblock %}

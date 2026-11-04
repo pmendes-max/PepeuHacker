@@ -1,0 +1,92 @@
+{# Estilos e comportamento compartilhados pelas telas de histórico semanal
+   (Histórico PoP e Histórico do Forecast). Vive num partial porque as duas
+   telas usam os MESMOS 4 painéis — small multiples, heatmap, legenda que
+   liga/desliga canal — e duas cópias divergiriam no primeiro ajuste de cor. -#}
+<style>
+  .hist-chips{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px}
+  .hist-bridge{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;
+    margin:-8px 0 24px;padding:12px 16px;border:1px solid var(--border);
+    border-radius:10px;background:var(--surface);font-size:13px;color:var(--muted)}
+  .hist-bridge b{color:var(--fg)}
+  .hb-lbl{font-weight:600;color:var(--fg)}
+  .hb-res{border-bottom:1px dotted var(--muted);cursor:help}
+  .h2-sub{font-size:13px;font-weight:400;color:var(--muted)}
+
+  /* Toggle da legenda: esconde o canal no SVG. Espelha o comportamento da PoP,
+     mas aqui o alvo é <rect>, então não dá pra usar display:none via classe do
+     contêiner — o seletor casa o canal ativo pelo data-channels do .dchart. */
+  .hist-seg{transition:opacity .12s}
+  .dchart[data-channels] .hist-seg{display:none}
+  {% for ch in (hist_channels or ['novo','cresceu','encolheu','lost']) %}
+  .dchart[data-channels~="{{ ch }}"] .hist-seg[data-ch="{{ ch }}"]{display:inline}
+  {% endfor %}
+  .hist-seg:hover{opacity:.75}
+  .hist-leg-net{display:inline-flex;align-items:center;gap:7px;font-size:12px;
+    color:var(--muted);font-weight:600;margin-left:4px}
+  .hist-leg-tick{width:14px;height:2.5px;border-radius:2px;background:var(--fg);display:inline-block}
+
+  /* ---- Small multiples ---- */
+  .sm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
+  .sm-card{border:1px solid var(--border);border-radius:10px;padding:12px 13px 10px;
+    background:var(--surface)}
+  .sm-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;
+    margin-bottom:8px}
+  .sm-name{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .sm-total{font-size:12.5px;font-weight:800;letter-spacing:-.2px;white-space:nowrap}
+  .sm-total.is-pos{color:#15803d}
+  .sm-total.is-neg{color:#dc2626}
+  .sm-svg{display:block;overflow:visible}
+  .sm-svg rect:hover{opacity:.7}
+  .sm-foot{display:flex;justify-content:space-between;gap:8px;margin-top:7px;
+    font-size:11px;color:var(--muted);white-space:nowrap}
+
+  /* ---- Heatmap ---- */
+  .hm{border-collapse:collapse;font-size:12px;width:100%}
+  .hm th,.hm td{padding:5px 8px;white-space:nowrap;text-align:right}
+  .hm thead th{font-weight:600;color:var(--muted);border-bottom:1px solid var(--border);
+    font-size:11px}
+  .hm .hm-name{text-align:left;font-weight:600;position:sticky;left:0;
+    background:var(--surface);z-index:1;max-width:170px;overflow:hidden;
+    text-overflow:ellipsis}
+  .hm tbody tr:hover .hm-name{background:var(--surface-2)}
+  /* --a = intensidade (0..1) do saldo da célula sobre o maior |saldo| da matriz.
+     color-mix mantém uma cor só por sinal e varia só a saturação, então a
+     leitura é "quanto", não "qual categoria". */
+  .hm-c{font-variant-numeric:tabular-nums;cursor:pointer;border-radius:4px;
+    color:var(--muted)}
+  .hm-c.is-pos{background:color-mix(in srgb,#15803d calc(var(--a) * 72%),transparent);
+    color:var(--fg)}
+  .hm-c.is-neg{background:color-mix(in srgb,#dc2626 calc(var(--a) * 72%),transparent);
+    color:var(--fg)}
+  .hm-c:hover{outline:2px solid var(--blue,#2563EB);outline-offset:-2px}
+  .hm-tot{font-weight:800;border-left:1px solid var(--border);font-variant-numeric:tabular-nums}
+  .hm-tot.is-pos{color:#15803d}
+  .hm-tot.is-neg{color:#dc2626}
+  .hm-note{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);
+    font-size:12px;color:var(--muted);line-height:1.6}
+</style>
+
+{% include "_drilldown.html" %}
+
+<script>
+(function(){
+  "use strict";
+  // Legenda liga/desliga os canais do gráfico de movimento — só reescreve
+  // data-channels, e o CSS acima faz o resto (mesma mecânica da tela PoP).
+  document.querySelectorAll('.dchart[data-chart^="hist-"]').forEach(function(chart){
+    // Canais = os botões da legenda (o Histórico por quarter tem 6, os outros 4).
+    var channels = Array.prototype.map.call(
+      chart.querySelectorAll('.leg-toggle'), function(b){ return b.dataset.ch; });
+    chart.dataset.channels = channels.join(' ');
+    chart.querySelectorAll('.leg-toggle').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        btn.classList.toggle('is-on');
+        var active = Array.prototype.map.call(
+          chart.querySelectorAll('.leg-toggle.is-on'), function(b){ return b.dataset.ch; });
+        chart.dataset.channels = active.join(' ');
+      });
+    });
+  });
+})();
+</script>
