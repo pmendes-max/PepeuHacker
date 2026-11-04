@@ -144,6 +144,53 @@
   </div>
 </div>
 
+{# ------- Perdidos no Stage 1 e no Stage 2 (pedido de 04/11/2026) -------
+   Por AE, duas colunas: S1 = perdido sem nunca chegar ao Stage 2 (Qualifying);
+   S2 = perdido depois do Stage 2 e antes do Scoping. Cada coluna empilha os
+   gerados pelo próprio AE (azul) e os recebidos (verde). Coorte por CRIAÇÃO no
+   período, igual ao resto da página; a regra mora em `_lost_stage_of`. #}
+<div class="panel">
+  <h2>Perdidos no Stage 1 e no Stage 2
+    <span style="font-size:13px;font-weight:400;color:var(--muted)">· S1 = Scheduled · S2 = Qualifying · criados no período</span>
+  </h2>
+  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="lost-s12" data-keep-order="1">
+    <div class="legend legend-toggle">
+      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq,auto_exp" style="--c:#2563EB">
+        <span class="leg-dot" style="background:#2563EB"></span>Gerados pelo próprio AE
+      </button>
+      <button type="button" class="leg-toggle is-on" data-ch="rcv" data-drill-val="rcv_exp,rcv_outbound,rcv_inbound" style="--c:#10B981;--ci:#047857">
+        <span class="leg-dot" style="background:#10B981"></span>Recebidos pelo AE
+      </button>
+    </div>
+    {% set ae_lost = by_ae|sort(attribute='lost_total', reverse=true)|list %}
+    <div class="vbars" style="--count:{{ (ae_lost|length) * 2 }}">
+      {% for r in ae_lost %}
+        {% for k in (1, 2) %}
+          {% set lo = r['lost%d_own'|format(k)]|int %}
+          {% set lr = r['lost%d_rcv'|format(k)]|int %}
+          {% set tot = lo + lr %}
+          {% set h_pct = (tot / max_lost * 100) if max_lost else 0 %}
+          {% set seg_url = url_for('demand_deals', name=r.account_executive, grain='ae', date_from=range_from, date_to=range_to, lost_stage=k) %}
+          <div class="vbar{% if tot <= 0 %} is-empty{% endif %}"
+               data-acq="{{ lo }}" data-rcv="{{ lr }}" data-name="{{ r.account_executive }} · S{{ k }}"
+               {% if tot > 0 %}data-drill="{{ seg_url }}" data-drill-title="{{ r.account_executive }} · perdidos no Stage {{ k }}"{% endif %}
+               {% if k == 2 %}style="margin-right:10px"{% endif %}>
+            <div class="vbar-tip"></div>
+            <div class="vbar-track" style="--h:{{ h_pct }}%">
+              <div class="vbar-val">{{ tot|intg }}</div>
+              <div class="vbar-col">
+                {% if lo > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ lo }}" data-drill="{{ seg_url }}&bucket=auto_acq,auto_exp" data-drill-title="{{ r.account_executive }} · S{{ k }} · gerados pelo próprio AE"></div>{% endif %}
+                {% if lr > 0 %}<div class="vbar-seg" data-ch="rcv" style="background:#10B981;flex:{{ lr }}" data-drill="{{ seg_url }}&bucket=rcv_exp,rcv_outbound,rcv_inbound" data-drill-title="{{ r.account_executive }} · S{{ k }} · recebidos"></div>{% endif %}
+              </div>
+            </div>
+            <div class="vbar-name">{{ r.account_executive }} · S{{ k }}</div>
+          </div>
+        {% endfor %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
 {# ------- Chart 2: Recebidas pelo AE — split Inbound/Outbound/Expansão ------- #}
 <div class="panel">
   <h2>Recebidas pelo AE</h2>
@@ -188,53 +235,6 @@
           </div>
           <div class="vbar-name">{{ r.account_executive }}</div>
         </div>
-      {% endfor %}
-    </div>
-  </div>
-</div>
-
-{# ------- Perdidos no Stage 1 e no Stage 2 (pedido de 04/11/2026) -------
-   Por AE, duas colunas: S1 = perdido sem nunca chegar ao Stage 2 (Qualifying);
-   S2 = perdido depois do Stage 2 e antes do Scoping. Cada coluna empilha os
-   gerados pelo próprio AE (azul) e os recebidos (verde). Coorte por CRIAÇÃO no
-   período, igual ao resto da página; a regra mora em `_lost_stage_of`. #}
-<div class="panel">
-  <h2>Perdidos no Stage 1 e no Stage 2
-    <span style="font-size:13px;font-weight:400;color:var(--muted)">· S1 = Scheduled · S2 = Qualifying · criados no período</span>
-  </h2>
-  <div class="dchart" data-drill-chips="bucket" data-channels="acq rcv" data-chart="lost-s12" data-keep-order="1">
-    <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq,auto_exp" style="--c:#2563EB">
-        <span class="leg-dot" style="background:#2563EB"></span>Gerados pelo próprio AE
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="rcv" data-drill-val="rcv_exp,rcv_outbound,rcv_inbound" style="--c:#10B981;--ci:#047857">
-        <span class="leg-dot" style="background:#10B981"></span>Recebidos pelo AE
-      </button>
-    </div>
-    {% set ae_lost = by_ae|sort(attribute='lost_total', reverse=true)|list %}
-    <div class="vbars" style="--count:{{ (ae_lost|length) * 2 }}">
-      {% for r in ae_lost %}
-        {% for k in (1, 2) %}
-          {% set lo = r['lost%d_own'|format(k)]|int %}
-          {% set lr = r['lost%d_rcv'|format(k)]|int %}
-          {% set tot = lo + lr %}
-          {% set h_pct = (tot / max_lost * 100) if max_lost else 0 %}
-          {% set seg_url = url_for('demand_deals', name=r.account_executive, grain='ae', date_from=range_from, date_to=range_to, lost_stage=k) %}
-          <div class="vbar{% if tot <= 0 %} is-empty{% endif %}"
-               data-acq="{{ lo }}" data-rcv="{{ lr }}" data-name="{{ r.account_executive }} · S{{ k }}"
-               {% if tot > 0 %}data-drill="{{ seg_url }}" data-drill-title="{{ r.account_executive }} · perdidos no Stage {{ k }}"{% endif %}
-               {% if k == 2 %}style="margin-right:10px"{% endif %}>
-            <div class="vbar-tip"></div>
-            <div class="vbar-track" style="--h:{{ h_pct }}%">
-              <div class="vbar-val">{{ tot|intg }}</div>
-              <div class="vbar-col">
-                {% if lo > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ lo }}" data-drill="{{ seg_url }}&bucket=auto_acq,auto_exp" data-drill-title="{{ r.account_executive }} · S{{ k }} · gerados pelo próprio AE"></div>{% endif %}
-                {% if lr > 0 %}<div class="vbar-seg" data-ch="rcv" style="background:#10B981;flex:{{ lr }}" data-drill="{{ seg_url }}&bucket=rcv_exp,rcv_outbound,rcv_inbound" data-drill-title="{{ r.account_executive }} · S{{ k }} · recebidos"></div>{% endif %}
-              </div>
-            </div>
-            <div class="vbar-name">{{ r.account_executive }} · S{{ k }}</div>
-          </div>
-        {% endfor %}
       {% endfor %}
     </div>
   </div>
