@@ -2743,7 +2743,11 @@ def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     """Pivot deal × estágio → timestamp da 1ª entrada, uma coluna por número de
     estágio (s1..s7). Base das coortes de conversão do funil."""
     raw = bq.funnel_stage_entries(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "funnel_entries_v6", _parquet_mtime("funnel_stage_entries_v5"))
+    # mtime do parquet DO PAÍS (`_pk`): com o nome do BR, o frame do México só
+    # era invalidado quando o parquet do Brasil mudava (mesmo bug já corrigido
+    # no `_get_demand_deals`).
+    key = (_pl(), "funnel_entries_v6",
+           _parquet_mtime(bq._pk("funnel_stage_entries_v5", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3072,7 +3076,11 @@ def _get_visits(force: bool = False) -> pd.DataFrame:
     MESMA atribuição de time do resto do app (snapshot ae_performance + roster Q3).
     Colunas: account_executive, start_date, category ('field'|'ia_center'), leader, region."""
     raw = bq.visits_raw(force_refresh=force)
-    key = (_pl(), "visits", _parquet_mtime("visits_raw_v2"))
+    # O nome do parquet sai de bq.VISITS_KEY: a chave apontava pra
+    # `visits_raw_v2` depois que a query passou a gravar `visits_raw_v3` — o
+    # arquivo não existia, o mtime era sempre 0 e o frame do 1º acesso ficava
+    # em memória até o processo reiniciar.
+    key = (_pl(), "visits", _parquet_mtime(bq.VISITS_KEY))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3782,7 +3790,8 @@ def _get_pipeline_deals(force: bool = False) -> pd.DataFrame:
     """Todos os deals do funil Sales BR com bucket (early/late/other), is_open,
     hs_closedate (close date do HubSpot raw) e leader/region. Memoizado por mtime."""
     raw = bq.pipeline_deals_raw(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "pipeline_deals", _parquet_mtime("pipeline_deals_raw_v6"))
+    key = (_pl(), "pipeline_deals",                  # `_pk`: ver _get_funnel_entries
+           _parquet_mtime(bq._pk("pipeline_deals_raw_v6", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -3818,7 +3827,8 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
     ponderado (amount × pct da categoria). leader/region do snapshot mais recente
     de ae_performance. Memoizado por mtime do parquet."""
     raw = bq.forecast_deals_raw(force_refresh=force, pipeline=_pl())
-    key = (_pl(), "forecast_deals_v2", _parquet_mtime("forecast_deals_raw_v6"))
+    key = (_pl(), "forecast_deals_v2",               # `_pk`: ver _get_funnel_entries
+           _parquet_mtime(bq._pk("forecast_deals_raw_v6", _pl())))
     if not force:
         with _DATA_CACHE_LOCK:
             cached = _DATA_CACHE.get(key)
@@ -14375,15 +14385,34 @@ def on_error(e):
     return f"<pre style='padding:20px'>{traceback.format_exc()}</pre>", 500
 
 
-def _warm_all(force: bool = False):
+def _warm_all(force: bool = False, extras: bool = True):
     """Aquece os caches dos dois níveis (parquet + memória). force=True re-consulta
     o BQ e reaquece a memória (usado pelo refresher). Aquece cada dataset isolado
-    pra que uma falha não impeça os demais."""
-    def _try(fn, *a, **kw):
-        try:
-            fn(*a, **kw)
-        except Exception as e:  # noqa: BLE001 — best-effort por dataset
-            print(f"pepeuhacker · warm {getattr(fn,'__name__',fn)} falhou: {e}", flush=True)
+    pra que uma falha não impeça os demais.
+
+    Roda dentro de um escopo de force (`bq.begin_force_scope`): vários loaders
+    pedem `ae_performance` com force=True, e sem o escopo cada volta pagava 5
+    queries iguais no BigQuery. `extras=False` deixa de fora o estado vivo que
+    não é do núcleo (ver `_warm_extras`) — é o que o boot usa, com a porta ainda
+    fechada."""
+    bq.begin_force_scope()
+    try:
+        _warm_core(force)
+        if extras:
+            _warm_extras(force)
+    finally:
+        bq.end_force_scope()
+
+
+def _warm_try(fn, *a, **kw):
+    try:
+        fn(*a, **kw)
+    except Exception as e:  # noqa: BLE001 — best-effort por dataset
+        print(f"pepeuhacker · warm {getattr(fn,'__name__',fn)} falhou: {e}", flush=True)
+
+
+def _warm_core(force: bool) -> None:
+    _try = _warm_try
     _try(_get_clean_ae_perf, force=force)
     _try(_get_ae_perf_with_managers, force=force)
     _try(_get_demand_deals, force=force)
@@ -14395,19 +14424,47 @@ def _warm_all(force: bool = False):
     # que não muda de hora em hora. Ela popula sozinha no 1º acesso à aba, com
     # TTL de 6h (ver LEGAL_MAIL_TTL).
     _try(bq.legal_deals_raw, force_refresh=force)
-    # /confirm é live BQ (cache 5min) — aquece o range default da rota
-    _try(bq.confirm_totals,
-         _quarter_start_of(date(2025, 4, 1)).isoformat(),
-         _quarter_start_of(date(2026, 1, 31)).isoformat(),
-         force_refresh=force)
+    # `bq.confirm_totals` saiu daqui em 11/2026: não existe mais rota /confirm
+    # nem outro chamador — era uma query paga em todo boot e em toda volta do
+    # refresher pra aquecer um cache que ninguém lia.
+
+
+def _warm_extras(force: bool) -> None:
+    """O resto do ESTADO VIVO (estágio/close date) que as telas leem: Pipeline
+    Total, Inatividade/Stale, funil e visitas. Antes ficavam fora do warm, e o
+    1º usuário depois de cada mudança da fonte pagava o rebuild (e, com o parquet
+    vencido, via o dado velho do stale-while-revalidate).
+
+    México: SEM force, de propósito. Cada chave do MX é uma query a mais no
+    BigQuery a cada disparo do gate, pra um time que abre a tela poucas vezes;
+    sem force, o warm só remonta os frames em memória e, se o parquet já venceu,
+    dispara o refresh em background (o mesmo que a 1ª visita faria) — nenhuma
+    query síncrona, nenhum job se o parquet ainda está no TTL."""
+    _try = _warm_try
+    _try(bq.pipeline_total_raw, force_refresh=force)
+    _try(bq.pipeline_stalled, force_refresh=force)
+    _try(bq.pipeline_activity, force_refresh=force)
+    _try(_get_funnel_entries, force=force)
+    _try(_get_visits, force=force)
+    with app.test_request_context("/mx/pipeline"):
+        _try(bq.mx_deals_raw)
+        _try(_get_pipeline_deals)
+        _try(_get_forecast_deals)
 
 
 def _prewarm():
     """Carrega caches em memória ao subir. Sem isso, o primeiro request da
     sessão paga ~50-150ms (parquet read + overrides) ou ~6-11s (BQ se parquet
-    expirou). Pré-aquece silenciosamente — falha não impede subir."""
-    _warm_all(force=False)
+    expirou). Pré-aquece silenciosamente — falha não impede subir.
+
+    Só o núcleo roda antes de abrir a porta: o boot já leva ~3,5 min, perto do
+    probe de inicialização do Cloud Run (240 s), e cada query a mais aqui é
+    risco de crash loop. Os extras sobem numa thread logo depois."""
+    _warm_all(force=False, extras=False)
     print("pepeuhacker · cache pré-aquecido", flush=True)
+
+    threading.Thread(target=_warm_extras, args=(False,), name="warm-extras",
+                     daemon=True).start()
 
 
 def _access_urls():
@@ -14510,8 +14567,8 @@ def _snapshot_forecast_midnight() -> None:
 
 def _midnight_loop() -> None:
     """Dorme até a próxima 00:00 BRT e tira a foto. Laço próprio, e não o
-    `_refresh_loop`: aquele gira de 15 em 15 min e pula volta quando o
-    reaquecimento demora, então a foto sairia em qualquer ponto até 00h15+ — e o
+    `_refresh_loop`: aquele gira de 5 em 5 min e pula volta quando o
+    reaquecimento demora, então a foto sairia em qualquer ponto até 00h05+ — e o
     DoD promete meia-noite. A 1ª chamada, no boot, cobre um deploy que caia
     entre 00h e 02h."""
     _snapshot_forecast_midnight()
@@ -14587,9 +14644,10 @@ def source_freshness() -> dict:
     }
 
 
-def _refresh_loop(interval: int = 900):
-    """Reaquece os caches principais a cada `interval`s — 15 min desde
-    14/09/2026 (antes: 45), pedido do Pedro pra operar o fim de trimestre.
+def _refresh_loop(interval: int = 300, last_src: float = 0.0):
+    """Reaquece os caches principais a cada `interval`s — 5 min desde 11/2026
+    (15 desde 14/09/2026; antes, 45). O gate é metadado, 0 byte, então olhar
+    mais vezes não custa nada; só reaquece de fato quando a fonte mudou.
 
     O laço é DISPARADO POR MUDANÇA, não por relógio: a cada volta pergunta ao
     BigQuery quando a tabela de deals do HubSpot foi gravada pela última vez
@@ -14597,7 +14655,13 @@ def _refresh_loop(interval: int = 900):
     queries caras se a fonte de fato mudou. Por que assim: a ingestão do HubSpot
     roda de ~2 em 2 horas, então um ciclo cego de 15 min pagaria 8 rodadas de
     BigQuery pra reescrever parquet idêntico. Com o gate, o dado novo chega à
-    tela em no máximo 15 min e o custo fica no mesmo patamar do ciclo de 45.
+    tela em no máximo 5 min (mais a duração do warm) e o custo fica no mesmo
+    patamar do ciclo de 45.
+
+    `last_src` vem do __main__, lido ANTES do `_prewarm`: começando em 0, a 1ª
+    volta sempre achava "fonte nova" e refazia o warm inteiro com force=True
+    logo depois do prewarm ter acabado de buscar tudo — 11 jobs no BigQuery a
+    mais em todo boot, concorrendo com os primeiros requests.
 
     Junto com o stale-while-revalidate do bq.query, nenhuma visita — nem a
     primeira do dia — paga o round-trip do BigQuery.
@@ -14606,7 +14670,9 @@ def _refresh_loop(interval: int = 900):
     sempre, então não precisa de um 2º agendador só pra isso, e a gravação é
     idempotente por domingo."""
     _snapshot_forecast_week()          # 1ª tentativa já no boot
-    last_src = 0.0
+    if last_src:
+        with _FRESH_LOCK:              # o prewarm acabou de aquecer tudo
+            _FRESH["warmed_epoch"] = time.time()
     while True:
         try:
             # Duas perguntas diferentes, de propósito (ver as docstrings das duas
@@ -15425,8 +15491,12 @@ if __name__ == "__main__":
     # são eles que gravam as fotos do forecast no BigQuery, e quem grava é o
     # serviço principal — duas instâncias gravando a mesma foto não ajuda ninguém.
     if os.environ.get("PEPEU_PAPEL") != "api":
+        # Marca da fonte ANTES do prewarm (ver `_refresh_loop`): o refresher só
+        # reaquece se ela mudar daqui pra frente.
+        _src0 = bq.hs_source_last_modified()
         _prewarm()
-        threading.Thread(target=_refresh_loop, name="cache-refresher", daemon=True).start()
+        threading.Thread(target=_refresh_loop, kwargs={"last_src": _src0},
+                         name="cache-refresher", daemon=True).start()
         threading.Thread(target=_midnight_loop, name="forecast-midnight", daemon=True).start()
     from waitress import serve
     # HOST: 127.0.0.1 (padrão, só local) ou 0.0.0.0 (exposto na rede/VPN p/ o time

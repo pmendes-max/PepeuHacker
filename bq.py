@@ -292,9 +292,20 @@ HS_DEALS_VIEW = "tractian-bi.pepeuhacker.hubspot_deals_live"
 # `pepeuhacker.hubspot_deals_live`). Isto aqui serve SÓ ao gate do reaquecimento,
 # que pergunta de metadado — 0 byte — se alguma delas foi gravada desde a última
 # volta. O selo das telas não sai daqui: ver `hs_data_last_modified`.
+#
+# 11/2026: entram a `hubspot_deals_mcp` — desde 13/10 é a ÚNICA fonte viva da view
+# (legada e nekt pararam em ~11/10), e sem ela o gate nunca disparava: em
+# simulação, 8 voltas (2 h) com só a mcp mudando deram 0 reaquecimento depois do
+# boot — e as duas tabelas curadas do BI, pra que um `dbt run` (valor, dono, PO,
+# realizado) também reaqueça a tela sem esperar visita. Tudo no mesmo projeto e
+# na mesma região (as queries do app já juntam esses datasets), então o UNION
+# de `__TABLES__` continua sendo UMA consulta de metadado, 0 byte.
 HS_SOURCE_TABLES = (
     "tractian-bi.hubspot.hubspot_deals",
     "tractian-bi.hubspot_nekt.hubspot_deals_transformed",
+    "tractian-bi.pepeuhacker.hubspot_deals_mcp",
+    "tractian-bi.dbt_analytics_dev.int_adding_names_to_deals",
+    "tractian-bi.dbt_analytics_dev.account_executives_performance",
 )
 
 
@@ -337,8 +348,8 @@ def hs_data_last_modified() -> float:
     tabela. Metadado de gravação não sabe fazer isso (ver acima).
 
     Custa ~1,5 MB por chamada (uma coluna, ~40 mil linhas) — abaixo do mínimo de
-    cobrança do BigQuery. É chamado no máximo de 15 em 15 min, pelo refresher e
-    pela sonda de dev; não chame dentro de um request.
+    cobrança do BigQuery. É chamado no máximo de 5 em 5 min, pelo refresher, e de
+    15 em 15 pela sonda de dev; não chame dentro de um request.
 
     Devolve 0.0 se falhar, pelo mesmo motivo de `hs_source_last_modified`."""
     sql = f"SELECT UNIX_SECONDS(MAX(hs_lastmodifieddate)) FROM `{HS_DEALS_VIEW}`"
@@ -900,6 +911,12 @@ MOTION_HIST_SUFFIX_FROM = "0260416"
 MOTION_HIST_FROM = "2026-04-16"
 
 
+# Nome do parquet de visits num lugar só: o app monta a chave do cache em memória
+# com o mtime DESTE arquivo, e um bump de versão aqui que não chegasse lá
+# desligava a invalidação em silêncio (foi o que aconteceu no v2 → v3).
+VISITS_KEY = "visits_raw_v3"
+
+
 def visits_raw(force_refresh: bool = False) -> pd.DataFrame:
     """Visitas (objeto HubSpot `hubspot_visits`) por vendedor, nível-visita.
     Categoria por LOCAL da visita:
@@ -972,7 +989,7 @@ def visits_raw(force_refresh: bool = False) -> pd.DataFrame:
       FROM (SELECT * FROM by_owner UNION ALL SELECT * FROM by_participant)
     )
     """
-    return query(sql, cache_key="visits_raw_v3", force_refresh=force_refresh)
+    return query(sql, cache_key=VISITS_KEY, force_refresh=force_refresh)
 
 
 def pipeline_total_raw(pipeline: str = SALES_BR, force_refresh: bool = False) -> pd.DataFrame:

@@ -425,7 +425,7 @@
          vermelho (.is-stale) quando a fonte passa de 3h sem gravar. #}
       {% if ctx.freshness and ctx.freshness.ok %}
       <span class="fresh-seal {% if ctx.freshness.stale %}is-stale{% endif %}"
-            title="Deal mais recente que o HubSpot mandou: {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 15 em 15 min.">
+            title="Deal mais recente que o HubSpot mandou: {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 5 em 5 min.">
         {% if ctx.freshness.source_age_min < 60 %}
           dado de {{ ctx.freshness.source_age_min }} min atrás
         {% else %}
