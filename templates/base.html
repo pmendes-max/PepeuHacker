@@ -244,6 +244,31 @@
              subtítulo da página — um date-picker aqui só permitiria montar pares
              não-consecutivos e quebrar a comparação Early↔Late. --- #}
       {% if ctx.period_locked %}
+      {# --- Período em BOTÕES (Overview): ano + Q1..Q4 + FY --- #}
+      {% elif ctx.period_mode == 'qchips' %}
+      <div class="f-group qc-group">
+        <label>Período</label>
+        <div class="qc-row">
+          <select class="qc-year" aria-label="Ano" onchange="if(this.value)location.href=this.value">
+            {% for y in ctx.qc_years %}<option value="{{ y.url }}" {% if y.selected %}selected{% endif %}>{{ y.year }}</option>{% endfor %}
+          </select>
+          {% for c in ctx.qc_chips %}
+            <a class="qc-chip{% if c.key == 'FY' %} qc-fy{% endif %}{% if c.active %} is-on{% endif %}" href="{{ c.url }}"
+               title="{{ c.range }}"{% if c.active %} aria-current="true"{% endif %}>{{ c.label }}</a>
+          {% endfor %}
+          <span class="qc-range">{{ ctx.qc_label }}</span>
+        </div>
+      </div>
+      <style>
+        .qc-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+        .qc-group select.qc-year{width:auto;min-width:0;flex:0 0 auto;padding:7px 8px;border-radius:8px}
+        .qc-chip{display:inline-flex;align-items:center;padding:7px 13px;border:1px solid var(--line,#DFE4EB);border-radius:8px;
+          font-weight:600;font-size:13px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;background:var(--surface,#fff)}
+        .qc-chip:hover{background:var(--surface-2,#EEF2F8)}
+        .qc-chip.is-on{background:var(--blue,#2563EB);border-color:var(--blue,#2563EB);color:#fff}
+        .qc-chip.qc-fy{margin-left:6px}
+        .qc-range{font-size:12px;color:var(--muted,#5F6A7A);margin-left:6px;font-variant-numeric:tabular-nums;white-space:nowrap}
+      </style>
       {# --- Período: TRIMESTRAL nas abas que pedem série (Sales Overtime) --- #}
       {% elif ctx.period_mode == 'quarter' %}
       <div class="f-group">
