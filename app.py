@@ -4460,7 +4460,7 @@ def overview_deals():
             if carriers is not None:                # None = período sem meta (fora do Q3)
                 sel_v = sel_v[sel_v["account_executive"].isin(carriers)]
                 sel_h = sel_h[sel_h["account_executive"].isin(carriers)]
-        rows = _mk(sel_v, "Validado") + _mk(sel_h, "Em aprovação")
+        rows = _mk(sel_v, "Validado") + _mk(sel_h, "Em validação financeira")
         rows.sort(key=lambda x: x["data"], reverse=True)
         amount = float(sum(x["amount"] for x in rows))
         _titles = {"acq": "Deals de aquisição", "exp": "Deals de expansão",
@@ -4476,7 +4476,7 @@ def overview_deals():
             "columns": cols, "rows": rows,
         })
 
-    rows = _mk(won, "Validado") + _mk(hld, "Em aprovação")
+    rows = _mk(won, "Validado") + _mk(hld, "Em validação financeira")
     rows.sort(key=lambda x: x["data"], reverse=True)
     amount = float(sum(x["amount"] for x in rows))
     return jsonify({
