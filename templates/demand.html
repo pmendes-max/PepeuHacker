@@ -6,7 +6,18 @@
 
 {# ------- Chart 1: Geradas pelo próprio AE (auto) ------- #}
 <div class="panel">
-  <h2>Geradas pelo próprio AE</h2>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
+    <h2>Geradas pelo próprio AE{% if ctx.gr_lw_on %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· última semana fechada · meta 3 por AE</span>{% endif %}</h2>
+    {% if ctx.gr_lw_url %}
+    <a href="{{ ctx.gr_lw_url }}" class="lw-btn{% if ctx.gr_lw_on %} is-on{% endif %}"
+       title="{% if ctx.gr_lw_on %}Voltar ao período anterior{% else %}Ver a última semana fechada (seg–dom){% endif %}">↺ Última semana</a>
+    {% endif %}
+  </div>
+  <style>
+    .lw-btn{display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--blue,#2563EB);color:var(--blue,#2563EB);
+      border-radius:999px;padding:6px 12px;font-weight:600;font-size:13px;text-decoration:none;white-space:nowrap}
+    .lw-btn.is-on{background:var(--blue,#2563EB);color:#fff}
+  </style>
   <div class="dchart" data-drill-chips="bucket" data-channels="acq exp goal" data-chart="auto"
        data-color-acq="#2563EB" data-color-exp="#1E3A8A"
        data-goal-value="{{ weekly_goal }}">
@@ -88,53 +99,6 @@
             <div class="vbar-col">
               {% if sa > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#00A2C7;flex:{{ sa }}"></div>{% endif %}
               {% if se > 0 %}<div class="vbar-seg" data-ch="exp" style="background:#0B5F73;flex:{{ se }}"></div>{% endif %}
-            </div>
-          </div>
-          <div class="vbar-name">{{ r.account_executive }}</div>
-        </div>
-      {% endfor %}
-    </div>
-  </div>
-</div>
-
-{# ------- Chart 1b: mesma métrica (auto) travada na última semana fechada -------
-   Janela seg→dom independente do filtro de data da página; vira todo domingo
-   junto com os snapshots. Meta fixa de 3/semana por AE. #}
-<div class="panel">
-  <h2>Geradas pelo próprio AE · semana passada
-    <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ week_stats.label }} · {{ week_stats.n_hit }}/{{ week_stats.n_ae }} bateram a meta</span>
-  </h2>
-  <div class="dchart" data-drill-chips="bucket" data-channels="acq exp goal" data-chart="auto-week"
-       data-color-acq="#2563EB" data-color-exp="#1E3A8A"
-       data-goal-value="{{ week_stats.goal }}">
-    <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="acq" data-drill-val="auto_acq" style="--c:#2563EB">
-        <span class="leg-dot" style="background:#2563EB"></span>Aquisição
-      </button>
-      <button type="button" class="leg-toggle is-on" data-ch="exp" data-drill-val="auto_exp" style="--c:#1E3A8A">
-        <span class="leg-dot" style="background:#1E3A8A"></span>Expansão
-      </button>
-      <button type="button" class="leg-toggle is-on leg-goal" data-ch="goal" data-drill-skip style="--c:var(--blue)">
-        <span class="leg-dot" style="background:var(--blue);border:1.5px dashed #fff;box-shadow:0 0 0 1px var(--blue)"></span>Meta · {{ week_stats.goal }}
-      </button>
-    </div>
-    <div class="vbars" style="--count:{{ week_rows|length }}">
-      {% if max_week %}
-        <div class="vbar-goal" style="--gp:{{ (week_stats.goal / max_week * 100) }}%">
-          <span class="vbar-goal-label">Meta · {{ week_stats.goal }}</span>
-        </div>
-      {% endif %}
-      {% for r in week_rows %}
-        {% set h_pct = (r.auto_total / max_week * 100) if max_week else 0 %}
-        <div class="vbar{% if r.auto_total <= 0 %} is-empty{% endif %}"
-             data-acq="{{ r.auto_acq }}" data-exp="{{ r.auto_exp }}" data-name="{{ r.account_executive }}"
-             {% if r.auto_total > 0 %}data-drill="{{ url_for('demand_deals', name=r.account_executive, grain='ae', date_from=week_stats.date_from, date_to=week_stats.date_to, source='auto') }}" data-drill-title="{{ r.account_executive }} · semana passada"{% endif %}>
-          <div class="vbar-tip"></div>
-          <div class="vbar-track" style="--h:{{ h_pct }}%">
-            <div class="vbar-val">{{ r.auto_total|intg }}</div>
-            <div class="vbar-col">
-              {% if r.auto_acq > 0 %}<div class="vbar-seg" data-ch="acq" style="background:#2563EB;flex:{{ r.auto_acq }}"></div>{% endif %}
-              {% if r.auto_exp > 0 %}<div class="vbar-seg" data-ch="exp" style="background:#1E3A8A;flex:{{ r.auto_exp }}"></div>{% endif %}
             </div>
           </div>
           <div class="vbar-name">{{ r.account_executive }}</div>

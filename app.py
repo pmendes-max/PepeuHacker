@@ -4005,6 +4005,126 @@ def _qchip_ctx() -> dict:
     }
 
 
+# Geração de Demanda: filtro por GRANULARIDADE (Semana | Mês | Trimestre) com
+# setas ◀ ▶, "Hoje" e atalhos (pedido do Pedro, 04/11/2026). Semana = seg→dom.
+_GRAN_PERIOD_PATHS = {"/demand", "/leaders/demand"}
+_MESES = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def _demand_default_window() -> tuple:
+    """Janela padrão da Demanda sem datas na URL: trimestre atual."""
+    t = _today()
+    return _quarter_start_of(t), _quarter_end_of(t)
+
+
+def _gran_ctx() -> dict:
+    today = _today()
+    f_from = _parse_filter_date(request.args.get("date_from", ""))
+    f_to = _parse_filter_date(request.args.get("date_to", ""))
+    if not f_from or not f_to:
+        f_from, f_to = _demand_default_window()
+    base = {k: v for k, v in request.args.items()
+            if k not in ("date_from", "date_to", "preset", "refresh", "prev_from", "prev_to") and v}
+
+    def _url(a, b, extra=None):
+        return request.path + "?" + urllib.parse.urlencode(
+            {**base, "date_from": a.isoformat(), "date_to": b.isoformat(), **(extra or {})})
+
+    wk_a = f_from - timedelta(days=f_from.weekday())
+    m_end = (date(f_from.year + (f_from.month == 12), f_from.month % 12 + 1, 1) - timedelta(days=1))
+    if f_from.weekday() == 0 and (f_to - f_from).days == 6:
+        g = "w"
+    elif f_from.day == 1 and f_to == m_end:
+        g = "m"
+    else:
+        g = "q"
+
+    def _win(gg, anchor):
+        if gg == "w":
+            a = anchor - timedelta(days=anchor.weekday()); return a, a + timedelta(days=6)
+        if gg == "m":
+            a = anchor.replace(day=1)
+            return a, date(a.year + (a.month == 12), a.month % 12 + 1, 1) - timedelta(days=1)
+        a = _quarter_start_of(anchor); return a, _quarter_end_of(a)
+
+    def _step(gg, a, k):
+        if gg == "w":
+            return a + timedelta(days=7 * k)
+        if gg == "m":
+            mm = a.month - 1 + k
+            return date(a.year + mm // 12, mm % 12 + 1, 1)
+        mm = a.month - 1 + 3 * k
+        return date(a.year + mm // 12, mm % 12 + 1, 1)
+
+    is_fy = (g == "q" and f_from.month == _FISCAL_START_MONTH and f_from.day == 1
+             and f_to == _fy_bounds(f_from.year)[1])
+    a, b = (f_from, f_to) if is_fy else _win(g, f_from)
+    if g == "w":
+        label = f"Semana {a.isocalendar()[1]} · {a.strftime('%d/%m')} – {b.strftime('%d/%m/%Y')}"
+    elif g == "m":
+        label = f"{_MESES[a.month - 1]}/{a.year} · {a.strftime('%d/%m')} – {b.strftime('%d/%m/%Y')}"
+    elif is_fy:
+        label = f"FY{str(a.year)[2:]} · {a.strftime('%d/%m/%Y')} – {b.strftime('%d/%m/%Y')}"
+    else:
+        label = f"{_quarter_label(a)} · {a.strftime('%d/%m')} – {b.strftime('%d/%m/%Y')}"
+
+    gran = []
+    for gg, lbl in (("w", "Semana"), ("m", "Mês"), ("q", "Trimestre")):
+        ga, gb = _win(gg, today if gg != g else a)
+        gran.append({"key": gg, "label": lbl, "active": gg == g, "url": _url(ga, gb)})
+    if is_fy:
+        pa, pb = _fy_bounds(a.year - 1); na, nb = _fy_bounds(a.year + 1)
+    else:
+        pa, pb = _win(g, _step(g, a, -1)); na, nb = _win(g, _step(g, a, 1))
+    ta, tb = _win(g, today)
+
+    quick, years = [], []
+    if g == "w":
+        tw = today - timedelta(days=today.weekday())
+        for lbl, k in (("Esta semana", 0), ("Semana passada", -1)):
+            qa = tw + timedelta(days=7 * k)
+            quick.append({"label": lbl, "url": _url(qa, qa + timedelta(days=6)), "active": qa == a})
+    else:
+        y = a.year
+        for yy in range(today.year + 1, _QCHIP_FIRST_YEAR - 1, -1):
+            if g == "m":
+                ya, yb = _win("m", date(yy, a.month, 1))
+            elif is_fy:
+                ya, yb = _fy_bounds(yy)
+            else:
+                ya, yb = _win("q", date(yy, a.month, 1))
+            years.append({"year": yy, "url": _url(ya, yb), "selected": yy == y})
+        if g == "m":
+            for i, mn in enumerate(_MESES):
+                qa, qb = _win("m", date(y, i + 1, 1))
+                quick.append({"label": mn, "url": _url(qa, qb), "active": qa == a and not is_fy})
+        else:
+            for n in range(4):
+                qa = date(y, 3 * n + 1, 1)
+                quick.append({"label": f"Q{n + 1}/{str(y)[2:]}", "url": _url(qa, _quarter_end_of(qa)),
+                              "active": qa == a and not is_fy})
+            fa, fb = _fy_bounds(y)
+            quick.append({"label": f"FY{str(y)[2:]}", "url": _url(fa, fb), "active": is_fy, "fy": True})
+
+    # Botão "Última semana" do gráfico principal: leva a página pra última semana
+    # fechada; clicado de novo, volta pro período de onde veio (prev_from/prev_to).
+    lw_a = today - timedelta(days=today.weekday() + 7)
+    lw_b = lw_a + timedelta(days=6)
+    lw_on = (a == lw_a and b == lw_b)
+    pf = _parse_filter_date(request.args.get("prev_from", ""))
+    pt = _parse_filter_date(request.args.get("prev_to", ""))
+    if lw_on:
+        lw_url = _url(pf, pt) if (pf and pt) else _url(*_demand_default_window())
+    else:
+        lw_url = _url(lw_a, lw_b, {"prev_from": a.isoformat(), "prev_to": b.isoformat()})
+    return {
+        "period_mode": "gran", "gr_gran": gran, "gr_label": label,
+        "gr_prev": _url(pa, pb), "gr_next": _url(na, nb), "gr_today": _url(ta, tb),
+        "gr_quick": quick, "gr_years": years,
+        "gr_lw_url": lw_url, "gr_lw_on": lw_on,
+    }
+
+
 def _period_widget_ctx() -> dict:
     """Contexto do filtro de período conforme a aba. Em modo 'quarter' devolve os
     presets de N trimestres, a lista de trimestres disponíveis (pro intervalo
@@ -4012,6 +4132,8 @@ def _period_widget_ctx() -> dict:
     botões de trimestre + FY por ano."""
     if request.path in _QCHIP_PERIOD_PATHS:
         return _qchip_ctx()
+    if request.path in _GRAN_PERIOD_PATHS:
+        return _gran_ctx()
     if request.path not in _QUARTER_PERIOD_PATHS:
         return {"period_mode": "date"}
     cur_q = _quarter_start_of(_today())
@@ -5218,8 +5340,8 @@ def demand():
     f = ctx["filters"]
 
     # Resolve date range
-    from_d = pd.to_datetime(f["date_from"]).date() if f["date_from"] else date(2026, 4, 1)
-    to_d   = pd.to_datetime(f["date_to"]).date()   if f["date_to"]   else date(2027, 1, 31)
+    from_d = pd.to_datetime(f["date_from"]).date() if f["date_from"] else _demand_default_window()[0]
+    to_d   = pd.to_datetime(f["date_to"]).date()   if f["date_to"]   else _demand_default_window()[1]
 
     # Slice em pandas a partir do cache deal-level — sem BQ por filtro.
     force = request.args.get("refresh") == "1"
@@ -6222,8 +6344,8 @@ def leaders_demand():
     ctx = base_context()
     f = ctx["filters"]
 
-    from_d = pd.to_datetime(f["date_from"]).date() if f["date_from"] else date(2026, 4, 1)
-    to_d   = pd.to_datetime(f["date_to"]).date()   if f["date_to"]   else date(2027, 1, 31)
+    from_d = pd.to_datetime(f["date_from"]).date() if f["date_from"] else _demand_default_window()[0]
+    to_d   = pd.to_datetime(f["date_to"]).date()   if f["date_to"]   else _demand_default_window()[1]
 
     force = request.args.get("refresh") == "1"
     grain = request.args.get("grain", "month")
