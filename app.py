@@ -2559,6 +2559,31 @@ def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 # Botão "↻ Refresh BQ" (?refresh=1) força rebuild propagando para o BQ.
 _DATA_CACHE_LOCK = threading.Lock()
 _DATA_CACHE: dict = {}
+# Teto de segurança. Na prática o cache fica em ~20 entradas: uma por
+# (país, dataset), porque `_cache_put` descarta a versão anterior.
+_DATA_CACHE_MAX = 64
+
+
+def _cache_put(key, value) -> None:
+    """Grava no _DATA_CACHE descartando as versões ANTERIORES do mesmo dataset.
+
+    As chaves são (país, nome, mtime do parquet...): cada parquet regravado — e o
+    stale-while-revalidate regrava a cada 10 min de uso — gerava uma chave nova, e
+    a velha nunca saía. Medido no harness: 8 entradas no boot, 92 depois de 12
+    ciclos do refresher, ~80-100 MB presos por ciclo com o volume real, até o OOM
+    do container. Agora entra a nova e sai quem tem o mesmo (país, nome) e outro
+    mtime. Chave que não é tupla (ou tupla curta) só entra, sem descarte por
+    família; o teto acima segura o total de qualquer jeito (sai a mais antiga)."""
+    with _DATA_CACHE_LOCK:
+        if isinstance(key, tuple) and len(key) >= 2:
+            fam = key[:2]
+            for k in [k for k in _DATA_CACHE
+                      if k != key and isinstance(k, tuple) and k[:2] == fam]:
+                del _DATA_CACHE[k]
+        _DATA_CACHE.pop(key, None)       # reinsere no fim (ordem = idade)
+        _DATA_CACHE[key] = value
+        while len(_DATA_CACHE) > _DATA_CACHE_MAX:
+            del _DATA_CACHE[next(iter(_DATA_CACHE))]
 
 
 def _parquet_mtime(name: str) -> float:
@@ -2606,8 +2631,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
         _mx = merge_ae_quarter_dups(canon_ae_names(df[df["region"] == "MX"].copy()))
         _mx["leader"] = MX_LEADER
         _mx = _mx.reset_index(drop=True)
-        with _DATA_CACHE_LOCK:
-            _DATA_CACHE[key] = _mx
+        _cache_put(key, _mx)
         return _mx
     # Nome canônico ANTES do roster: é o rename que faz a linha órfã do AE casar
     # com o roster, e a fusão evita a quota sair dobrada.
@@ -2623,8 +2647,7 @@ def _get_clean_ae_perf(force: bool = False) -> pd.DataFrame:
     df = df[df["leader"].isin(ALLOWED_LEADERS)]
     df = df[~df["account_executive"].isin(HIDDEN_FROM_AE_VIEWS)]
     df = drop_departed_from(df, "quarter").reset_index(drop=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2643,8 +2666,7 @@ def _get_unit_price_events(force: bool = False) -> pd.DataFrame:
     df = df[df["event_date"].notna()]
     df["amount_brl"] = pd.to_numeric(df["amount_brl"], errors="coerce").fillna(0.0)
     df["devices"] = pd.to_numeric(df["devices"], errors="coerce").fillna(0).astype(int)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2688,8 +2710,7 @@ def _get_quota_history(force: bool = False) -> pd.DataFrame:
                 or cur_leader.get(ae))
     df["leader"] = df.apply(_ld, axis=1) if len(df) else None
     df = df.reset_index(drop=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -2748,8 +2769,7 @@ def _get_funnel_entries(force: bool = False) -> pd.DataFrame:
     piv["created_date"] = pd.to_datetime(piv["deal_id"].map(base["created_date"]), errors="coerce")
     piv["deal_name"] = piv["deal_id"].map(base["deal_name"])
     piv["amount"] = pd.to_numeric(piv["deal_id"].map(base["amount"]), errors="coerce").fillna(0.0)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = piv
+    _cache_put(key, piv)
     return piv
 
 
@@ -2866,8 +2886,7 @@ def _get_ae_perf_with_managers(force: bool = False) -> pd.DataFrame:
     df = drop_departed_from(df, "quarter")
     if len(kept):
         df = pd.concat([df, kept], ignore_index=True)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3002,8 +3021,7 @@ def _get_demand_deals(force: bool = False) -> pd.DataFrame:
         df["leader"] = MX_LEADER
         df["region"] = "MX"
     df = drop_departed_from(df, "created_date")
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3029,8 +3047,7 @@ def _get_visits(force: bool = False) -> pd.DataFrame:
                [["account_executive", "leader", "region"]])
     df = df.merge(ae_meta, on="account_executive", how="left")
     df = apply_roster_leader(df)
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3745,8 +3762,7 @@ def _get_pipeline_deals(force: bool = False) -> pd.DataFrame:
     _gone = {ae for ae, cut in DEPARTED_FROM.items() if cut <= _today()}
     if _gone:
         df = df[~df["account_executive"].isin(_gone)]
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
@@ -3832,8 +3848,7 @@ def _get_forecast_deals(force: bool = False) -> pd.DataFrame:
         df.loc[_kw, "region"] = "BR"
         df.loc[_kw, "is_manager_sale"] = True
 
-    with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = df
+    _cache_put(key, df)
     return df
 
 
