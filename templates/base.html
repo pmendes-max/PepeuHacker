@@ -89,6 +89,43 @@
         <a href="{{ url_for('forecast', **ctx.filters) }}"   class="{% if ctx.current_path.startswith('/forecast') %}active{% endif %}">Forecast</a>
       {% endif %}
     </nav>
+    {# Utilitários da página (05/11/2026): frescor do dado + refresh + moeda.
+       Moram AQUI, na linha das abas, e não na barra de filtros: lá eles
+       empurravam os filtros e trocavam de lugar conforme a tela tinha mais ou
+       menos selects. Nesta linha a posição é a mesma em todas as telas.
+       Selo: idade do DADO vivo do HubSpot (vermelho quando passa de 3h sem
+       gravar, `freshness`) + idade da base do BI de onde vêm valor, dono e PO
+       (`bi_freshness`). No Sales MX não há toggle: o time é medido em dólar. #}
+    {% set _live_stale = ctx.freshness and ctx.freshness.ok and ctx.freshness.stale %}
+    {% set _bi_stale = not (ctx.bi_freshness and ctx.bi_freshness.ok) or ctx.bi_freshness.stale %}
+    <div class="util">
+      <div class="util-status{% if _live_stale or _bi_stale %} is-stale{% endif %}">
+        {% if ctx.freshness and ctx.freshness.ok %}
+        <span class="util-part util-live{% if _live_stale %} is-stale{% endif %}"
+              title="Estágio, close date e forecast category: deal mais recente que o HubSpot mandou em {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 5 em 5 min.">
+          <i class="util-dot" aria-hidden="true"></i>
+          {% if ctx.freshness.source_age_min < 60 %}HubSpot há {{ ctx.freshness.source_age_min }} min{% else %}HubSpot {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }}{% endif %}
+        </span>
+        {% endif %}
+        {% if ctx.bi_freshness and ctx.bi_freshness.ok %}
+        <span class="util-part util-bi{% if _bi_stale %} is-stale{% endif %}"
+              title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot. Deal mais novo nessa base: criado em {{ ctx.bi_freshness.newest.strftime('%d/%m/%Y') }}. Deal criado depois disso ainda não aparece.">BI até {{ ctx.bi_freshness.newest.strftime('%d/%m') }}</span>
+        {% else %}
+        <span class="util-part util-bi is-stale"
+              title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot — desatualizada desde ~11/10/2026.">BI desatualizado</span>
+        {% endif %}
+        <a class="util-refresh" href="{{ ctx.current_path }}?{{ ctx.querystring }}{% if ctx.querystring %}&{% endif %}refresh=1"
+           title="Buscar os dados de novo no BigQuery agora" aria-label="Atualizar dados">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        </a>
+      </div>
+      {% if ctx.view != 'mx' %}
+      <span class="money-toggle" role="group" aria-label="Moeda de exibição — vale em todas as abas">
+        <a href="{{ ctx.money_url_mrr }}" class="money-opt {% if ctx.money_mode != 'arr' %}is-on{% endif %}">MRR R$</a>
+        <a href="{{ ctx.money_url_arr }}" class="money-opt {% if ctx.money_mode == 'arr' %}is-on{% endif %}">ARR US$</a>
+      </span>
+      {% endif %}
+    </div>
   </div>
 </div>
 
@@ -461,47 +498,6 @@
       </div>
       {% endfor %}
       <a href="{{ ctx.current_path }}" class="f-btn secondary">Limpar</a>
-      <a href="{{ ctx.current_path }}?{{ ctx.querystring }}{% if ctx.querystring %}&{% endif %}refresh=1" class="f-btn refresh" title="Re-query BigQuery agora">↻ Refresh BQ</a>
-      {# Selo de frescor: a idade do DADO, não a do cache. Existe desde 14/09/2026,
-         quando descobrimos que a fonte do HubSpot tinha parado havia 3 dias e o
-         dashboard servia o funil de sexta sem nenhum aviso na tela. Fica em
-         vermelho (.is-stale) quando a fonte passa de 3h sem gravar. #}
-      {# 2ª linha (11/2026): o selo de cima mede só a fonte VIVA (estágio, close
-         date, forecast category). Valor, dono e data do PO vêm da base do BI,
-         parada desde ~11/10/2026 — sem esta linha o selo dizia "5 min atrás"
-         para números de semanas. Ver `bi_freshness`. #}
-      <span class="fresh-stack">
-      {% if ctx.freshness and ctx.freshness.ok %}
-      <span class="fresh-seal {% if ctx.freshness.stale %}is-stale{% endif %}"
-            title="Deal mais recente que o HubSpot mandou: {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }} (BRT){% if ctx.freshness.warmed_dt %} · cache reaquecido {{ ctx.freshness.warmed_dt.strftime('%H:%M') }}{% endif %}. O app verifica a fonte de 5 em 5 min.">
-        {% if ctx.freshness.source_age_min < 60 %}
-          dado de {{ ctx.freshness.source_age_min }} min atrás
-        {% else %}
-          dado de {{ ctx.freshness.source_dt.strftime('%d/%m %H:%M') }}
-        {% endif %}
-      </span>
-      {% endif %}
-      {% if ctx.bi_freshness and ctx.bi_freshness.ok %}
-      <span class="fresh-bi {% if ctx.bi_freshness.stale %}is-stale{% endif %}"
-            title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot. Deal mais novo nessa base: criado em {{ ctx.bi_freshness.newest.strftime('%d/%m/%Y') }}. Deal criado depois disso ainda não aparece.">
-        valor, dono e PO: base do BI até {{ ctx.bi_freshness.newest.strftime('%d/%m') }}
-      </span>
-      {% else %}
-      <span class="fresh-bi is-stale"
-            title="Valor, dono (AE) e data do PO vêm da base do BI (int_adding_names_to_deals), não da fonte viva do HubSpot.">
-        valor, dono e PO: base do BI (desatualizada desde ~11/10/2026)
-      </span>
-      {% endif %}
-      </span>
-      {# No Sales MX não há toggle: o time é medido em dólar e um deal em peso não
-         tem leitura em real. A moeda é fixa e a página diz isso no subtítulo. #}
-      {# `display:none` inline e não `hidden`: .money-toggle tem display:flex no
-         CSS, que ganha do atributo hidden e deixava o toggle visível. #}
-      <span class="money-toggle" title="Moeda de exibição — vale em todas as abas"
-            {% if ctx.view == 'mx' %}style="display:none"{% endif %}>
-        <a href="{{ ctx.money_url_mrr }}" class="money-opt {% if ctx.money_mode != 'arr' %}is-on{% endif %}">MRR R$</a>
-        <a href="{{ ctx.money_url_arr }}" class="money-opt {% if ctx.money_mode == 'arr' %}is-on{% endif %}">ARR US$</a>
-      </span>
     </form>
 
     {% if ctx.active_chips %}
@@ -554,11 +550,10 @@
   };
 </script>
 <style>
-  .money-toggle{display:inline-flex;border:1px solid var(--border,#d7dde5);border-radius:8px;overflow:hidden;margin-left:8px}
-  .money-toggle .money-opt{padding:7px 12px;font-size:12.5px;font-weight:600;color:var(--muted,#64748b);
-    text-decoration:none;background:var(--surface,#fff);white-space:nowrap}
-  .money-toggle .money-opt.is-on{background:var(--blue,#2563EB);color:#fff}
-  .money-toggle .money-opt+.money-opt{border-left:1px solid var(--border,#d7dde5)}
+  .money-toggle{display:inline-flex;border:1px solid var(--border,#d7dde5);border-radius:999px;overflow:hidden;background:var(--surface,#fff);padding:2px;gap:2px}
+  .money-toggle .money-opt{padding:5px 12px;font-size:12px;font-weight:600;color:var(--muted,#64748b);border-radius:999px;text-decoration:none;white-space:nowrap}
+  .money-toggle .money-opt:hover{color:var(--fg,#16202D)}
+  .money-toggle .money-opt.is-on{background:var(--fg,#16202D);color:#fff}
 </style>
 
 <div class="wrap">
