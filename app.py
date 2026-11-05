@@ -9204,13 +9204,48 @@ def _wow_events_categorize(ev, focus):
         (is_amt & (d < 0),                "encolheu"),
     ]:
         ev.loc[m, "category"] = c
-    return ev
+    return _wow_net_amount_edits(ev)
+
+
+def _wow_net_amount_edits(ev):
+    """Consolida as edições de VALOR de cada deal num lado só (pedido do Pedro,
+    05/11/2026). Antes cada edição era um evento: um deal editado 6.265 → 9.933
+    → 6.265 na mesma semana aparecia em Cresceu (+3.668) E em Encolheu
+    (−3.668) — o saldo fechava, mas as barras dos dois lados inflavam e a tela
+    parecia contraditória (caso Lyondellbasell).
+
+    Agora as edições de valor de um deal (com o mesmo AE e, no Histórico, na
+    mesma semana — `week_idx`) viram UMA linha: delta = soma dos deltas, valor
+    antes = o da 1ª edição, depois = o da última. Pelo sinal do saldo vira
+    Cresceu ou Encolheu; saldo zero vira `sem_var` (vai e volta), que fica fora
+    das barras e só aparece no drill pra auditoria. Só AGRUPA eventos, não muda
+    nenhum delta: a identidade total_prev + Σdelta == total_curr continua
+    fechando exata. Eventos de estágio (novo, lost, late…) não mudam."""
+    ev = ev.copy()
+    ev["n_edits"] = 1
+    m = ev["category"].isin(["cresceu", "encolheu"])
+    if not m.any():
+        return ev
+    amt = ev[m].sort_values("ts", kind="stable")
+    keys = ["deal_id", "account_executive"] + (["week_idx"] if "week_idx" in ev.columns else [])
+    g = amt.groupby(keys, sort=False, dropna=False)
+    agg = g.agg(_delta=("delta", "sum"), _n=("delta", "size"), _a0=("amt_from", "first"))
+    base = amt.drop_duplicates(keys, keep="last").set_index(keys)
+    base = base.join(agg)
+    base["delta"] = base["_delta"].where(base["_delta"].abs() >= 0.005, 0.0)
+    base["n_edits"] = base["_n"].astype(int)
+    base["amt_from"] = base["_a0"]
+    base = base.drop(columns=["_delta", "_n", "_a0"]).reset_index()
+    base["category"] = "sem_var"
+    base.loc[base["delta"] > 0, "category"] = "cresceu"
+    base.loc[base["delta"] < 0, "category"] = "encolheu"
+    return pd.concat([ev[~m], base[ev.columns]], ignore_index=True)
 
 
 _WOW_CAT_LABEL = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu",
                   "lost": "Lost", "won": "Won", "late": "Movido p/ Late",
                   "transferiu": "Transferiu", "regrediu": "Voltou de estágio",
-                  "reabriu": "Reabriu"}
+                  "reabriu": "Reabriu", "sem_var": "Sem variação"}
 
 # Categorias que somam o SALDO do período (pipe que entrou/saiu de verdade).
 # won/late/transferiu/regrediu/reabriu ficam fora: são movimento de fronteira,
@@ -9247,8 +9282,16 @@ def _wow_event_rows(ev):
             mov = f"{_lbl(r['stage_from'])} → {_lbl(r['stage_to'])}"
             val = float(r["amount_at"])
         else:
-            mov = f"{_lbl(r['stage_at'])} · valor alterado"
+            # Edições de valor já consolidadas por deal (`_wow_net_amount_edits`):
+            # mostra o valor antes da 1ª edição e depois da última.
+            mov = (f"{_lbl(r['stage_at'])} · {fmt_money(float(r['amt_from']))}"
+                   f" → {fmt_money(float(r['amt_to']))}")
             val = float(r["amt_to"])
+        n_ed = int(r.get("n_edits", 1) or 1) if r["kind"] != "stage" else 0
+        if r["category"] == "sem_var":
+            edicoes = f"{n_ed} · vai e volta"
+        else:
+            edicoes = str(n_ed) if n_ed else ""
         rows.append({
             "deal_name": r.get("deal_name") or "—",
             "deal_url":  _hs_deal_url(r.get("deal_id")),
@@ -9258,6 +9301,7 @@ def _wow_event_rows(ev):
             "quando":    _quando(r["ts"]),
             "delta":     float(r["delta"]),
             "amount":    val,
+            "edicoes":   edicoes,
         })
     rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
     return rows
@@ -9272,6 +9316,7 @@ def _wow_drill_columns(grain, name):
         {"key": "quando",    "label": "Quando", "align": "right"},
         {"key": "delta",     "label": "Δ (R$)", "type": "money_signed"},
         {"key": "amount",    "label": "Amount no evento", "type": "money"},
+        {"key": "edicoes",   "label": "Edições de valor", "align": "right"},
     ], "leader" if (grain == "leader" or not name) else "ae")
 
 
@@ -9335,7 +9380,10 @@ def pipeline_wow_deals(focus):
     ev = _entity_filter(_wow_events_filtered(), name, grain,
                         request.args.get("leader"), request.args.get("region"))
     ev = _wow_events_categorize(ev, focus)
-    ev = ev[ev["category"].isin(cats)]
+    # Deal de vai e volta (saldo zero nas edições) não compõe número nenhum, mas
+    # entra no fim da lista de Cresceu/Encolheu/saldo pra auditoria.
+    _show = cats + (["sem_var"] if {"cresceu", "encolheu"} & set(cats) else [])
+    ev = ev[ev["category"].isin(_show)]
 
     rows = _wow_event_rows(ev)
     # Saldo = MESMA conta da página: só o que aumentou/diminuiu de pipe. A 5ª
@@ -9347,10 +9395,15 @@ def pipeline_wow_deals(focus):
     # Linha = evento, então "N deals" tem que contar deals DISTINTOS; senão um
     # deal que se moveu 2× na semana seria anunciado como 2 deals. Quando os dois
     # números diferem, mostra os dois — é o intra-semana ficando visível.
-    n_deals = int(ev["deal_id"].nunique())
+    _ev_num = ev[ev["category"] != "sem_var"]
+    n_deals = int(_ev_num["deal_id"].nunique())
+    _n_mov = int(len(_ev_num))
     _d = f"{n_deals} deal{'s' if n_deals != 1 else ''}"
-    if len(rows) != n_deals:
-        _d += f" · {len(rows)} movimentos"
+    if _n_mov != n_deals:
+        _d += f" · {_n_mov} movimentos"
+    _n_vv = int((ev["category"] == "sem_var").sum())
+    if _n_vv:
+        _d += f" · {_n_vv} vai e volta (saldo zero)"
     if cat == "won":
         subtitle = f"{_d} won · {fmt_money(won)}" + " que saiu do pipe"
     elif cat == "late":
@@ -9579,6 +9632,50 @@ def pipeline_funnel_deals():
     })
 
 
+_WOW_BRIDGE_COLOR = {"novo": "#15803d", "cresceu": "#86efac", "encolheu": "#fdba74",
+                     "lost": "#dc2626", "saida": "#94a3b8", "base": "#cbd5e1"}
+
+
+def _wow_bridge_steps(total_prev, total_curr, cat_totals, cat_deals, fifth,
+                      prev_label, curr_label):
+    """Degraus da ponte do time (cascata) da PoP: domingo anterior → cada
+    categoria → domingo atual. Saldo (novo/cresceu/encolheu/lost) em cor;
+    o que saiu ou entrou por FRONTEIRA (won, movido p/ Late, transferência,
+    volta de estágio, reabertura) em cinza — não é perda nem ganho de pipe.
+    Fecha exato por construção (ver `_wow_events_categorize`); se sobrar
+    diferença, ela aparece nomeada como "Ajuste" em vez de sumir.
+
+    Geometria em % da altura (`bottom`/`height`), pronta pro template."""
+    lbl = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu", "lost": "Lost",
+           "won": "Won", "late": "Movido p/ Late", "transferiu": "Transferiu",
+           "regrediu": "Voltou de estágio", "reabriu": "Reabriu"}
+    order = ["novo", "cresceu", "encolheu", "lost", fifth]
+    order += [c for c in ("won", "transferiu", "regrediu", "reabriu") if c not in order]
+    steps = [{"key": "prev", "label": prev_label, "val": total_prev, "kind": "base",
+              "a": 0.0, "b": total_prev}]
+    run = total_prev
+    for c in order:
+        v = float(cat_totals.get(c, 0.0))
+        if c not in _WOW_NET_CATS and abs(v) < 0.5:
+            continue                       # fronteira sem movimento: não polui
+        steps.append({"key": c, "label": lbl[c], "val": v, "a": run, "b": run + v,
+                      "kind": c if c in _WOW_NET_CATS else "saida",
+                      "deals": int(cat_deals.get(c, 0))})
+        run += v
+    if abs(total_curr - run) >= 0.5:
+        steps.append({"key": "ajuste", "label": "Ajuste", "val": total_curr - run,
+                      "a": run, "b": total_curr, "kind": "saida", "deals": 0})
+    steps.append({"key": "curr", "label": curr_label, "val": total_curr, "kind": "base",
+                  "a": 0.0, "b": total_curr})
+    top = max([max(x["a"], x["b"]) for x in steps] + [1.0])
+    for x in steps:
+        lo, hi = min(x["a"], x["b"]), max(x["a"], x["b"])
+        x["bottom"] = round(lo / top * 100, 3)
+        x["height"] = round((hi - lo) / top * 100, 3)
+        x["color"] = _WOW_BRIDGE_COLOR[x["kind"] if x["kind"] in _WOW_BRIDGE_COLOR else "saida"]
+    return steps
+
+
 def _render_pipeline_wow(focus: str, grain="ae"):
     """Snapshot do pipeline em 2 domingos consecutivos (12h BRT) e o que aconteceu
     deal-a-deal entre eles. `focus` ∈ {'early','late'} — define o universo
@@ -9709,8 +9806,12 @@ def _render_pipeline_wow(focus: str, grain="ae"):
     y_max_neg = max(-(r["encolheu"] + r["lost"]) for r in rows) if rows else 0
     y_max     = max(y_max_pos, y_max_neg, 1.0)
 
+    bridge = _wow_bridge_steps(total_prev, total_curr, cat_totals, cat_deals, fifth,
+                               "Domingo " + prev_sun.strftime("%d/%m"),
+                               "Domingo " + last_sun.strftime("%d/%m"))
+
     return render_template(
-        "pipeline_wow.html", ctx=ctx,
+        "pipeline_wow.html", ctx=ctx, bridge=bridge,
         focus=focus,
         focus_label=("Early · " + _STAGE_BY_ID["93878633"]["name"] if focus == "early"
                      else "Late · Negotiation / Decision / Procurement"),
@@ -10260,14 +10361,22 @@ def pipeline_wow_history_deals():
     ev = _entity_filter(ev, name, grain,
                         request.args.get("leader"), request.args.get("region"))
     ev = _wow_events_categorize(ev, focus)
-    ev = ev[ev["category"].isin(cats)]
+    # Deal de vai e volta (saldo zero nas edições) não compõe número nenhum, mas
+    # entra no fim da lista de Cresceu/Encolheu/saldo pra auditoria.
+    _show = cats + (["sem_var"] if {"cresceu", "encolheu"} & set(cats) else [])
+    ev = ev[ev["category"].isin(_show)]
     rows = _wow_event_rows(ev)
 
     _janela = f"{_fmt_date_short(suns[wk - 1])} → {_fmt_date_short(suns[wk])}"
-    n_deals = int(ev["deal_id"].nunique())
+    _ev_num = ev[ev["category"] != "sem_var"]
+    n_deals = int(_ev_num["deal_id"].nunique())
+    _n_mov = int(len(_ev_num))
     _d = f"{n_deals} deal{'s' if n_deals != 1 else ''}"
-    if len(rows) != n_deals:
-        _d += f" · {len(rows)} movimentos"
+    if _n_mov != n_deals:
+        _d += f" · {_n_mov} movimentos"
+    _n_vv = int((ev["category"] == "sem_var").sum())
+    if _n_vv:
+        _d += f" · {_n_vv} vai e volta (saldo zero)"
     _v = sum(x["delta"] for x in rows)
     _sinal = "+" if _v >= 0 else "−"
     # `fmt_money` respeita o filtro mestre de moeda (e o MX, que é sempre ARR
@@ -11249,10 +11358,15 @@ def _wq_deals_drill():
     rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
 
     _janela = f"{_fmt_date_short(alvos[wk - 1])} → {_fmt_date_short(alvos[wk])}"
-    n_deals = int(ev["deal_id"].nunique())
+    _ev_num = ev[ev["category"] != "sem_var"]
+    n_deals = int(_ev_num["deal_id"].nunique())
+    _n_mov = int(len(_ev_num))
     _d = f"{n_deals} deal{'s' if n_deals != 1 else ''}"
-    if len(rows) != n_deals:
-        _d += f" · {len(rows)} movimentos"
+    if _n_mov != n_deals:
+        _d += f" · {_n_mov} movimentos"
+    _n_vv = int((ev["category"] == "sem_var").sum())
+    if _n_vv:
+        _d += f" · {_n_vv} vai e volta (saldo zero)"
     _v = sum(x["delta"] for x in rows)
     _valor = f"{'+' if _v >= 0 else '−'}{fmt_money(abs(_v))}"
     cat = cats[0] if len(cats) == 1 else ""
