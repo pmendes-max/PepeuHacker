@@ -2780,3 +2780,25 @@ tbody tr:last-child td{border-bottom:none}
 .lang-switch .lang-opt+.lang-opt{border-left:1px solid var(--border,#d7dde5)}
 .lang-switch .lang-opt:hover{color:var(--fg,#0f172a)}
 .lang-switch .lang-opt.is-on{background:var(--blue,#2563EB);color:#fff;cursor:default}
+
+/* ---------- Utilitários na linha das abas (05/11/2026) ----------
+   Selo de frescor + refresh + moeda, à direita das abas. Posição fixa em todas
+   as telas (antes ficavam no fim da barra de filtros e pulavam de lugar). */
+.subnav-inner{gap:12px;flex-wrap:wrap}
+.util{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.util-status{display:inline-flex;align-items:center;height:30px;border:1px solid var(--border);
+  border-radius:999px;background:var(--surface);padding:0 3px 0 12px;font-size:12px;
+  font-weight:500;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.util-part{display:inline-flex;align-items:center;gap:6px;cursor:default}
+.util-part + .util-part::before{content:"";width:1px;height:12px;background:var(--border);margin:0 10px 0 4px}
+.util-part + .util-part{gap:0}
+.util-dot{width:7px;height:7px;border-radius:50%;background:var(--green,#10B981);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--green,#10B981) 18%,transparent)}
+.util-part.is-stale{color:var(--red)}
+.util-live.is-stale .util-dot{background:var(--red);box-shadow:0 0 0 3px color-mix(in srgb,var(--red) 18%,transparent)}
+.util-refresh{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
+  margin-left:8px;border-radius:50%;color:var(--fg-soft);transition:background .15s ease,color .15s ease}
+.util-refresh:hover{background:var(--blue-soft);color:var(--blue)}
+.util-refresh:active svg{transform:rotate(90deg)}
+.util-refresh svg{transition:transform .2s ease}
+@media (max-width:760px){.util{margin-left:0;width:100%}}
