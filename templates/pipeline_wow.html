@@ -50,6 +50,51 @@
   </div>
 </div>
 
+{# ---- Ponte do time (05/11/2026): do pipe do domingo anterior ao de hoje,
+   degrau por degrau. Saldo em cor; fronteira (won, movido p/ Late, transferência,
+   volta de estágio, reabertura) em cinza. Substitui a ponte em texto do rodapé.
+   Cada degrau explode os deals dele. ---- #}
+<div class="panel">
+  <h2>Ponte do pipe {{ focus|capitalize }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ snap_prev_label }} → {{ snap_curr_label }}</span></h2>
+  <div class="wb-chart" role="img" aria-label="Ponte do pipe do domingo anterior ao atual">
+    {% for st in bridge %}
+      {% set _drill = st.key in ('novo', 'cresceu', 'encolheu', 'lost', fifth_cat) and st.deals %}
+      <div class="wb-col{% if _drill %} wb-drill{% endif %}"
+           {% if _drill %}data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat=st.key, leader=ctx.filters.leader, region=ctx.filters.region) }}"
+           title="Explodir os deals de {{ st.label }}"{% endif %}>
+        <div class="wb-area">
+          {% if st.zero > 0 %}<div class="wb-zero" style="bottom:{{ st.zero }}%"></div>{% endif %}
+          <div class="wb-bar" style="bottom:{{ st.bottom }}%;height:max(2px,{{ st.height }}%);background:{{ st.color }}"></div>
+          <div class="wb-val" style="bottom:calc({{ st.bottom + st.height }}% + 4px)">
+            {%- if st.kind == 'base' -%}{{ st.val|brl }}
+            {%- else -%}{{ '+' if st.val >= 0 else '−' }}{{ (st.val if st.val >= 0 else -st.val)|brl }}{%- endif -%}
+          </div>
+          {% if not loop.last %}<div class="wb-link" style="bottom:{{ (st.bottom + st.height) if (st.kind == 'base' or st.val >= 0) else st.bottom }}%"></div>{% endif %}
+        </div>
+        <div class="wb-lbl">{{ st.label }}{% if st.deals %}<span>{{ st.deals }} deal{{ 's' if st.deals != 1 else '' }}</span>{% endif %}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <div class="wb-foot">Saldo da semana (novo + cresceu − encolheu − lost):
+    <b class="{% if cat_totals.net >= 0 %}is-pos{% else %}is-neg{% endif %}">{{ '+' if cat_totals.net >= 0 else '−' }}{{ (cat_totals.net if cat_totals.net >= 0 else -cat_totals.net)|brl }}</b>
+    · em cinza, o que saiu ou entrou sem ser ganho ou perda de pipe.</div>
+</div>
+<style>
+  .wb-chart{display:flex;gap:10px;align-items:stretch;overflow-x:auto;padding-top:22px}
+  .wb-col{flex:1 1 0;min-width:84px;display:flex;flex-direction:column;gap:8px}
+  .wb-area{position:relative;height:210px;border-bottom:1px solid var(--border)}
+  .wb-bar{position:absolute;left:12%;right:12%;border-radius:4px 4px 0 0}
+  .wb-val{position:absolute;left:0;right:0;text-align:center;font-size:12.5px;font-weight:700;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .wb-zero{position:absolute;left:0;right:0;border-top:1px solid var(--muted);opacity:.5}
+  .wb-link{position:absolute;left:88%;right:-22%;border-top:1px dashed var(--muted);opacity:.6}
+  .wb-lbl{font-size:12px;color:var(--muted);text-align:center;line-height:1.3}
+  .wb-lbl span{display:block;font-size:11px;opacity:.85}
+  .wb-drill{cursor:pointer}
+  .wb-drill:hover .wb-bar{filter:brightness(.92)}
+  .wb-foot{margin-top:12px;font-size:12.5px;color:var(--muted)}
+  .wb-foot b.is-pos{color:#15803d}.wb-foot b.is-neg{color:#dc2626}
+</style>
+
 {# ---- Chart por AE ---- #}
 <div class="panel">
   <h2>Por {{ 'Líder' if grain == 'leader' else 'Account Executive' }}</h2>
@@ -203,21 +248,6 @@
     </div>
   </div>
 
-  {# Ponte entre os 2 snapshots: o saldo não fecha a diferença sozinho porque
-     won, transferências entre estágios, voltas de estágio e reaberturas também
-     mexem no total. Deixa a conta auditável em vez de "sobrar" diferença.
-     Desde a migração pra eventos (wow_events) todas as parcelas saem da MESMA
-     conta, então isto fecha EXATO — se sobrar diferença aqui, é bug. #}
-  <div class="wow-bridge">
-    {{ total_prev|brl }}
-    <span>{% if cat_totals.net >= 0 %}+{% else %}−{% endif %} saldo {{ (cat_totals.net if cat_totals.net >= 0 else -cat_totals.net)|brl }}</span>
-    {% if fifth_cat == 'late' and cat_totals.late %}<span>− movido p/ Late {{ (-cat_totals.late)|brl }} ({{ cat_deals.late }})</span>{% endif %}
-    {% if cat_totals.won %}<span>− won {{ (-cat_totals.won)|brl }}</span>{% endif %}
-    {% if cat_totals.transferiu %}<span>{% if cat_totals.transferiu >= 0 %}+{% else %}−{% endif %} transferência entre estágios {{ (cat_totals.transferiu if cat_totals.transferiu >= 0 else -cat_totals.transferiu)|brl }} ({{ cat_deals.transferiu }})</span>{% endif %}
-    {% if cat_totals.regrediu %}<span>− voltou de estágio {{ (-cat_totals.regrediu)|brl }} ({{ cat_deals.regrediu }})</span>{% endif %}
-    {% if cat_totals.reabriu %}<span>+ reabriu {{ cat_totals.reabriu|brl }} ({{ cat_deals.reabriu }})</span>{% endif %}
-    <b>= {{ total_curr|brl }}</b>
-  </div>
 </div>
 
 <style>
