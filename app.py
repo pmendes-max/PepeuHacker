@@ -2428,7 +2428,9 @@ PRESET_KEYS_BY_PATH = {
     **{p: ("wow_1w", "wow_2w", "wow_4w", "wow_8w") for p in WOW_PATHS},
     # Mesmos presets da Cobertura (close date olha pra frente), mas sem pin:
     # a aba abre com o funil inteiro e o trimestre é uma escolha do usuário.
-    **{p: ("current_q", "next_q", "next_2q") for p in PIPELINE_TOTAL_PATHS},
+    # Pipeline Total: sem presets — close date é por botão (`cd`) e a janela de
+    # datas é ignorada; oferecer preset aqui (ex. pra API de agentes) recortaria nada.
+    **{p: () for p in PIPELINE_TOTAL_PATHS},
     # Só presets pra trás: a aba mede desfecho, e trimestre futuro não tem
     # deal fechado pra medir.
     **{p: ("current_q", "last_q", "this_year", "last_year", "all") for p in LEGAL_PATHS},
@@ -2446,7 +2448,6 @@ def filter_presets_for_path(presets: list[dict], path: str) -> list[dict]:
 # Label do filtro de período varia por rota — na Cobertura é Close Date do HubSpot
 # e no WoW são os 2 domingos comparados.
 PERIOD_LABEL_BY_PATH = {**{p: "Close Date" for p in COVERAGE_PATHS},
-                        **{p: "Close Date" for p in PIPELINE_TOTAL_PATHS},
                         **{p: "Domingos comparados" for p in WOW_PATHS},
                         **{p: "Entrada na etapa" for p in FUNNEL2_PATHS},
                         **{p: "Fechamento do deal" for p in LEGAL_PATHS}}
@@ -2522,8 +2523,9 @@ def get_filters():
         # "tem qualquer data preenchida".
         # Saneado aqui, como as datas e pelo mesmo motivo: valor inventado na URL
         # não pode deixar a página num 4º estado sem chip aceso — cai em "todos".
-        "cdate":     (request.args.get("cdate", "")
-                      if request.args.get("cdate") in ("com", "sem") else ""),
+        # Aposentado (05/11/2026): virou `cd` acima. Fica vazio pra não viajar
+        # em link nenhum (keep/drill/nav) como corte morto.
+        "cdate":     "",
         # Presença de Customer Owner no Pipeline Total: "" (todos) · "com" · "sem".
         # Mesmo molde do `cdate` (teste de nulo, saneado na origem).
         "cown":      (request.args.get("cown", "")
@@ -2533,7 +2535,10 @@ def get_filters():
         # na URL como `cd=late,sem,2026-Q4`. Saneado aqui: só fica o que existe
         # como botão HOJE (link salvo de um trimestre que já virou cai fora em
         # vez de deixar a tela num estado sem botão aceso).
-        "cd":        _pt_cd_clean(request.args.get("cd", "")),
+        # Link antigo `?cdate=sem` (filtro que ficava dentro do gráfico) vira o
+        # botão equivalente; `cdate=com` não tem botão e cai em Todos.
+        "cd":        _pt_cd_clean(request.args.get("cd", "")
+                                  or ("sem" if request.args.get("cdate") == "sem" else "")),
         # Cortes da aba Legal: `env` = o que conta como "jurídico envolvido"
         # (ticket · interação nominal · qualquer um) e `coh` = a coorte da
         # comparação (Negociação+ · todos os fechados). Ficam aqui pelo mesmo
@@ -4244,7 +4249,7 @@ def _gran_ctx() -> dict:
     }
 
 
-def _ptchips_ctx() -> dict:
+def _ptchips_ctx(f: dict) -> dict:
     """Pipeline Total (pedido do Pedro, 05/11/2026): no lugar do date-picker,
     dois grupos de botões no topo.
       · Close date — Todos · Atrasados · Sem close date · Q atual · +1 · +2,
@@ -4252,8 +4257,8 @@ def _ptchips_ctx() -> dict:
       · Customer owner — Todos · Com · Sem, um por vez (clicar no aceso volta
         pra Todos).
     Tudo por link: o resto da URL (líder, AE, dimensões, `by`) é preservado."""
-    f_cd = set((request.args.get("cd") and _pt_cd_clean(request.args.get("cd")) or "").split(",")) - {""}
-    cown = request.args.get("cown") if request.args.get("cown") in ("com", "sem") else ""
+    f_cd = set((f.get("cd") or "").split(",")) - {""}
+    cown = f.get("cown") or ""
     base = {k: v for k, v in request.args.items()
             if k not in ("date_from", "date_to", "preset", "refresh", "cd", "cown", "cdate") and v}
 
@@ -4284,15 +4289,17 @@ def _ptchips_ctx() -> dict:
     return {"period_mode": "ptchips", "pt_cd_chips": cd_chips, "pt_co_chips": co_chips}
 
 
-def _covchips_ctx() -> dict:
+def _covchips_ctx(f: dict) -> dict:
     """Cobertura (pedido do Pedro, 05/11/2026): close date em 3 botões — trimestre
     atual e os 2 seguintes, nome relativo (Q4/26 · Q1/27 · Q2/27). UM por vez:
     cada trimestre tem a própria quota (remanescente no atual, cheia nos
     futuros), então somar trimestres distorce a cobertura. A página já abre
     pinada no atual (ver `base_context`)."""
     today = _today()
-    f_from = _parse_filter_date(request.args.get("date_from", ""))
-    f_to = _parse_filter_date(request.args.get("date_to", ""))
+    # Datas JÁ resolvidas pelo `base_context` (pin do trimestre, ponta única
+    # completada) — reler a URL aqui faria o botão aceso discordar dos dados.
+    f_from = _parse_filter_date(f.get("date_from", ""))
+    f_to = _parse_filter_date(f.get("date_to", ""))
     if not f_from or not f_to:
         f_from, f_to = _quarter_start_of(today), _quarter_end_of(today)
     base = {k: v for k, v in request.args.items()
@@ -4319,15 +4326,22 @@ def _covchips_ctx() -> dict:
     return {"period_mode": "covchips", "cv_chips": chips, "cv_label": " · ".join(bits)}
 
 
-def _period_widget_ctx() -> dict:
+def _is_coverage_page(path: str) -> bool:
+    """Cobertura BR/líderes e o espelho MX. `/mx/pipeline` NÃO: é uma tela
+    própria do México (ARR por estágio, sem quota nem close date) que só cai em
+    '/pipeline' porque `_rota_base` corta o prefixo."""
+    return path != "/mx/pipeline" and _rota_base(path) in COVERAGE_PATHS
+
+
+def _period_widget_ctx(f: dict) -> dict:
     """Contexto do filtro de período conforme a aba. Em modo 'quarter' devolve os
     presets de N trimestres, a lista de trimestres disponíveis (pro intervalo
     aberto) e o rótulo do que está selecionado. Em modo 'qchips' (Overview),
     botões de trimestre + FY por ano."""
     if _rota_base(request.path) in PIPELINE_TOTAL_PATHS:
-        return _ptchips_ctx()
-    if _rota_base(request.path) in COVERAGE_PATHS:
-        return _covchips_ctx()
+        return _ptchips_ctx(f)
+    if _is_coverage_page(request.path):
+        return _covchips_ctx(f)
     if request.path in _QCHIP_PERIOD_PATHS:
         return _qchip_ctx()
     if request.path in _GRAN_PERIOD_PATHS:
@@ -4372,7 +4386,9 @@ def build_active_chips(filters: dict, current_path: str) -> list[dict]:
     # chip "De: …" vindo de link antigo/salvo mentiria sobre o que está na tela.
     _skip = ({"date_from", "date_to"}
              if _rota_base(current_path) in WOW_PATHS + WOW_HIST_PATHS
-             + PIPELINE_DOD_PATHS + PIPELINE_TOTAL_PATHS + COVERAGE_PATHS else set())
+             + PIPELINE_DOD_PATHS + PIPELINE_TOTAL_PATHS else set())
+    if _is_coverage_page(current_path):
+        _skip = _skip | {"date_from", "date_to"}
     # Pipeline Total ignora a janela de datas (close date é por botão) e na
     # Cobertura o trimestre já aparece aceso no botão — chip "De/Até" seria
     # duplicado ou mentira.
@@ -4553,7 +4569,7 @@ def base_context():
         "bi_freshness": bi_freshness(),
         # Filtro de PERÍODO mutável por aba: 'quarter' (Sales Overtime) troca o
         # date-range por presets de N trimestres + intervalo aberto quarter→quarter.
-        **_period_widget_ctx(),
+        **_period_widget_ctx(f),
         # Chama _money_mode() em vez de reler a querystring: a regra do México
         # ("sempre ARR US$") mora lá, e a cópia daqui não a tinha. O efeito era
         # o pior tipo de erro — o MESMO card em duas moedas: o subtítulo do drill
