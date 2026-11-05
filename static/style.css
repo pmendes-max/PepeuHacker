@@ -436,29 +436,6 @@ nav a.active{
 .f-btn.primary:hover{filter:brightness(1.05);box-shadow:var(--shadow-md)}
 .f-btn.secondary{background:var(--surface);color:var(--fg);border:1px solid var(--border)}
 .f-btn.secondary:hover{background:var(--surface-2)}
-.f-btn.refresh{background:var(--surface);color:var(--blue);border:1px solid var(--border)}
-.f-btn.refresh:hover{background:var(--blue-soft);border-color:var(--blue)}
-
-/* Selo de frescor — a idade do DADO ao lado do botão de refresh. Discreto
-   enquanto a fonte está em dia; vermelho quando passa de 3h sem gravar, que é
-   o sinal de que a ingestão do HubSpot travou e o número na tela envelheceu. */
-.fresh-seal{
-  display:inline-flex;align-items:center;gap:5px;
-  padding:8px 12px;border-radius:var(--radius-sm);
-  font-size:12px;font-weight:600;color:var(--muted);
-  background:var(--surface-2);border:1px solid var(--border);
-  white-space:nowrap;cursor:default;
-}
-.fresh-seal::before{
-  content:"";width:6px;height:6px;border-radius:50%;background:var(--green,#10B981);
-}
-.fresh-seal.is-stale{color:var(--red);border-color:var(--red);background:transparent}
-.fresh-seal.is-stale::before{background:var(--red)}
-/* 2ª linha do selo: idade da base do BI (valor, dono, PO), embaixo do selo vivo */
-.fresh-stack{display:inline-flex;flex-direction:column;align-items:flex-start;gap:3px}
-.fresh-bi{font-size:11px;font-weight:500;color:var(--muted);white-space:nowrap;padding:0 2px;cursor:default}
-.fresh-bi.is-stale{color:var(--red)}
-
 /* ---------- LAYOUT ---------- */
 .wrap{max-width:1720px;margin:0 auto;padding:32px 28px 80px}
 h1{
