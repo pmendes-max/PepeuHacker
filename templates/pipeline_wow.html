@@ -68,7 +68,9 @@
         <div class="wf-area"><div class="wf-plot">
           <div class="wf-zero" style="bottom:{{ st.zero }}%"></div>
           <div class="wf-bar{% if st.val < 0 %} is-neg{% endif %}" style="bottom:{{ st.bottom }}%;height:max(2px,{{ st.height }}%);background:{{ st.color }}"></div>
-          {% if st.val >= 0 %}
+          {% if st.val|abs < 0.5 %}
+          <div class="wf-val wf-nil" style="bottom:calc({{ st.bottom }}% + 4px)">{{ 0|brl }}</div>
+          {% elif st.val >= 0 %}
           <div class="wf-val" style="bottom:calc({{ st.bottom + st.height }}% + 4px)">+{{ st.val|brl }}</div>
           {% else %}
           <div class="wf-val" style="top:calc({{ 100 - st.bottom }}% + 4px)">−{{ (-st.val)|brl }}</div>
@@ -94,6 +96,7 @@
   .wf-bar.is-neg{border-radius:0 0 4px 4px}
   .wf-val{position:absolute;left:0;right:0;text-align:center;font-size:12.5px;font-weight:700;white-space:nowrap;font-variant-numeric:tabular-nums}
   .wf-saldo .wf-val{font-size:14px}
+  .wf-val.wf-nil{font-weight:500;color:var(--muted)}
   .wf-exit .wf-bar{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.28) 0 6px,transparent 6px 12px)}
   .wf-exit-tag{position:absolute;left:0;right:0;text-align:center;font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap}
   .wf-lbl{font-size:12px;color:var(--muted);text-align:center;line-height:1.3}
