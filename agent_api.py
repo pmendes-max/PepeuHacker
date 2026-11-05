@@ -208,8 +208,9 @@ _TELAS = {
                   "Procurement) contra o que falta da meta. O período filtra o close date."),
     "/pipeline/total": ("Pipeline Total",
                         "Todo o dinheiro aberto no funil por estágio, cortável por deal type (dtype), source, "
-                        "produto (prod), forecast category (fcat), close date preenchido (cdate=com|sem) e "
-                        "customer owner (cown=com|sem)."),
+                        "produto (prod), forecast category (fcat), close date em botões (cd=lista separada por vírgula de "
+                        "late = atrasados, sem = sem close date, AAAA-Qn = trimestre atual e os 2 seguintes; "
+                        "vários = união) e customer owner (cown=com|sem). Não usa date_from/date_to nem preset."),
     "/pipeline/stalled": ("Pipeline · Stale",
                           "Deals parados por tempo no estágio (SLA por estágio) e a movimentação domingo × "
                           "domingo anterior."),

@@ -5,26 +5,10 @@
 <h1>Pipeline Total</h1>
 <div class="page-sub">
   Deals <b>abertos</b> do {{ ctx.pipeline_label }} · amount por estágio do funil
-  {%- if cdate == 'sem' %} · <b>só deals sem close date</b>
-  {%- elif cdate == 'com' %} · só deals <b>com</b> close date{% endif %}
+  {%- if cd_text %} · close date <b>{{ cd_text }}</b>{% endif %}
   {%- if cown == 'sem' %} · <b>só deals sem customer owner</b>
   {%- elif cown == 'com' %} · só deals <b>com</b> customer owner{% endif %}
-  {%- if (ctx.filters.date_from or ctx.filters.date_to) and cdate != 'sem' %} · close date em <b>{{ ctx.period_text }}</b>{% endif %}
-  {%- if n_sem_close %} ·
-  <span title="O HubSpot não tem close date nesses deals, então a janela de datas não consegue classificá-los.">{{ n_sem_close }} deals sem close date ficaram fora</span>
-  {%- endif %}
 </div>
-
-{% if cdate_ignora_janela %}
-{# Deal sem close date não cai em intervalo nenhum: aplicar as duas coisas
-   juntas devolveria sempre vazio. A janela é ignorada e isso é DITO — o
-   silêncio faria a tela parecer quebrada em vez de contraditória. #}
-<div class="pt-cd-warn">
-  <b>Janela de datas ignorada.</b> Deal sem close date não cai em intervalo
-  nenhum, então o período do topo não se aplica a este recorte — estão sendo
-  mostrados todos os deals abertos sem data.
-</div>
-{% endif %}
 
 {# ---------- Totais ----------
    `_drill` carrega os filtros da página pro endpoint, pra a lista explodida
@@ -78,25 +62,6 @@
   <div class="panel-head">
     <h2>Amount por estágio do funil{% if by %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· empilhado por {{ dims|selectattr('key','equalto',by)|map(attribute='label')|first }}</span>{% endif %}</h2>
     <span class="ph" style="margin:0">altura da barra = {{ ctx.money_sym }} em pipeline · ordem do funil</span>
-  </div>
-
-  {# Presença de close date: recorte da PÁGINA, não empilhamento — por isso vem
-     em linha própria, acima do switcher, e não como mais uma dimensão. #}
-  <div class="pt-cd-filter">
-    <span class="pt-cd-lbl">Close date</span>
-    <div class="grain-switch">
-      <a class="grain-btn {% if not cdate %}active{% endif %}" href="{{ cdate_urls[''] }}">Todos</a>
-      <a class="grain-btn {% if cdate == 'com' %}active{% endif %}" href="{{ cdate_urls['com'] }}">Com close date</a>
-      <a class="grain-btn {% if cdate == 'sem' %}active{% endif %}" href="{{ cdate_urls['sem'] }}">Sem close date</a>
-    </div>
-  </div>
-  <div class="pt-cd-filter">
-    <span class="pt-cd-lbl">Customer Owner</span>
-    <div class="grain-switch">
-      <a class="grain-btn {% if not cown %}active{% endif %}" href="{{ cown_urls[''] }}">Todos</a>
-      <a class="grain-btn {% if cown == 'com' %}active{% endif %}" href="{{ cown_urls['com'] }}">Com customer owner</a>
-      <a class="grain-btn {% if cown == 'sem' %}active{% endif %}" href="{{ cown_urls['sem'] }}">Sem customer owner</a>
-    </div>
   </div>
 
   {# `keep` vem da rota já sem chaves vazias (ver comentário lá). #}
@@ -547,12 +512,6 @@
 </script>
 <style>
   .pt-h2-sub{font-size:13px;font-weight:400;color:var(--muted)}
-  .pt-cd-filter{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-  .pt-cd-lbl{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.02em}
-  .pt-cd-warn{margin:0 0 16px;padding:11px 15px;border-radius:10px;font-size:12.5px;
-    line-height:1.6;border:1px solid #F59E0B55;color:var(--muted);
-    background:color-mix(in srgb,#F59E0B 7%,transparent)}
-  .pt-cd-warn b{color:var(--fg)}
   /* Recorte pela legenda: os totais deixam de ser o filtro do topo, e isso tem
      que estar ESCRITO — número menor sem explicação é lido como bug. */
   .pt-sel-note{margin:12px 2px 0;font-size:12px;color:var(--muted);line-height:1.6}

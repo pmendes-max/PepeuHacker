@@ -2428,7 +2428,9 @@ PRESET_KEYS_BY_PATH = {
     **{p: ("wow_1w", "wow_2w", "wow_4w", "wow_8w") for p in WOW_PATHS},
     # Mesmos presets da Cobertura (close date olha pra frente), mas sem pin:
     # a aba abre com o funil inteiro e o trimestre é uma escolha do usuário.
-    **{p: ("current_q", "next_q", "next_2q") for p in PIPELINE_TOTAL_PATHS},
+    # Pipeline Total: sem presets — close date é por botão (`cd`) e a janela de
+    # datas é ignorada; oferecer preset aqui (ex. pra API de agentes) recortaria nada.
+    **{p: () for p in PIPELINE_TOTAL_PATHS},
     # Só presets pra trás: a aba mede desfecho, e trimestre futuro não tem
     # deal fechado pra medir.
     **{p: ("current_q", "last_q", "this_year", "last_year", "all") for p in LEGAL_PATHS},
@@ -2446,10 +2448,47 @@ def filter_presets_for_path(presets: list[dict], path: str) -> list[dict]:
 # Label do filtro de período varia por rota — na Cobertura é Close Date do HubSpot
 # e no WoW são os 2 domingos comparados.
 PERIOD_LABEL_BY_PATH = {**{p: "Close Date" for p in COVERAGE_PATHS},
-                        **{p: "Close Date" for p in PIPELINE_TOTAL_PATHS},
                         **{p: "Domingos comparados" for p in WOW_PATHS},
                         **{p: "Entrada na etapa" for p in FUNNEL2_PATHS},
                         **{p: "Fechamento do deal" for p in LEGAL_PATHS}}
+
+
+def _rel_quarters(n: int = 3, today_d=None) -> list:
+    """Trimestre atual + os (n-1) seguintes, como datas de início. Base dos
+    botões de close date do Pipeline Total e da Cobertura: o nome anda sozinho
+    na virada (no Q4/26 → Q4/26, Q1/27, Q2/27; no Q1/27 → Q1/27, Q2/27, Q3/27)."""
+    q = _quarter_start_of(today_d or _today())
+    out = []
+    for _ in range(n):
+        out.append(q)
+        q = _next_quarter(q)
+    return out
+
+
+# Botões de close date do Pipeline Total, na ordem da tela. Os trimestres entram
+# depois, calculados a cada request (`_rel_quarters`).
+_PT_CD_FIXED = (("late", "Atrasados"), ("sem", "Sem close date"))
+
+
+def _pt_cd_options(today_d=None) -> list:
+    """[(token, rótulo, início, fim)] dos botões de close date do Pipeline Total."""
+    out = [(k, lbl, None, None) for k, lbl in _PT_CD_FIXED]
+    for q in _rel_quarters(3, today_d):
+        out.append((_quarter_key(q), _quarter_label(q), q, _quarter_end_of(q)))
+    return out
+
+
+def _pt_cd_text(cd: str) -> str:
+    """'late,2026-Q4' → 'Atrasados + Q4/26' (subtítulo da página e do drill)."""
+    sel = set((cd or "").split(","))
+    return " + ".join(lbl for k, lbl, *_ in _pt_cd_options() if k in sel)
+
+
+def _pt_cd_clean(raw: str) -> str:
+    """Saneia o `cd` da URL: só tokens que existem como botão hoje, sem
+    repetição, na ordem da tela (URL canônica → mesmo cache, mesmo link)."""
+    want = {t.strip() for t in (raw or "").replace(" ", ",").split(",") if t.strip()}
+    return ",".join(k for k, *_ in _pt_cd_options() if k in want)
 
 
 def get_filters():
@@ -2484,12 +2523,22 @@ def get_filters():
         # "tem qualquer data preenchida".
         # Saneado aqui, como as datas e pelo mesmo motivo: valor inventado na URL
         # não pode deixar a página num 4º estado sem chip aceso — cai em "todos".
-        "cdate":     (request.args.get("cdate", "")
-                      if request.args.get("cdate") in ("com", "sem") else ""),
+        # Aposentado (05/11/2026): virou `cd` acima. Fica vazio pra não viajar
+        # em link nenhum (keep/drill/nav) como corte morto.
+        "cdate":     "",
         # Presença de Customer Owner no Pipeline Total: "" (todos) · "com" · "sem".
         # Mesmo molde do `cdate` (teste de nulo, saneado na origem).
         "cown":      (request.args.get("cown", "")
                       if request.args.get("cown") in ("com", "sem") else ""),
+        # Close date do Pipeline Total em BOTÕES (pedido do Pedro, 05/11/2026):
+        # Atrasados · Sem close date · trimestre atual · +1 · +2, multi-seleção,
+        # na URL como `cd=late,sem,2026-Q4`. Saneado aqui: só fica o que existe
+        # como botão HOJE (link salvo de um trimestre que já virou cai fora em
+        # vez de deixar a tela num estado sem botão aceso).
+        # Link antigo `?cdate=sem` (filtro que ficava dentro do gráfico) vira o
+        # botão equivalente; `cdate=com` não tem botão e cai em Todos.
+        "cd":        _pt_cd_clean(request.args.get("cd", "")
+                                  or ("sem" if request.args.get("cdate") == "sem" else "")),
         # Cortes da aba Legal: `env` = o que conta como "jurídico envolvido"
         # (ticket · interação nominal · qualquer um) e `coh` = a coorte da
         # comparação (Negociação+ · todos os fechados). Ficam aqui pelo mesmo
@@ -4200,11 +4249,99 @@ def _gran_ctx() -> dict:
     }
 
 
-def _period_widget_ctx() -> dict:
+def _ptchips_ctx(f: dict) -> dict:
+    """Pipeline Total (pedido do Pedro, 05/11/2026): no lugar do date-picker,
+    dois grupos de botões no topo.
+      · Close date — Todos · Atrasados · Sem close date · Q atual · +1 · +2,
+        multi-seleção (cada botão liga/desliga; 'Todos' limpa).
+      · Customer owner — Todos · Com · Sem, um por vez (clicar no aceso volta
+        pra Todos).
+    Tudo por link: o resto da URL (líder, AE, dimensões, `by`) é preservado."""
+    f_cd = set((f.get("cd") or "").split(",")) - {""}
+    cown = f.get("cown") or ""
+    base = {k: v for k, v in request.args.items()
+            if k not in ("date_from", "date_to", "preset", "refresh", "cd", "cown", "cdate") and v}
+
+    def _url(cd_set, co):
+        q = dict(base)
+        cd = ",".join(k for k, *_ in _pt_cd_options() if k in cd_set)
+        if cd:
+            q["cd"] = cd
+        if co:
+            q["cown"] = co
+        return request.path + ("?" + urllib.parse.urlencode(q) if q else "")
+
+    cd_chips = [{"key": "", "label": "Todos", "active": not f_cd, "url": _url(set(), cown)}]
+    for tok, lbl, qa, qb in _pt_cd_options():
+        on = tok in f_cd
+        cd_chips.append({
+            "key": tok, "label": lbl, "active": on,
+            "url": _url(f_cd - {tok} if on else f_cd | {tok}, cown),
+            "late": tok == "late",
+            "title": ("Close date já passou e o deal segue aberto (qualquer trimestre)"
+                      if tok == "late" else "Deal aberto sem close date no HubSpot"
+                      if tok == "sem" else
+                      f'Close date de {qa.strftime("%d/%m/%Y")} a {qb.strftime("%d/%m/%Y")}'),
+        })
+    co_chips = [{"key": k, "label": lbl, "active": cown == k,
+                 "url": _url(f_cd, "" if (cown == k or not k) else k)}
+                for k, lbl in (("", "Todos"), ("com", "Com"), ("sem", "Sem"))]
+    return {"period_mode": "ptchips", "pt_cd_chips": cd_chips, "pt_co_chips": co_chips}
+
+
+def _covchips_ctx(f: dict) -> dict:
+    """Cobertura (pedido do Pedro, 05/11/2026): close date em 3 botões — trimestre
+    atual e os 2 seguintes, nome relativo (Q4/26 · Q1/27 · Q2/27). UM por vez:
+    cada trimestre tem a própria quota (remanescente no atual, cheia nos
+    futuros), então somar trimestres distorce a cobertura. A página já abre
+    pinada no atual (ver `base_context`)."""
+    today = _today()
+    # Datas JÁ resolvidas pelo `base_context` (pin do trimestre, ponta única
+    # completada) — reler a URL aqui faria o botão aceso discordar dos dados.
+    f_from = _parse_filter_date(f.get("date_from", ""))
+    f_to = _parse_filter_date(f.get("date_to", ""))
+    if not f_from or not f_to:
+        f_from, f_to = _quarter_start_of(today), _quarter_end_of(today)
+    base = {k: v for k, v in request.args.items()
+            if k not in ("date_from", "date_to", "preset", "refresh") and v}
+    cur_q = _quarter_start_of(today)
+    chips = []
+    for pk, q in zip(("current_q", "next_q", "next_2q"), _rel_quarters(3, today)):
+        qe = _quarter_end_of(q)
+        chips.append({
+            "label": _quarter_label(q), "active": (f_from == q and f_to == qe),
+            "url": request.path + "?" + urllib.parse.urlencode(
+                {**base, "preset": pk, "date_from": q.isoformat(), "date_to": qe.isoformat()}),
+            "title": f'Close date de {q.strftime("%d/%m/%Y")} a {qe.strftime("%d/%m/%Y")}',
+        })
+    act = next((c for c in chips if c["active"]), None)
+    rng = f'{f_from.strftime("%d/%m")} – {f_to.strftime("%d/%m/%Y")}'
+    bits = [f'{act["label"]} · {rng}' if act else rng]
+    if _quarter_start_of(f_from) > cur_q:
+        bits.append("quota cheia (trimestre futuro)")
+    else:
+        bits.append("quota remanescente (já desconta o vendido)")
+        if _quarter_start_of(f_from) == cur_q:
+            bits.append(f"semana {_quarter_week(today)} do trimestre")
+    return {"period_mode": "covchips", "cv_chips": chips, "cv_label": " · ".join(bits)}
+
+
+def _is_coverage_page(path: str) -> bool:
+    """Cobertura BR/líderes e o espelho MX. `/mx/pipeline` NÃO: é uma tela
+    própria do México (ARR por estágio, sem quota nem close date) que só cai em
+    '/pipeline' porque `_rota_base` corta o prefixo."""
+    return path != "/mx/pipeline" and _rota_base(path) in COVERAGE_PATHS
+
+
+def _period_widget_ctx(f: dict) -> dict:
     """Contexto do filtro de período conforme a aba. Em modo 'quarter' devolve os
     presets de N trimestres, a lista de trimestres disponíveis (pro intervalo
     aberto) e o rótulo do que está selecionado. Em modo 'qchips' (Overview),
     botões de trimestre + FY por ano."""
+    if _rota_base(request.path) in PIPELINE_TOTAL_PATHS:
+        return _ptchips_ctx(f)
+    if _is_coverage_page(request.path):
+        return _covchips_ctx(f)
     if request.path in _QCHIP_PERIOD_PATHS:
         return _qchip_ctx()
     if request.path in _GRAN_PERIOD_PATHS:
@@ -4249,7 +4386,12 @@ def build_active_chips(filters: dict, current_path: str) -> list[dict]:
     # chip "De: …" vindo de link antigo/salvo mentiria sobre o que está na tela.
     _skip = ({"date_from", "date_to"}
              if _rota_base(current_path) in WOW_PATHS + WOW_HIST_PATHS
-             + PIPELINE_DOD_PATHS else set())
+             + PIPELINE_DOD_PATHS + PIPELINE_TOTAL_PATHS else set())
+    if _is_coverage_page(current_path):
+        _skip = _skip | {"date_from", "date_to"}
+    # Pipeline Total ignora a janela de datas (close date é por botão) e na
+    # Cobertura o trimestre já aparece aceso no botão — chip "De/Até" seria
+    # duplicado ou mentira.
     # Mesmo motivo, outro filtro: os links das sub-abas viajam com `**ctx.filters`,
     # então escolher "Aquisição" no Forecast levava o chip junto pro Histórico e
     # pro Modelo Analytics — telas que ignoram o corte e mostram o time inteiro.
@@ -4427,7 +4569,7 @@ def base_context():
         "bi_freshness": bi_freshness(),
         # Filtro de PERÍODO mutável por aba: 'quarter' (Sales Overtime) troca o
         # date-range por presets de N trimestres + intervalo aberto quarter→quarter.
-        **_period_widget_ctx(),
+        **_period_widget_ctx(f),
         # Chama _money_mode() em vez de reler a querystring: a regra do México
         # ("sempre ARR US$") mora lá, e a cópia daqui não a tinha. O efeito era
         # o pior tipo de erro — o MESMO card em duas moedas: o subtítulo do drill
@@ -5665,7 +5807,7 @@ def _page_slice_keys(path: str) -> list:
     keys = [x["key"] for x in _extra_filters_for_path(path)]
     base = _rota_base(path)
     if base in PIPELINE_TOTAL_PATHS:
-        keys += ["cdate", "cown"]
+        keys += ["cd", "cown"]
     if base in LEGAL_PATHS:
         keys += ["env", "coh"]
     return keys
@@ -7530,17 +7672,14 @@ def _pt_series_key(df: pd.DataFrame, dim: str) -> pd.Series:
 
 def _pt_filtered_frame(f: dict, force: bool = False):
     """Universo do Pipeline Total já filtrado: deals ABERTOS do Sales BR com
-    roster aplicado + todos os cortes da página (região, líder, AE, close date,
-    deal type, source, product, forecast category).
-
-    O corte de close date tem DUAS partes independentes: a presença (`cdate`:
-    todos · com · sem) e a janela de datas da barra do topo. Ver o bloco marcado
-    lá embaixo pra por que uma desliga a outra.
+    roster aplicado + todos os cortes da página (região, líder, AE, close date
+    em botões `cd`, customer owner, deal type, source, product, forecast category).
 
     Compartilhado pelo gráfico e pelo drill-down DE PROPÓSITO: se cada um
     montasse seu próprio filtro, a lista explodida passaria a discordar da barra
     no primeiro ajuste — é o bug clássico de drill. Devolve (df, n_sem_close),
-    onde n_sem_close = deals descartados por não ter close date quando há janela.
+    onde n_sem_close hoje é sempre 0 (era o que a janela de datas descartava;
+    a página não tem mais janela) — mantido pela assinatura dos chamadores.
     """
     df = bq.pipeline_total_raw(force_refresh=force, pipeline=_pl())
     df = _apply_roster_current(df)
@@ -7561,57 +7700,39 @@ def _pt_filtered_frame(f: dict, force: bool = False):
     if f.get("ae"):
         df = df[df["account_executive"] == f["ae"]]
 
-    # ---- Close date: PRESENÇA (filtro da página) + JANELA (barra de datas) ----
-    #
-    # O filtro de presença vem primeiro porque ele decide se a janela faz sentido.
-    # "Sem close date" e janela de datas são mutuamente excludentes POR DEFINIÇÃO:
-    # deal sem data nunca cai num intervalo. Se as duas fossem aplicadas juntas o
-    # resultado seria sempre vazio, e a tela pareceria quebrada em vez de
-    # contraditória — então a janela é IGNORADA quando o usuário pede o bucket sem
-    # data, e a página diz que ignorou (`cdate_ignora_janela`). Metade do pipe
-    # aberto não tem close date preenchido no HubSpot, então esse bucket é grande
-    # demais pra só existir como "ficaram de fora" no subtítulo.
-    cdate = f.get("cdate", "")
-    if cdate in ("com", "sem"):
-        _cd = pd.to_datetime(df["close_date"], errors="coerce")
-        df = df[_cd.isna() if cdate == "sem" else _cd.notna()]
-
     # Presença de Customer Owner (CS). id vazio/NaN = sem dono de conta.
     cown = f.get("cown", "")
     if cown in ("com", "sem"):
         _co = df["customer_owner_id"].astype("string").str.strip().replace("", pd.NA)
         df = df[_co.isna() if cown == "sem" else _co.notna()]
 
-    lo, hi = _parse_filter_date(f.get("date_from")), _parse_filter_date(f.get("date_to"))
+    # ---- Close date: botões (Atrasados · Sem close date · Q atual · +1 · +2) ----
+    # Multi-seleção = UNIÃO (OR): "Atrasados + Q4/26" é o deal que está em
+    # qualquer um dos dois, contado uma vez só. Nenhum botão = todos os abertos.
+    # Atrasado = close date ANTES de hoje e o deal segue aberto (qualquer
+    # trimestre, inclusive os antigos). O trimestre atual inclui os atrasados
+    # dele mesmo — o botão responde "close date dentro do Q4", sem exceção.
+    # Comparação em Timestamp normalizado (nunca `.dt.date`): coluna toda NaT
+    # num recorte pequeno (AE recém-contratado) virava TypeError/500 com date.
+    # NaT compara False em tudo, então deal sem data só entra por "sem".
+    # A janela de datas (date_from/date_to) NÃO se aplica mais aqui: a página não
+    # tem date-picker, e as datas que viajam nos links das outras abas (ex.: o
+    # pin de trimestre da Cobertura) recortariam o funil sem nada na tela dizer.
+    sel = set((f.get("cd") or "").split(",")) - {""}
+    if sel:
+        cdn = pd.to_datetime(df["close_date"], errors="coerce").dt.normalize()
+        m = pd.Series(False, index=df.index)
+        for tok, _lbl, qa, qb in _pt_cd_options():
+            if tok not in sel:
+                continue
+            if tok == "sem":
+                m |= cdn.isna()
+            elif tok == "late":
+                m |= (cdn < pd.Timestamp(_today())).fillna(False)
+            else:
+                m |= ((cdn >= pd.Timestamp(qa)) & (cdn <= pd.Timestamp(qb))).fillna(False)
+        df = df[m]
     n_sem_close = 0
-    if (lo or hi) and cdate != "sem":
-        cd = pd.to_datetime(df["close_date"], errors="coerce")
-        sem_close = cd.isna()
-        n_sem_close = int(sem_close.sum())
-        keep = ~sem_close
-        # Comparação em datetime64 (Timestamp), NUNCA em `.dt.date`: quando o recorte
-        # não tem NENHUM close date preenchido, `cd` fica todo-NaT e o `.dt.date` de
-        # série todo-NaT devolve datetime64[ns] em vez de object-de-date — comparar
-        # isso com um datetime.date levanta TypeError e a página inteira vira 500. O
-        # `keep = ~sem_close` NÃO protege: pandas avalia os dois lados do `&` antes de
-        # combinar, então não há curto-circuito. Cenário real, não teórico: basta
-        # filtrar por um AE recém-contratado, cujos deals ainda estão todos sem Close
-        # Date — o recorte de UMA pessoa é o que torna "coluna toda nula" alcançável,
-        # ao contrário dos cortes que rodam sobre o frame inteiro.
-        # `.dt.normalize()` (e não Timestamp cru sobre `cd`) preserva a semântica de
-        # DIA que o filtro sempre teve: zera a hora dos dois lados, então a borda de
-        # cima continua incluindo o último dia INTEIRO. Hoje `close_date` é dbdate
-        # (0 de 16.499 linhas com hora != 00:00), logo os dois jeitos empatam — mas o
-        # empate seria acidente da fonte, e no dia em que ela virar timestamp o
-        # `<= Timestamp(hi)` passaria a descartar calado o que fecha depois da meia
-        # noite do último dia. NaT normaliza pra NaT e compara False, que é o que se
-        # quer: deal sem close date já sai por `~sem_close` e é contado em n_sem_close.
-        cdn = cd.dt.normalize()
-        if lo:
-            keep &= cdn >= pd.Timestamp(lo)
-        if hi:
-            keep &= cdn <= pd.Timestamp(hi)
-        df = df[keep]
 
     # ---- Cortes de negócio ----
     for dim in _PT_DIMS:
@@ -7821,6 +7942,8 @@ def pipeline_total_deals():
     wsum   = sum(x["weighted"] for x in rows if x["weighted"] is not None)
     show_ae = "leader" if (grain == "leader" or not f.get("ae")) else "ae"
     sub = _drill_money_subtitle(len(rows), amount)
+    if f.get("cd"):
+        sub += f" · close date {_pt_cd_text(f['cd'])}"
     if wsum:
         sub += f" · ponderado {fmt_money(wsum)}"
     return jsonify({
@@ -7951,33 +8074,9 @@ def _pipeline_total_page(grain="ae"):
     # emite `?dtype=&source=` na URL, que suja o link e vira chip fantasma.
     keep = {k: v for k, v in f.items() if v and k != "role"}
 
-    # Chips de presença de close date. Montados aqui pelo mesmo motivo do `keep`:
-    # url_for com valor "" emitiria `?cdate=` e viraria chip fantasma.
-    _cd_base = {k: v for k, v in keep.items() if k != "cdate"}
-    if by:
-        _cd_base["by"] = by
-    cdate_urls = {
-        "":    url_for(request.endpoint, **_cd_base),
-        "com": url_for(request.endpoint, cdate="com", **_cd_base),
-        "sem": url_for(request.endpoint, cdate="sem", **_cd_base),
-    }
-    _co_base = {k: v for k, v in keep.items() if k != "cown"}
-    if by:
-        _co_base["by"] = by
-    cown_urls = {
-        "":    url_for(request.endpoint, **_co_base),
-        "com": url_for(request.endpoint, cown="com", **_co_base),
-        "sem": url_for(request.endpoint, cown="sem", **_co_base),
-    }
-    # A janela de datas foi descartada por incompatibilidade, não por bug.
-    cdate_ignora_janela = bool(f.get("cdate") == "sem"
-                               and (f.get("date_from") or f.get("date_to")))
-
     return render_template(
         "pipeline_total.html", ctx=ctx, grain=grain,
-        cdate=f.get("cdate", ""), cdate_urls=cdate_urls,
-        cown=f.get("cown", ""), cown_urls=cown_urls,
-        cdate_ignora_janela=cdate_ignora_janela,
+        cd_text=_pt_cd_text(f.get("cd", "")), cown=f.get("cown", ""),
         rows=rows, segs=segs, by=by, seg_totals=seg_totals,
         total_amount=total_amount, total_deals=total_deals, max_amount=max_amount,
         ticket=(total_amount / total_deals if total_deals else 0.0),
@@ -10671,7 +10770,7 @@ def _ae_quarter_quota(ae, q, f=None, force=False) -> float:
     (Q3/Q4 de 2026), linha curada antes disso. Mesma conta da aba Cobertura."""
     f_ae = {**(f or {}), "date_from": "", "date_to": "", "leader": "", "region": "",
             "role": "", "ae": ae}
-    for k in ("dtype", "source", "prod", "fcat", "cdate", "cown", "env", "coh", "money"):
+    for k in ("dtype", "source", "prod", "fcat", "cdate", "cown", "cd", "env", "coh", "money"):
         f_ae.setdefault(k, "")
     qdf = _quota_by_ae_for_window(_entity_only_filters(_get_clean_ae_perf(force=force), f_ae),
                                   q, _quarter_end_of(q), f_ae)
