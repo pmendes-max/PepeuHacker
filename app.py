@@ -9262,7 +9262,20 @@ _WOW_CAT_LABEL = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu",
 _WOW_NET_CATS = ("novo", "cresceu", "encolheu", "lost")
 
 
-def _wow_event_rows(ev):
+def _wow_cat_label(cat: str, focus: str = "") -> str:
+    """Rótulo de negócio da categoria. `transferiu` e `regrediu` dependem do
+    foco (pedido do Pedro, 05/11/2026 — "não entendi o transferiu e o voltou de
+    estágio"): no Early, transferiu = deal que VOLTOU do Late; no Late, é o que
+    voltou pro Early. Regrediu = voltou pra antes do Scoping (Scheduled /
+    Qualifying)."""
+    if cat == "transferiu" and focus:
+        return "Voltou do Late" if focus == "early" else "Voltou p/ Early"
+    if cat == "regrediu":
+        return "Voltou p/ Qualifying"
+    return _WOW_CAT_LABEL.get(cat, cat)
+
+
+def _wow_event_rows(ev, focus=""):
     """Linhas do drill a partir de eventos JÁ categorizados — uma linha por
     EVENTO, não por deal: o mesmo deal aparece 2× se cresceu e depois avançou na
     mesma semana, que é justamente o que o diff de pontas escondia.
@@ -9305,7 +9318,7 @@ def _wow_event_rows(ev):
             "deal_name": r.get("deal_name") or "—",
             "deal_url":  _hs_deal_url(r.get("deal_id")),
             "ae":        r["account_executive"],
-            "categoria": _WOW_CAT_LABEL.get(r["category"], r["category"]),
+            "categoria": _wow_cat_label(r["category"], focus),
             "movimento": mov,
             "quando":    _quando(r["ts"]),
             "delta":     float(r["delta"]),
@@ -9382,7 +9395,11 @@ def pipeline_wow_deals(focus):
         pedidas = [c.strip().lower() for c in _pedido.split(",")]
         # `cat` pedido mas inválido pra este foco → lista VAZIA, nunca "todas".
         # Cair em todas mostraria deals que não compõem o número clicado.
-        cats = [c for c in _all if c in pedidas]
+        # Fronteira (won no Early, voltou do Late/p/ Early, voltou p/
+        # Qualifying, reabriu) só quando pedida explicitamente — é o clique na
+        # barra dela no gráfico de entradas e saídas.
+        _front = ["won", "transferiu", "regrediu", "reabriu"]
+        cats = [c for c in _all + [x for x in _front if x not in _all] if c in pedidas]
     else:
         cats = list(_all)
     cat = cats[0] if len(cats) == 1 else ""
@@ -9394,7 +9411,7 @@ def pipeline_wow_deals(focus):
     _show = cats + (["sem_var"] if {"cresceu", "encolheu"} & set(cats) else [])
     ev = ev[ev["category"].isin(_show)]
 
-    rows = _wow_event_rows(ev)
+    rows = _wow_event_rows(ev, focus)
     # Saldo = MESMA conta da página: só o que aumentou/diminuiu de pipe. A 5ª
     # categoria (won no Late, movido-pra-Late no Early) fica fora e aparece à
     # parte, senão o subtítulo divergia do card "Saldo do período".
@@ -9429,7 +9446,7 @@ def pipeline_wow_deals(focus):
             _w_lbl = "movido p/ Late" if focus == "early" else "won"
             subtitle += f" · {_w_lbl} {fmt_money(won)}"
     _escopo = name or f"PoP {focus} — total"
-    _sufixo = _WOW_CAT_LABEL.get(cat, "") if cat else ("" if len(cats) == 5 else "Saldo")
+    _sufixo = _wow_cat_label(cat, focus) if cat else ("" if len(cats) == 5 else "Saldo")
     return jsonify({
         "title": (f"{_escopo} · {_sufixo}" if _sufixo else _escopo),
         "subtitle": subtitle,
@@ -9641,54 +9658,57 @@ def pipeline_funnel_deals():
     })
 
 
-_WOW_BRIDGE_COLOR = {"novo": "#15803d", "cresceu": "#86efac", "encolheu": "#fdba74",
-                     "lost": "#dc2626", "saida": "#94a3b8", "base": "#cbd5e1"}
+_WOW_FLOW_COLOR = {"novo": "#15803d", "cresceu": "#86efac", "encolheu": "#fdba74",
+                   "lost": "#dc2626", "fronteira": "#94a3b8", "var": "#16202D"}
 
 
-def _wow_bridge_steps(total_prev, total_curr, cat_totals, cat_deals, fifth,
-                      prev_label, curr_label):
-    """Degraus da ponte do time (cascata) da PoP: domingo anterior → cada
-    categoria → domingo atual. Saldo (novo/cresceu/encolheu/lost) em cor;
-    o que saiu ou entrou por FRONTEIRA (won, movido p/ Late, transferência,
-    volta de estágio, reabertura) em cinza — não é perda nem ganho de pipe.
-    Fecha exato por construção (ver `_wow_events_categorize`); se sobrar
-    diferença, ela aparece nomeada como "Ajuste" em vez de sumir.
+def _wow_flow_bars(total_prev, total_curr, cat_totals, cat_deals, fifth, focus):
+    """Gráfico de ENTRADAS e SAÍDAS do pipe do foco (pedidos do Pedro,
+    05/11/2026): o que somou fica acima da linha do zero, o que tirou fica
+    abaixo — numa escala só dos movimentos (a cascata a partir do pipe total
+    achatava tudo sob as barras de R$ 4M).
 
-    Geometria em % da altura (`bottom`/`height`), pronta pro template."""
-    lbl = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu", "lost": "Lost",
-           "won": "Won", "late": "Movido p/ Late", "transferiu": "Transferiu",
-           "regrediu": "Voltou de estágio", "reabriu": "Reabriu"}
-    order = ["novo", "cresceu", "encolheu", "lost", fifth]
-    order += [c for c in ("won", "transferiu", "regrediu", "reabriu") if c not in order]
-    steps = [{"key": "prev", "label": prev_label, "val": total_prev, "kind": "base",
-              "a": 0.0, "b": total_prev}]
-    run = total_prev
-    for c in order:
+    Ordem: Novo · Cresceu · Encolheu · Lost → SALDO (a soma dos 4) → o que mexe
+    no pipe sem ser ganho/perda (voltou do Late/p/ Early, voltou p/ Qualifying,
+    reabriu, won no Early) → por ÚLTIMO a 5ª categoria (Movido p/ Late no Early,
+    Won no Late), marcada com seta de saída. Σ de tudo menos o Saldo ==
+    variação do pipe, por construção; sobra vira barra "Ajuste".
+
+    Geometria pronta pro template: `zero` = altura (%) da linha do zero; cada
+    barra tem `bottom`/`height` em % da área."""
+    def _bar(c, v, **kw):
+        return {"key": c, "label": _wow_cat_label(c, focus), "val": float(v),
+                "deals": int(cat_deals.get(c, 0)), "drill": True,
+                "color": _WOW_FLOW_COLOR.get(c, _WOW_FLOW_COLOR["fronteira"]), **kw}
+
+    bars = [_bar(c, cat_totals.get(c, 0.0)) for c in _WOW_NET_CATS]
+    bars.append({"key": "saldo", "label": "Saldo", "val": float(cat_totals.get("net", 0.0)),
+                 "deals": 0, "drill": True, "color": _WOW_FLOW_COLOR["var"], "is_saldo": True})
+    outros = [c for c in ("transferiu", "regrediu", "reabriu", "won") if c != fifth]
+    first_front = True
+    for c in outros:
         v = float(cat_totals.get(c, 0.0))
-        if c not in _WOW_NET_CATS and abs(v) < 0.5:
-            continue                       # fronteira sem movimento: não polui
-        steps.append({"key": c, "label": lbl[c], "val": v, "a": run, "b": run + v,
-                      "kind": c if c in _WOW_NET_CATS else "saida",
-                      "deals": int(cat_deals.get(c, 0))})
-        run += v
-    if abs(total_curr - run) >= 0.5:
-        steps.append({"key": "ajuste", "label": "Ajuste", "val": total_curr - run,
-                      "a": run, "b": total_curr, "kind": "saida", "deals": 0})
-    steps.append({"key": "curr", "label": curr_label, "val": total_curr, "kind": "base",
-                  "a": 0.0, "b": total_curr})
-    # Eixo de [piso, topo]: o acumulado pode ficar NEGATIVO no meio da ponte
-    # (deal que reabre/volta e sai de novo na mesma semana, num recorte de
-    # pipe pequeno) — sem o piso a barra vazava pra baixo do gráfico.
-    top = max([max(x["a"], x["b"]) for x in steps] + [1.0])
-    floor = min([min(x["a"], x["b"]) for x in steps] + [0.0])
-    span = (top - floor) or 1.0
-    for x in steps:
-        lo, hi = min(x["a"], x["b"]), max(x["a"], x["b"])
-        x["bottom"] = round((lo - floor) / span * 100, 3)
-        x["height"] = round((hi - lo) / span * 100, 3)
-        x["zero"] = round((0 - floor) / span * 100, 3)
-        x["color"] = _WOW_BRIDGE_COLOR[x["kind"] if x["kind"] in _WOW_BRIDGE_COLOR else "saida"]
-    return steps
+        if abs(v) >= 0.5:
+            bars.append(_bar(c, v, sep=first_front))
+            first_front = False
+    var = total_curr - total_prev
+    movs = sum(float(cat_totals.get(c, 0.0)) for c in list(_WOW_NET_CATS) + outros + [fifth])
+    if abs(var - movs) >= 0.5:
+        bars.append({"key": "ajuste", "label": "Ajuste", "val": var - movs, "deals": 0,
+                     "drill": False, "color": _WOW_FLOW_COLOR["fronteira"], "sep": first_front})
+        first_front = False
+    bars.append(_bar(fifth, cat_totals.get(fifth, 0.0), sep=first_front, is_exit=True,
+                     exit_to=("Late" if fifth == "late" else "receita")))
+    pos = max([x["val"] for x in bars] + [0.0])
+    neg = max([-x["val"] for x in bars] + [0.0])
+    span = (pos + neg) or 1.0
+    zero = neg / span * 100
+    for x in bars:
+        h = abs(x["val"]) / span * 100
+        x["height"] = round(h, 3)
+        x["bottom"] = round(zero if x["val"] >= 0 else zero - h, 3)
+        x["zero"] = round(zero, 3)
+    return bars
 
 
 def _render_pipeline_wow(focus: str, grain="ae"):
@@ -9821,9 +9841,7 @@ def _render_pipeline_wow(focus: str, grain="ae"):
     y_max_neg = max(-(r["encolheu"] + r["lost"]) for r in rows) if rows else 0
     y_max     = max(y_max_pos, y_max_neg, 1.0)
 
-    bridge = _wow_bridge_steps(total_prev, total_curr, cat_totals, cat_deals, fifth,
-                               "Domingo " + prev_sun.strftime("%d/%m"),
-                               "Domingo " + last_sun.strftime("%d/%m"))
+    bridge = _wow_flow_bars(total_prev, total_curr, cat_totals, cat_deals, fifth, focus)
 
     return render_template(
         "pipeline_wow.html", ctx=ctx, bridge=bridge,
@@ -10380,7 +10398,7 @@ def pipeline_wow_history_deals():
     # entra no fim da lista de Cresceu/Encolheu/saldo pra auditoria.
     _show = cats + (["sem_var"] if {"cresceu", "encolheu"} & set(cats) else [])
     ev = ev[ev["category"].isin(_show)]
-    rows = _wow_event_rows(ev)
+    rows = _wow_event_rows(ev, focus)
 
     _janela = f"{_fmt_date_short(suns[wk - 1])} → {_fmt_date_short(suns[wk])}"
     _ev_num = ev[ev["category"] != "sem_var"]
