@@ -14917,6 +14917,10 @@ MX_ROSTER = {
     "Adolfo Mora":       {"display": "Adolfo Mora",      "tier": "Enterprise"},
     "Armando Roman":     {"display": "Armando Roman",    "tier": "Mid Market"},
     "Luis Terrazas":     {"display": "Luis Terrazas",    "tier": "Mid Market"},
+    # Entrou em ~05/10/2026 (Mid-Market AE, time do Mauricio — ramp report MX no
+    # Slack). Nome = owner do HubSpot ("Rodrigo Mejia"); no ramp report aparece
+    # como "Rodrigo Mejia De Leon". Sem meta declarada no Q4 → quota 0 até vir.
+    "Rodrigo Mejia":     {"display": "Rodrigo Mejia",    "tier": "Mid Market"},
 }
 MX_DISPLAY = {k: v["display"] for k, v in MX_ROSTER.items()}
 # Único gestor do país: os 7 respondem a ele, e ele ao VP (ver ORG_CHART).
