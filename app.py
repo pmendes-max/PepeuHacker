@@ -9226,8 +9226,16 @@ def _wow_net_amount_edits(ev):
     m = ev["category"].isin(["cresceu", "encolheu"])
     if not m.any():
         return ev
+    # "Trecho" = edições SEGUIDAS, sem evento de estágio no meio. Se o deal sai
+    # do foco e volta, as edições de antes e de depois não se juntam: entre elas
+    # o valor pode ter mudado fora do foco, e o "antes → depois" da linha
+    # passaria a contradizer o Δ dela (revisão de 05/11/2026).
+    _ord = ev.sort_values("ts", kind="stable")
+    _run = (_ord["kind"] == "stage").astype(int).groupby(_ord["deal_id"]).cumsum()
+    ev["_trecho"] = _run.reindex(ev.index)
     amt = ev[m].sort_values("ts", kind="stable")
-    keys = ["deal_id", "account_executive"] + (["week_idx"] if "week_idx" in ev.columns else [])
+    keys = (["deal_id", "account_executive", "_trecho"]
+            + (["week_idx"] if "week_idx" in ev.columns else []))
     g = amt.groupby(keys, sort=False, dropna=False)
     agg = g.agg(_delta=("delta", "sum"), _n=("delta", "size"), _a0=("amt_from", "first"))
     base = amt.drop_duplicates(keys, keep="last").set_index(keys)
@@ -9239,7 +9247,8 @@ def _wow_net_amount_edits(ev):
     base["category"] = "sem_var"
     base.loc[base["delta"] > 0, "category"] = "cresceu"
     base.loc[base["delta"] < 0, "category"] = "encolheu"
-    return pd.concat([ev[~m], base[ev.columns]], ignore_index=True)
+    out = pd.concat([ev[~m], base[ev.columns]], ignore_index=True)
+    return out.drop(columns=["_trecho"])
 
 
 _WOW_CAT_LABEL = {"novo": "Novo", "cresceu": "Cresceu", "encolheu": "Encolheu",
@@ -9667,11 +9676,17 @@ def _wow_bridge_steps(total_prev, total_curr, cat_totals, cat_deals, fifth,
                       "a": run, "b": total_curr, "kind": "saida", "deals": 0})
     steps.append({"key": "curr", "label": curr_label, "val": total_curr, "kind": "base",
                   "a": 0.0, "b": total_curr})
+    # Eixo de [piso, topo]: o acumulado pode ficar NEGATIVO no meio da ponte
+    # (deal que reabre/volta e sai de novo na mesma semana, num recorte de
+    # pipe pequeno) — sem o piso a barra vazava pra baixo do gráfico.
     top = max([max(x["a"], x["b"]) for x in steps] + [1.0])
+    floor = min([min(x["a"], x["b"]) for x in steps] + [0.0])
+    span = (top - floor) or 1.0
     for x in steps:
         lo, hi = min(x["a"], x["b"]), max(x["a"], x["b"])
-        x["bottom"] = round(lo / top * 100, 3)
-        x["height"] = round((hi - lo) / top * 100, 3)
+        x["bottom"] = round((lo - floor) / span * 100, 3)
+        x["height"] = round((hi - lo) / span * 100, 3)
+        x["zero"] = round((0 - floor) / span * 100, 3)
         x["color"] = _WOW_BRIDGE_COLOR[x["kind"] if x["kind"] in _WOW_BRIDGE_COLOR else "saida"]
     return steps
 

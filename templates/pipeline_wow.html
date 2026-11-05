@@ -63,6 +63,7 @@
            {% if _drill %}data-drill="{{ url_for('pipeline_wow_deals', focus=focus, grain=grain, cat=st.key, leader=ctx.filters.leader, region=ctx.filters.region) }}"
            title="Explodir os deals de {{ st.label }}"{% endif %}>
         <div class="wb-area">
+          {% if st.zero > 0 %}<div class="wb-zero" style="bottom:{{ st.zero }}%"></div>{% endif %}
           <div class="wb-bar" style="bottom:{{ st.bottom }}%;height:max(2px,{{ st.height }}%);background:{{ st.color }}"></div>
           <div class="wb-val" style="bottom:calc({{ st.bottom + st.height }}% + 4px)">
             {%- if st.kind == 'base' -%}{{ st.val|brl }}
@@ -84,6 +85,7 @@
   .wb-area{position:relative;height:210px;border-bottom:1px solid var(--border)}
   .wb-bar{position:absolute;left:12%;right:12%;border-radius:4px 4px 0 0}
   .wb-val{position:absolute;left:0;right:0;text-align:center;font-size:12.5px;font-weight:700;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .wb-zero{position:absolute;left:0;right:0;border-top:1px solid var(--muted);opacity:.5}
   .wb-link{position:absolute;left:88%;right:-22%;border-top:1px dashed var(--muted);opacity:.6}
   .wb-lbl{font-size:12px;color:var(--muted);text-align:center;line-height:1.3}
   .wb-lbl span{display:block;font-size:11px;opacity:.85}
