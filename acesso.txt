@@ -3,4 +3,12 @@
 #   fulano@tractian.com            → uma pessoa
 #   group:time-vendas@tractian.com → um Google Group inteiro
 # Linhas com # são ignoradas. Depois de editar, rode ./setup_acesso.sh
-pmendes@tractian.com
+pmendes@tractian.com    # Pedro Mendes — VP de Vendas
+fbarati@tractian.com    # Fernando Barati — Director of Sales
+lscopel@tractian.com    # Leonardo Scopel — Director of Sales BR & EMEA
+ggiovani@tractian.com   # Gustavo Giovani — Regional Sales Manager
+bagosti@tractian.com    # Bernardo Agosti — Director of Sales BR
+jtavares@tractian.com   # João Tavares — Regional Sales Manager
+mhierro@tractian.com    # Mauricio Del Hierro — Sales Director México
+lvieira@tractian.com    # Leonardo Vieira — CCO
+fmaia@tractian.com      # Francisco Maia — Director of TAM
