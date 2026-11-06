@@ -8,7 +8,7 @@
    `sm`    = geometria de _build_fc_small  (um card por líder, escala comum)
    `nota`  = texto opcional embaixo do gráfico (ex.: cobertura da categoria)
    ========================================================================== #}
-{% macro fc_series(lc, sm, title, sub, cor, nota='', pessoa='diretor') %}
+{% macro fc_series(lc, sm, title, sub, cor, nota='', pessoa='diretor', sm2=None, cor2='', lbl1='', lbl2='') %}
 <div class="panel">
   <div class="panel-head">
     <h2>{{ title }} <span class="h2-sub">· {{ sub }}</span></h2>
@@ -85,13 +85,17 @@
     conta no gerente <b>e</b> no diretor dele (a mesma convenção das outras telas
     de Leaders), então a soma sai ~20% acima.
   </div>
+  {% set _m2 = {} %}{% if sm2 %}{% for q in sm2.rows %}{% set _ = _m2.update({q.name: q}) %}{% endfor %}{% endif %}
+  {% if sm2 %}<div class="fc-sm-leg"><span><i style="background:{{ cor }}"></i>{{ lbl1 }}</span><span><i style="background:{{ cor2 }}"></i>{{ lbl2 }}</span></div>{% endif %}
   <div class="sm-grid">
     {% for p in sm.rows %}
+    {% set p2 = _m2.get(p.name) %}
     <div class="sm-card">
       <div class="sm-head">
         <span class="sm-name" title="{{ p.name }}">{{ p.short }}</span>
-        <span class="sm-total {% if p.att and p.att >= 1 %}is-pos{% else %}is-neg{% endif %}">
+        <span class="sm-total" style="color:{{ att_color(p.att) }}" title="{{ lbl1 or 'atingimento' }}">
           {% if p.att is not none %}{{ (p.att*100)|round|int }}%{% else %}—{% endif %}
+          {% if p2 %}<span style="color:var(--muted);font-weight:600"> · </span><span style="color:{{ att_color(p2.att) }}" title="{{ lbl2 }}">{% if p2.att is not none %}{{ (p2.att*100)|round|int }}%{% else %}—{% endif %}</span>{% endif %}
         </span>
       </div>
       <svg class="sm-svg" viewBox="0 0 {{ sm.w }} {{ sm.h }}" preserveAspectRatio="none"
@@ -108,9 +112,15 @@
         {% for pt in p.points %}
           <circle cx="{{ pt.cx }}" cy="{{ pt.cy }}" r="1.8" fill="{{ cor }}"/>
         {% endfor %}
+        {% if p2 %}
+          {% for seg in p2.segs %}
+            <polyline points="{{ seg }}" fill="none" stroke="{{ cor2 }}" stroke-width="2"
+                      stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+          {% endfor %}
+        {% endif %}
       </svg>
       <div class="sm-foot">
-        <span title="começo → fim da janela">{{ p.start|brl }} → <b>{{ p.end|brl }}</b></span>
+        <span title="começo → fim da janela">{{ p.start|brl }} → <b>{{ p.end|brl }}</b>{% if p2 %} · <b style="color:{{ cor2 }}">{{ p2.end|brl }}</b>{% endif %}</span>
         <span class="{% if p.delta >= 0 %}is-pos{% else %}is-neg{% endif %}">
           {{ '+' if p.delta >= 0 else '−' }}{{ (p.delta if p.delta >= 0 else -p.delta)|brl }}
         </span>
@@ -120,4 +130,8 @@
   </div>
   {% endif %}
 </div>
+<style>
+  .fc-sm-leg{display:flex;gap:14px;font-size:12px;color:var(--muted);margin:-4px 0 10px}
+  .fc-sm-leg i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:6px;vertical-align:3px}
+</style>
 {% endmacro %}

@@ -240,7 +240,6 @@
     <a href="{{ url_for('forecast', **ctx.filters) }}"       class="{% if ctx.current_path == '/forecast' %}active{% endif %}">Forecast</a>
     <a href="{{ url_for('forecast_model', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/model' %}active{% endif %}">Modelo Analytics</a>
     <a href="{{ url_for('forecast_wow', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/wow' %}active{% endif %}">WoW</a>
-    <a href="{{ url_for('forecast_history', **ctx.filters) }}" class="{% if ctx.current_path == '/forecast/history' %}active{% endif %}">Histórico</a>
   </div>
 </div>
 {% elif ctx.current_path and ctx.current_path.startswith('/leaders/forecast') %}

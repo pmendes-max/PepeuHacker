@@ -12833,6 +12833,16 @@ def _render_forecast_history(grain="ae"):
                                   span=span_cards),
         proj_dir_now=_fim(proj_dir), proj_dir_ini=_ini(proj_dir),
         att_dir=(_fim(proj_dir) / meta_team) if meta_team else None,
+        # --- Gráfico ÚNICO com os dois modelos (pedido do Pedro, 06/11/2026)
+        chart_both=_build_fc_line(
+            suns,
+            [{"name": "Modelo Analytics (Done + Forecast)", "color": "#2563EB",
+              "values": proj_model},
+             {"name": "Modelo dos diretores (Done + Forecast ponderado)", "color": "#7C3AED",
+              "values": proj_dir},
+             {"name": "Done acumulado (PO Won)", "color": "#0F6E56",
+              "values": done, "dash": "5 4"}],
+            goal=meta_team, y_max=y_max_comum),
         cobertura=cobertura,
         meta_ok=meta_ok,
         sem_serie=not any(v is not None for v in proj_model),
