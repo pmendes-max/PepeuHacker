@@ -16563,7 +16563,11 @@ def _mx_wow_deals(focus):
 
 # Servidor MCP pros agentes de IA. Fica DEPOIS de todas as rotas: o catálogo de
 # telas que ele oferece sai do url_map. K_REVISION = revisão do Cloud Run.
-agent_api.init(app, base_context, versao_app=os.environ.get("K_REVISION", ""))
+# Servidor MCP (/mcp) DESLIGADO a pedido do Pedro (06/11/2026). Pra religar,
+# publicar com a variável de ambiente PEPEU_MCP=on. Sem ela a rota nem existe
+# (404). O modo ?format=json das telas não depende disto.
+if os.environ.get("PEPEU_MCP") == "on":
+    agent_api.init(app, base_context, versao_app=os.environ.get("K_REVISION", ""))
 
 
 if __name__ == "__main__":

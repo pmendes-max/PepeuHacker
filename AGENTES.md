@@ -1,3 +1,8 @@
+> **DESLIGADO em 06/11/2026 (pedido do Pedro).** A rota `/mcp` só existe se o app
+> for publicado com `PEPEU_MCP=on`; o kit do conector (`tools/mcp_local.py`,
+> `tools/kit_conector`, `dist/`) saiu do repositório e o serviço `pepeuhacker-api`
+> deve ser apagado. O texto abaixo fica só como registro de como funcionava.
+
 # Agentes de IA no pepeuhacker
 
 Os agentes leem o dashboard pelos mesmos números da tela, sem navegador. Nada
