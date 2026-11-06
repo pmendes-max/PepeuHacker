@@ -10383,6 +10383,13 @@ def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
             "saldo_row_y": base_y + 37}
 
 
+# Cores dos fluxos do PoP Histórico: verde = entrou, azul = saída boa,
+# vermelho = saída ruim (tons por tipo). As mesmas na faixa e no balanço.
+_FLOW_COLORS = {"novo": "#15803d", "puxou": "#22a05a", "cresceu": "#86efac",
+                "won": "#2563EB", "late": "#2563EB",
+                "escorregou": "#991B1B", "lost": "#DC2626", "encolheu": "#F87171"}
+
+
 def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
                     cov_rows=None, zero_base=False):
     """Gráfico único do PoP Histórico (pedido do Pedro, 06/11/2026; substitui a
@@ -10406,12 +10413,12 @@ def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
     _STEP = _hist_fit_step(n, max_step=110)
     right_x = _LEFT + n * _STEP
     has_cov = bool(cov_rows)
-    GAP = 34
+    GAP = 46
     P1_TOP, P1_H = 30, 210
     P2_TOP = P1_TOP + P1_H + GAP
     P2_H = 110 if has_cov else 0
     P3_TOP = (P2_TOP + P2_H + GAP) if has_cov else P2_TOP
-    P3_H = 150
+    P3_H = 200
     base3 = P3_TOP + P3_H
     H = base3 + 40
 
@@ -10490,24 +10497,45 @@ def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
                "last": ({"x": _cx(last), "y": _y2(cpts[last]["cov"]) - 10,
                          "txt": cpts[last]["cov_txt"]} if last is not None else None)}
 
-    # ---- Faixa 3: saldo (acima/abaixo do zero) e avanço (abaixo do zero) ----
+    # ---- Faixa 3: entrou × saiu (pedido do Pedro, 06/11/2026) ----
+    # Cada semana: para cima, em verde, o que ENTROU (novo, puxado, cresceu);
+    # para baixo, em azul, a saída BOA (Won / Movido p/ Late) e, em vermelho, as
+    # RUINS (escorregou, lost, encolheu). Linha tracejada = saldo (entrou − saiu
+    # mal; a saída boa fica fora, como no resto da tela). Mesmas cores do
+    # balanço embaixo do gráfico, que resume o período ou a semana clicada.
+    ent_c = [c for c in ("novo", "puxou", "cresceu") if c in net_cats]
+    bad_c = [c for c in ("escorregou", "lost", "encolheu") if c in net_cats]
+    ups = [sum(max(r[c], 0.0) for c in ent_c) for r in col_rows]
+    dns = [abs(r["fifth"]) + sum(-min(r[c], 0.0) for c in bad_c) for r in col_rows]
     nets = [r["net"] for r in col_rows]
-    advs = [abs(r["fifth"]) for r in col_rows]
-    up = max([v for v in nets if v > 0] + [1.0])
-    dn = max([-v for v in nets if v < 0] + advs + [1.0])
+    up = max(ups + [v for v in nets if v > 0] + [1.0])
+    dn = max(dns + [-v for v in nets if v < 0] + [1.0])
     tot = up + dn
     z3 = round(P3_TOP + up / tot * P3_H, 1)
     k3 = P3_H / tot
-    bw = round(max(3.0, min(_STEP * 0.32, 18)), 1)
+    bw = round(max(4.0, min(_STEP * 0.5, 30)), 1)
 
     tiny = _STEP < 34
-    cols = []
+    cols, net_pts = [], []
     for j, r in enumerate(col_rows):
         i = j + 1
         cx = _cx(i)
         prev = levels[j]
-        hn = abs(r["net"]) * k3
-        ha = abs(r["fifth"]) * k3
+        segs, y = [], z3
+        for c in ent_c:                                   # para cima
+            h = max(r[c], 0.0) * k3
+            if h >= 0.5:
+                y -= h
+                segs.append({"y": round(y, 1), "h": round(max(h - 1, 0.8), 1),
+                             "fill": _FLOW_COLORS[c], "url": drill_url(r["idx"], c)})
+        y = z3
+        for c, v in [(fifth, abs(r["fifth"]))] + [(c, -min(r[c], 0.0)) for c in bad_c]:
+            h = v * k3                                    # para baixo
+            if h >= 0.5:
+                segs.append({"y": round(y + 1, 1), "h": round(max(h - 1, 0.8), 1),
+                             "fill": _FLOW_COLORS.get(c, "#2563EB"), "url": drill_url(r["idx"], c)})
+                y += h
+        net_pts.append((cx, round(z3 - r["net"] * k3, 1)))
         if monthly:
             xl = r["label"]
         elif not tiny:
@@ -10524,30 +10552,55 @@ def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
                {"k": "Pipe no fim", "v": fmt_brl(r["level"])},
                {"k": "Variação do pipe", "v": ("+" if r["level"] >= prev else "−")
                 + fmt_brl(abs(r["level"] - prev))},
-               {"k": "Saldo", "v": ("+" if r["net"] >= 0 else "−") + fmt_brl(abs(r["net"])),
-                "c": "pos" if r["net"] >= 0 else "neg"}]
-        for c in net_cats:
-            if abs(r[c]) >= 1:
-                tip.append({"k": cat_label.get(c, c),
-                            "v": ("+" if r[c] >= 0 else "−") + fmt_brl(abs(r[c]))
-                            + f" · {r['deals_' + c]} deals", "sub": True})
-        tip.append({"k": ("Movido p/ Late" if fifth == "late" else "Foi para Won"),
-                    "v": fmt_brl(adv) + f" · {r['deals_fifth']} deals"
-                    + (f" · {taxa * 100:.1f}% do pipe".replace(".", ",") if taxa else ""),
-                    "c": "adv"})
+               {"k": "Entrou", "v": "+" + fmt_brl(ups[j]), "c": "pos"},
+               {"k": ("Movido p/ Late" if fifth == "late" else "Foi para Won"),
+                "v": "−" + fmt_brl(adv) + f" · {r['deals_fifth']} deals"
+                + (f" · {taxa * 100:.1f}% do pipe".replace(".", ",") if taxa else ""),
+                "c": "adv"},
+               {"k": "Saiu mal", "v": "−" + fmt_brl(dns[j] - adv), "c": "neg"},
+               {"k": "Saldo (entrou − saiu mal)",
+                "v": ("+" if r["net"] >= 0 else "−") + fmt_brl(abs(r["net"]))}]
         if cov and cov["pts"][i]:
             c = cov["pts"][i]
             tip.append({"k": "Cobertura", "v": c["cov_txt"]
                         + (f" · pipe {fmt_brl(c['pipe'])} ÷ rem. {fmt_brl(c['rem'])}"
                            if c["tem_meta"] and c["rem"] else "")})
-        cols.append({
-            "cx": cx, "zx": round(_LEFT + i * _STEP, 1), "xl": xl,
-            "net_x": round(cx - bw - 1, 1), "adv_x": round(cx + 1, 1),
-            "net_y": round(z3 - hn if r["net"] >= 0 else z3, 1), "net_h": round(max(hn, 1.0), 1),
-            "pos": r["net"] >= 0, "adv_y": z3, "adv_h": round(max(ha, 1.0 if adv else 0), 1),
-            "tip": tip, "url": drill_url(r["idx"], ",".join(net_cats)),
-            "url_adv": drill_url(r["idx"], fifth),
-        })
+        tip.append({"k": "clique pra ver o balanço da semana", "v": "", "sub": True})
+        cols.append({"cx": cx, "zx": round(_LEFT + i * _STEP, 1), "xl": xl,
+                     "x": round(cx - bw / 2, 1), "segs": segs, "tip": tip, "j": j})
+
+    # ---- Balanço (3 colunas) do período e de cada semana ----
+    def _bal(rows, idx, titulo):
+        def _it(c, sinal):
+            v = sum(abs(x[c]) for x in rows) if c == fifth else sum(
+                (max(x[c], 0.0) if sinal > 0 else -min(x[c], 0.0)) for x in rows)
+            n = sum(x["deals_" + c] for x in rows)
+            return {"label": ("Movido p/ Late" if c == "late" else "Won") if c == fifth
+                    else cat_label.get(c, c), "v": v, "n": n,
+                    "url": drill_url(idx, c), "color": _FLOW_COLORS.get(c, "#2563EB")}
+        cols_ = [("Entrou", "ent", [_it(c, 1) for c in ent_c], "+"),
+                 ("Saiu bem", "boa", [_it(fifth, -1)], "−"),
+                 ("Saiu mal", "ruim", [_it(c, -1) for c in bad_c], "−")]
+        mx = max([it["v"] for _, _, its, _ in cols_ for it in its] + [1.0])
+        for _, _, its, _ in cols_:
+            for it in its:
+                it["pct"] = round(it["v"] / mx * 100, 1)
+        return {"titulo": titulo, "cols": [{"nome": n, "k": k_, "itens": its, "sig": sg,
+                                            "tot": sum(it["v"] for it in its)}
+                                           for n, k_, its, sg in cols_]}
+    bal = []
+    if col_rows:
+        w0 = col_rows[0]["weeks"][0] if monthly else col_rows[0]["idx"]
+        w1 = col_rows[-1]["weeks"][-1] if monthly else col_rows[-1]["idx"]
+        bal.append(_bal(col_rows, f"{w0}-{w1}" if w0 != w1 else w0,
+                        f"Período inteiro · {col_rows[0]['from_label']} → "
+                        f"{col_rows[-1].get('to_label', col_rows[-1]['label'])}"))
+        for r in col_rows:
+            bal.append(_bal([r], r["idx"],
+                            (f"{r['label']} · {r['from_label']} → {r.get('to_label', r['label'])}"
+                             if monthly else f"Semana {r['from_label']} → {r['label']}")))
+            bal[-1]["curto"] = (r["label"] if monthly
+                                else "Semana " + r["sunday"].strftime("%d/%m"))
 
     q_breaks = []
     for j in range(1, len(col_rows)):
@@ -10563,9 +10616,11 @@ def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
                "dots": [{"x": x, "y": y} for x, y in lvl_pts]},
         "p2": ({"top": P2_TOP, "base": P2_TOP + P2_H, **cov} if cov else None),
         "p3": {"top": P3_TOP, "base": base3, "zero": z3,
+               "net": " ".join(f"{x},{y}" for x, y in net_pts), "net_pts": net_pts,
                "ticks": [{"label": "+" + fmt_brl(up), "y": P3_TOP},
                          {"label": "0", "y": z3},
                          {"label": "−" + fmt_brl(dn), "y": base3}]},
+        "bal": bal,
         "anchor": {"cx": _cx(0), "label": "início"},
         "cols": cols, "q_breaks": q_breaks, "zero_base": zero_base or lo == 0,
         "delta": levels[-1] - level0,

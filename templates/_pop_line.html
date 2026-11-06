@@ -7,16 +7,17 @@
   <div class="panel-head">
     <h2>Movimento do pipe {{ focus|capitalize }}
       <span class="h2-sub">· {{ 'close date no trimestre vigente' if viradas is defined else 'pipe total, qualquer close date' }}
-        · passe o mouse numa semana · clique pra ver os deals</span></h2>
+        · passe o mouse numa semana · clique pra ver o balanço dela</span></h2>
     <a class="hw-zoom {% if zero %}is-on{% endif %}" href="{{ chip_url(zero='' if zero else '1') }}"
        title="Liga/desliga o eixo do pipe a partir do zero">Eixo desde o zero</a>
   </div>
   <div class="legend">
     <span class="leg-item"><span class="pl-leg-line" style="background:#2563EB"></span>Pipe {{ focus|capitalize }}</span>
     {% if pl.p2 %}<span class="leg-item"><span class="pl-leg-line" style="background:#0F6E56"></span>Cobertura (pipe ÷ quota remanescente)</span>{% endif %}
-    <span class="leg-item"><span class="pl-leg-dot" style="background:#15803d"></span>Saldo positivo</span>
-    <span class="leg-item"><span class="pl-leg-dot" style="background:#dc2626"></span>Saldo negativo</span>
-    <span class="leg-item"><span class="pl-leg-dot" style="background:#0EA5E9"></span>{{ adv_lbl }}</span>
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#15803d"></span>Entrou</span>
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#2563EB"></span>Saiu bem ({{ 'Movido p/ Late' if fifth_cat == 'late' else 'Won' }})</span>
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#DC2626"></span>Saiu mal</span>
+    <span class="leg-item"><span class="pl-leg-net"></span>Saldo (entrou − saiu mal)</span>
   </div>
   <div class="rank-wrap pl-wrap" style="overflow-x:auto;overflow-y:hidden">
     <svg class="pl-svg" viewBox="0 0 {{ pl.w }} {{ pl.h }}" width="100%"
@@ -75,7 +76,7 @@
 
       {# ---- 3) Saldo e avanço ---- #}
       <text x="{{ pl.left }}" y="{{ pl.p3.top - 12 }}" font-size="12" font-weight="700"
-            fill="var(--fg)">Saldo da semana · {{ adv_lbl }}</text>
+            fill="var(--fg)">Entrou × saiu</text>
       {% for t in pl.p3.ticks %}
         <text x="{{ pl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="11"
               fill="var(--muted)">{{ t.label }}</text>
@@ -86,27 +87,62 @@
             font-weight="700" fill="var(--fg)">{{ pl.anchor.label }}</text>
 
       {% for c in pl.cols %}
-        <g class="pl-col" data-tip='{{ c.tip|tojson }}'>
+        <g class="pl-col" data-tip='{{ c.tip|tojson }}' data-bal="{{ c.j + 1 }}">
           <rect class="pl-band" x="{{ c.zx }}" y="{{ pl.p1.top - 4 }}" width="{{ pl.step }}"
-                height="{{ pl.p3.base - pl.p1.top + 8 }}" data-drill="{{ c.url }}"/>
-          <rect x="{{ c.net_x }}" y="{{ c.net_y }}" width="{{ pl.bw }}" height="{{ c.net_h }}" rx="2"
-                fill="{{ '#15803d' if c.pos else '#dc2626' }}" data-drill="{{ c.url }}"/>
-          {% if c.adv_h %}
-          <rect x="{{ c.adv_x }}" y="{{ c.adv_y }}" width="{{ pl.bw }}" height="{{ c.adv_h }}" rx="2"
-                fill="#0EA5E9" data-drill="{{ c.url_adv }}"/>
-          {% endif %}
+                height="{{ pl.p3.base - pl.p1.top + 8 }}"/>
+          {% for sg in c.segs %}
+          <rect x="{{ c.x }}" y="{{ sg.y }}" width="{{ pl.bw }}" height="{{ sg.h }}" rx="1.5"
+                fill="{{ sg.fill }}" pointer-events="none"/>
+          {% endfor %}
           {% if c.xl %}
           <text x="{{ c.cx }}" y="{{ pl.p3.base + 22 }}" text-anchor="middle" font-size="11"
                 fill="var(--fg-soft)" pointer-events="none">{{ c.xl }}</text>
           {% endif %}
         </g>
       {% endfor %}
+      {% if pl.p3.net %}
+      <polyline points="{{ pl.p3.net }}" fill="none" stroke="var(--fg)" stroke-width="1.8"
+                stroke-dasharray="5 4" pointer-events="none"/>
+      {% for x, y in pl.p3.net_pts %}
+        <circle cx="{{ x }}" cy="{{ y }}" r="3.2" fill="var(--surface)" stroke="var(--fg)"
+                stroke-width="1.8" pointer-events="none"/>
+      {% endfor %}
+      {% endif %}
     </svg>
     <div class="pl-tip" hidden></div>
   </div>
+
+  {# ---- Balanço: período inteiro ou a semana clicada ---- #}
+  {% if pl.bal %}
+  <div class="pl-bal">
+    <div class="pl-bal-head">
+      <span class="pl-bal-t" data-bal-title>{{ pl.bal[0].titulo }}</span>
+      <div class="grain-switch">
+        <a href="#" class="grain-btn active" data-bal-go="0">Período inteiro</a>
+        <a href="#" class="grain-btn" data-bal-week hidden></a>
+      </div>
+    </div>
+    {% for v in pl.bal %}
+    <div class="pl-bal-cols" data-bal-view="{{ loop.index0 }}" data-titulo="{{ v.titulo }}" data-curto="{{ v.curto or '' }}"{% if not loop.first %} hidden{% endif %}>
+      {% for col in v.cols %}
+      <div class="pl-bal-col is-{{ col.k }}">
+        <div class="pl-bal-ch"><span>{{ col.nome }}</span><b>{{ col.sig }}{{ col.tot|brl }}</b></div>
+        {% for it in col.itens %}
+        <div class="pl-bal-it" data-drill="{{ it.url }}" title="Clique pra ver os deals">
+          <div class="pl-bal-r"><span>{{ it.label }}<small> · {{ it.n }} deals</small></span><b>{{ col.sig }}{{ it.v|brl }}</b></div>
+          <div class="pl-bal-bar is-{{ col.k }}"><i style="width:{{ it.pct }}%;background:{{ it.color }}"></i></div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
   <div class="hm-note">
-    Saldo = novo + cresceu − encolheu − lost{% if viradas is defined %} + puxado pro trimestre − escorregou{% endif %}.
-    {{ adv_lbl }} fica fora do saldo e aparece abaixo do zero, em azul: é saída boa, o funil andando.
+    Entrou = novo + cresceu{% if viradas is defined %} + puxado pro trimestre{% endif %}.
+    Saiu bem = {{ 'movido p/ Late' if fifth_cat == 'late' else 'Won' }}. Saiu mal = lost + encolheu{% if viradas is defined %} + escorregou do trimestre{% endif %}.
+    Saldo = entrou − saiu mal (a saída boa fica fora: é o funil andando).
     {% if pl.p2 %}Cobertura = pipe do trimestre ÷ (meta do trimestre − realizado até o domingo); a linha corta na virada de trimestre.
     {% elif viradas is not defined %}Sem cobertura aqui de propósito: este pipe inclui close dates de outros trimestres e não tem quota que case com ele. Para ver a cobertura, troque o Close date para <a href="{{ chip_url(cd='q') }}">Trimestre vigente</a>.{% endif %}
   </div>
@@ -125,6 +161,27 @@
   .pl-tip .h{font-weight:800;margin-bottom:3px}
   .pl-tip .pl-sub{color:var(--muted);font-size:11.5px;padding-left:12px}
   .pl-leg-dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .pl-leg-net{width:16px;height:0;border-top:2px dashed var(--fg);display:inline-block}
+  .pl-col.is-sel .pl-band{fill-opacity:.1;stroke:#2563EB;stroke-opacity:.5}
+  .pl-bal{margin-top:14px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2,#F8FAFC)}
+  .pl-bal-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+  .pl-bal-t{font-size:12.5px;font-weight:700;color:var(--muted)}
+  .pl-bal-cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px}
+  .pl-bal-cols[hidden],.pl-bal [data-bal-week][hidden]{display:none}
+  @media (max-width:760px){.pl-bal-cols{grid-template-columns:1fr}}
+  .pl-bal-ch{display:flex;justify-content:space-between;font-size:12px;font-weight:800;text-transform:uppercase;
+    letter-spacing:.3px;border-bottom:2px solid;padding-bottom:4px;margin-bottom:8px}
+  .is-ent .pl-bal-ch{color:#15803d;border-color:#15803d}
+  .is-boa .pl-bal-ch{color:#1D4ED8;border-color:#2563EB}
+  .is-ruim .pl-bal-ch{color:#B91C1C;border-color:#DC2626}
+  .pl-bal-it{margin-bottom:9px;cursor:pointer;border-radius:6px}
+  .pl-bal-it:hover .pl-bal-r span{text-decoration:underline}
+  .pl-bal-r{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
+  .pl-bal-r small{color:var(--muted);font-size:11px}
+  .pl-bal-r b{font-variant-numeric:tabular-nums}
+  .pl-bal-bar{height:8px;border-radius:4px;margin-top:4px;overflow:hidden}
+  .pl-bal-bar.is-ent{background:#DCFCE7}.pl-bal-bar.is-boa{background:#DBEAFE}.pl-bal-bar.is-ruim{background:#FEE2E2}
+  .pl-bal-bar i{display:block;height:100%;border-radius:4px}
   .pl-tip .pos b{color:#15803d}.pl-tip .neg b{color:#B91C1C}.pl-tip .adv b{color:#0369A1}
 </style>
 <script>
@@ -150,6 +207,28 @@
       });
       g.addEventListener("mouseleave", function () { tip.hidden = true; });
     });
+  });
+  // Balanço: clique numa semana do gráfico mostra o balanço dela; o botão volta ao período.
+  document.querySelectorAll(".panel").forEach(function (panel) {
+    var bal = panel.querySelector(".pl-bal");
+    if (!bal) return;
+    var wk = bal.querySelector("[data-bal-week]"), all = bal.querySelector('[data-bal-go="0"]');
+    var title = bal.querySelector("[data-bal-title]");
+    function show(n) {
+      bal.querySelectorAll("[data-bal-view]").forEach(function (v) { v.hidden = v.getAttribute("data-bal-view") !== String(n); });
+      var v = bal.querySelector('[data-bal-view="' + n + '"]');
+      if (v) title.textContent = v.getAttribute("data-titulo");
+      panel.querySelectorAll(".pl-col").forEach(function (g) { g.classList.toggle("is-sel", g.getAttribute("data-bal") === String(n)); });
+      all.classList.toggle("active", n === 0);
+      wk.classList.toggle("active", n !== 0);
+      wk.hidden = n === 0;
+      if (n !== 0 && v) wk.textContent = v.getAttribute("data-curto");
+    }
+    panel.querySelectorAll(".pl-col").forEach(function (g) {
+      g.addEventListener("click", function () { show(parseInt(g.getAttribute("data-bal"), 10)); });
+    });
+    all.addEventListener("click", function (e) { e.preventDefault(); show(0); });
+    wk.addEventListener("click", function (e) { e.preventDefault(); });
   });
 })();
 </script>
