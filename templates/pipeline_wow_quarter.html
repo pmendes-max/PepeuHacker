@@ -13,20 +13,7 @@
 </div>
 
 {# ---- Chips da página: foco e janela (semanas móveis ou um trimestre). ---- #}
-<div class="hist-chips">
-  <div class="grain-switch">
-    {% for k, lbl in [('early', 'Early stage'), ('late', 'Late stage')] %}
-      <a class="grain-btn {% if focus == k %}active{% endif %}"
-         href="{{ chip_url(focus=k) }}">{{ lbl }}</a>
-    {% endfor %}
-  </div>
-  <div class="grain-switch">
-    {% for w, lbl in week_opts %}
-      <a class="grain-btn {% if week_sel == w %}active{% endif %}"
-         href="{{ chip_url(weeks=w) }}">{{ lbl }}</a>
-    {% endfor %}
-  </div>
-</div>
+{% include "_hist_window_picker.html" %}
 
 <div class="wq-rule">
   O pipe de cada semana só conta deal com close date <b>dentro do trimestre daquela semana</b>
@@ -35,7 +22,7 @@
   isso é a <b>virada</b>, que não é movimento de ninguém, por isso fica fora do saldo e aparece
   só na ponte e como corte na linha.
   {% if modo_q %}No modo trimestre a série parte da véspera do início, já medida na régua do trimestre.{% endif %}
-  {% if modo_fy %}No modo FY a série parte da véspera do início do ano fiscal e troca de régua a cada trimestre: a cobertura de cada domingo é contra a meta do trimestre daquele domingo.{% endif %}
+  {% if modo_fy %}Com mais de um trimestre (régua ou FY) a série parte da véspera do primeiro e troca de régua a cada trimestre: a cobertura de cada domingo é contra a meta do trimestre daquele domingo.{% endif %}
 </div>
 
 {% include "_chart_toggles.html" %}
@@ -126,56 +113,8 @@
   <b>= {{ level_end|brl }}</b>
 </div>
 
-{# ============ 1) Nível do pipe ao longo das semanas ============ #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Nível do pipe {{ focus|capitalize }} do trimestre <span class="h2-sub">· quanto havia em cada domingo</span></h2>
-    <span class="ph" style="margin:0">eixo desde o zero · a linha corta na virada de trimestre</span>
-  </div>
-  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
-    <svg viewBox="0 0 {{ lvl.w }} {{ lvl.h }}" width="{{ lvl.w }}" height="{{ lvl.h }}"
-         style="min-width:100%;display:block" font-family="inherit">
-      {% for t in lvl.yL %}
-        <line x1="{{ lvl.left }}" y1="{{ t.y }}" x2="{{ lvl.right_x }}" y2="{{ t.y }}"
-              stroke="var(--border-soft)" stroke-width="1"/>
-        <text x="{{ lvl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
-              fill="var(--muted)">{{ t.label }}</text>
-      {% endfor %}
-      <line x1="{{ lvl.left }}" y1="{{ lvl.base_y }}" x2="{{ lvl.right_x }}" y2="{{ lvl.base_y }}"
-            stroke="var(--border)" stroke-width="1.5"/>
-      {# Virada: faixa vertical tracejada + o nível que saiu e o que entrou. #}
-      {% for b in lvl.breaks %}
-        <line x1="{{ b.x }}" y1="{{ lvl.top }}" x2="{{ b.x }}" y2="{{ lvl.base_y }}"
-              stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4"/>
-        <text x="{{ b.x + 5 }}" y="{{ lvl.base_y - 8 }}" font-size="11" font-weight="700"
-              fill="var(--muted)">virada {{ b.label }}</text>
-        <line x1="{{ b.x }}" y1="{{ b.y_out }}" x2="{{ b.x }}" y2="{{ b.y_in }}"
-              stroke="#2563EB" stroke-width="1.5" stroke-dasharray="2 3"/>
-        <circle cx="{{ b.x }}" cy="{{ b.y_out }}" r="3.5" fill="var(--surface)" stroke="#94a3b8" stroke-width="2"/>
-        <circle cx="{{ b.x }}" cy="{{ b.y_in }}" r="4" fill="var(--surface)" stroke="#2563EB" stroke-width="2.5"/>
-        <text x="{{ b.x - 6 }}" y="{{ b.y_out + 4 }}" text-anchor="end" font-size="10.5"
-              fill="var(--muted)" paint-order="stroke" stroke="var(--surface)" stroke-width="3">sobrou {{ b.out_label }}</text>
-        <text x="{{ b.x - 7 }}" y="{{ b.y_in + 4 }}" text-anchor="end" font-size="10.5" font-weight="700"
-              fill="#1D4ED8" paint-order="stroke" stroke="var(--surface)" stroke-width="3">abriu {{ b.in_label }}</text>
-      {% endfor %}
-      {% for seg in lvl.segs %}
-        <polyline points="{{ seg }}" fill="none" stroke="#2563EB" stroke-width="2.5"
-                  stroke-linejoin="round" stroke-linecap="round"/>
-      {% endfor %}
-      {% for m in lvl.marks %}
-        <circle cx="{{ m.cx }}" cy="{{ m.cy }}" r="4"
-                fill="{{ 'var(--surface)' if m.is_anchor else '#2563EB' }}"
-                stroke="#2563EB" stroke-width="2.5"/>
-        <text x="{{ m.lx }}" y="{{ m.ly }}" text-anchor="{{ m.anchor }}" font-size="11"
-              font-weight="700" fill="#1D4ED8" paint-order="stroke"
-              stroke="var(--surface)" stroke-width="3.5">{{ m.label }}</text>
-        <text x="{{ m.cx }}" y="{{ lvl.base_y + 18 }}" text-anchor="end" font-size="11"
-              fill="var(--fg-soft)" transform="rotate(-40 {{ m.cx }} {{ lvl.base_y + 18 }})">{{ m.date }}</text>
-      {% endfor %}
-    </svg>
-  </div>
-</div>
-
+{# ============ 1) Escada do pipe (nível + saldo, degrau a degrau) ============ #}
+{% include "_hist_stairs.html" %}
 
 {# ============ 2) Cobertura: pipe ÷ quota remanescente em cada domingo ============ #}
 <div class="panel">
@@ -290,7 +229,7 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
 {# ============ 3) Movimento semana a semana ============ #}
 <div class="panel">
   <div class="panel-head">
-    <h2>Movimento por semana <span class="h2-sub">· o que entrou e o que saiu do pipe do trimestre</span></h2>
+    <h2>Movimento por {{ "mês" if monthly else "semana" }} <span class="h2-sub">· o que entrou e o que saiu do pipe do trimestre</span></h2>
     <span class="ph" style="margin:0">clique num segmento pra explodir os deals</span>
   </div>
   <div class="dchart" data-chart="hist-q-{{ focus }}" data-drill-chips="cat">
@@ -307,57 +246,11 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
           <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
         </button>
       {% endfor %}
-      <span class="hist-leg-net"><span class="hist-leg-tick"></span>saldo da semana</span>
+      <span class="hist-leg-net"><span class="hist-leg-tick"></span>saldo {{ "do mês" if monthly else "da semana" }}</span>
     </div>
 
     {% if wk_rows %}
-    <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
-      <svg viewBox="0 0 {{ bars.w }} {{ bars.h }}" width="{{ bars.w }}" height="{{ bars.h }}"
-           style="min-width:100%;display:block" font-family="inherit">
-        {% for t in bars.yL %}
-          <line x1="{{ bars.left }}" y1="{{ t.y }}" x2="{{ bars.right_x }}" y2="{{ t.y }}"
-                stroke="var(--border-soft)" stroke-width="1"/>
-          <text x="{{ bars.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
-                fill="var(--muted)">{{ t.label }}</text>
-        {% endfor %}
-        {% for b in bar_breaks %}
-          <line x1="{{ b.x }}" y1="{{ bars.top - 8 }}" x2="{{ b.x }}" y2="{{ bars.base_y }}"
-                stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4"/>
-          <text x="{{ b.x + 4 }}" y="{{ bars.top + 2 }}" font-size="11" font-weight="700"
-                fill="var(--muted)">{{ b.label }} →</text>
-        {% endfor %}
-        <line x1="{{ bars.left }}" y1="{{ bars.zero_y }}" x2="{{ bars.right_x }}" y2="{{ bars.zero_y }}"
-              stroke="var(--fg)" stroke-width="1.5"/>
-
-        {% for c in bars.cols %}
-          <g class="hist-col">
-            <rect x="{{ c.zx }}" y="{{ bars.top }}" width="{{ bars.step }}"
-                  height="{{ bars.plot_h }}" fill="#2563EB" fill-opacity="0"
-                  pointer-events="all" style="cursor:pointer" data-drill="{{ c.url }}">
-              <title>{{ c.label }} — saldo {{ c.net_label }}</title>
-            </rect>
-            {% for s in c.segs %}
-              <rect class="hist-seg" data-ch="{{ s.ch }}" x="{{ s.x }}" y="{{ s.y }}"
-                    width="{{ s.w }}" height="{{ s.h }}" fill="{{ s.fill }}"
-                    style="cursor:pointer" data-drill="{{ s.url }}">
-                <title>{{ c.label }} · {{ s.amt }} ({{ s.deals }} deals)</title>
-              </rect>
-            {% endfor %}
-            <line class="hist-net" x1="{{ c.cx - bars.bw / 2 - 3 }}" y1="{{ c.net_y }}"
-                  x2="{{ c.cx + bars.bw / 2 + 3 }}" y2="{{ c.net_y }}"
-                  stroke="var(--fg)" stroke-width="2.5" stroke-linecap="round"/>
-            <text x="{{ c.cx }}" y="{{ (c.top_y - 7) if c.net >= 0 else (c.bot_y + 15) }}"
-                  text-anchor="middle" font-size="11" font-weight="800"
-                  fill="{{ '#15803d' if c.net >= 0 else '#B91C1C' }}" paint-order="stroke"
-                  stroke="var(--surface)" stroke-width="3.5"
-                  >{{ '+' if c.net >= 0 else '−' }}{{ c.net_label }}</text>
-            <text x="{{ c.cx }}" y="{{ bars.base_y + 22 }}" text-anchor="end" font-size="11"
-                  fill="var(--fg-soft)"
-                  transform="rotate(-40 {{ c.cx }} {{ bars.base_y + 22 }})">{{ c.label }}</text>
-          </g>
-        {% endfor %}
-      </svg>
-    </div>
+    {% include "_hist_bars.html" %}
     {% if tem_troca %}
     <div class="hm-note">* a cópia do BI desse domingo faltou ou veio quebrada; a ponta usa a última cópia boa antes dele.</div>
     {% endif %}
@@ -372,7 +265,7 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
 {# ============ 4) Comparação entre pessoas — small multiples ============ #}
 <div class="panel">
   <div class="panel-head">
-    <h2>Comportamento por {{ pessoa }} <span class="h2-sub">· {{ weeks }} semanas lado a lado</span></h2>
+    <h2>Comportamento por {{ pessoa }} <span class="h2-sub">· {{ col_rows|length }} {{ "meses" if monthly else "semanas" }} lado a lado</span></h2>
     <span class="ph" style="margin:0">mesma escala em todos · barra cheia = {{ spark.span_label }}</span>
   </div>
   {% if spark.rows %}
@@ -392,11 +285,11 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
         {% for b in p.bars %}
           <rect x="{{ b.x }}" y="{{ b.y }}" width="{{ b.w }}" height="{{ b.h }}"
                 fill="{{ '#15803d' if b.pos else '#dc2626' }}" style="cursor:pointer"
-                data-drill="{{ drill(b.week, net_cats, p.name) }}"/>
+                data-drill="{{ drill(col_rows[b.week - 1].idx, net_cats, p.name) }}"/>
         {% endfor %}
       </svg>
       <div class="sm-foot">
-        <span>{{ p.pos_weeks }}/{{ weeks }} semanas positivas</span>
+        <span>{{ p.pos_weeks }}/{{ col_rows|length }} {{ "meses" if monthly else "semanas" }} positiv{{ "o" if monthly else "a" }}s</span>
         <span title="pipe do trimestre no início → no fim da janela">{{ p.level_start|brl }} → {{ p.level_end|brl }}</span>
       </div>
     </div>
@@ -410,7 +303,7 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
 {# ============ 5) Matriz semana × pessoa ============ #}
 <div class="panel">
   <div class="panel-head">
-    <h2>Matriz semana × {{ pessoa }} <span class="h2-sub">· saldo de cada célula</span></h2>
+    <h2>Matriz {{ "mês" if monthly else "semana" }} × {{ pessoa }} <span class="h2-sub">· saldo de cada célula</span></h2>
     <span class="ph" style="margin:0">cor = intensidade do saldo · clique numa célula pra explodir</span>
   </div>
   {% if people %}
@@ -419,7 +312,7 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
       <thead>
         <tr>
           <th class="hm-name">{{ pessoa }}</th>
-          {% for r in wk_rows %}<th class="hm-wk" title="{{ r.from_label }} → {{ r.label }}">{{ r.label }}{% if r.virada %} ⟂{% endif %}</th>{% endfor %}
+          {% for r in col_rows %}<th class="hm-wk" title="{{ r.from_label }} → {{ r.to_label if monthly else r.label }}">{{ r.label }}{% if r.virada %} ⟂{% endif %}</th>{% endfor %}
           <th class="hm-tot">Acumulado</th>
         </tr>
       </thead>
@@ -431,8 +324,8 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
             {% set a = (v / spark.span) if spark.span else 0 %}
             <td class="hm-c {% if v > 0 %}is-pos{% elif v < 0 %}is-neg{% endif %}"
                 style="--a:{{ '%.3f'|format((a if a >= 0 else -a)) }}"
-                data-drill="{{ drill(loop.index, net_cats, p.name) }}"
-                title="{{ p.name }} · semana que fechou em {{ wk_rows[loop.index0].label }}">
+                data-drill="{{ drill(col_rows[loop.index0].idx, net_cats, p.name) }}"
+                title="{{ p.name }} · {{ ('mês ' ~ col_rows[loop.index0].label) if monthly else ('semana que fechou em ' ~ col_rows[loop.index0].label) }}">
               {% if v %}{{ '+' if v > 0 else '−' }}{{ (v if v > 0 else -v)|brl }}{% else %}·{% endif %}
             </td>
           {% endfor %}

@@ -9891,24 +9891,84 @@ def _wow_hist_weeks() -> int:
 
 
 WOW_HIST_QUARTER_KEY = "q"
+# Régua de trimestres do PoP Histórico (pedido do Pedro, 06/11/2026): clicar num
+# trimestre abre a série DELE ATÉ HOJE (Q4 · Q3+Q4 · Q2+Q3+Q4 …), e os chips de
+# FY cobrem o ano fiscal inteiro (fev → jan, `_fy_bounds`). A base daqui é o
+# histórico de propriedades do HubSpot, que vai bem antes das cópias diárias do
+# BI — por isso este PoP alcança o FY25 e o PoP Histórico Q não.
+WOW_HIST_FIRST_Q = date(2025, 1, 1)
+WOW_HIST_FROM = "from"          # ?weeks=from2026Q3 → Q3/26 até hoje
+WOW_HIST_FY = {
+    "FY25": _fy_bounds(2025),
+    "FY26": _fy_bounds(2026),
+    "FY25-FY26": (_fy_bounds(2025)[0], _fy_bounds(2026)[1]),
+}
+WOW_HIST_FY_LABEL = {"FY25-FY26": "FY25+FY26"}
+
+
+def _qkey_date(s: str):
+    """'2026Q3' → date(2026, 7, 1); None se não for chave de trimestre."""
+    m = re.fullmatch(r"(\d{4})Q([1-4])", s or "")
+    return date(int(m.group(1)), 3 * (int(m.group(2)) - 1) + 1, 1) if m else None
+
+
+def _wow_hist_range(sel: str):
+    """(início, fim) de uma janela de calendário do PoP Histórico — régua
+    (`from<trimestre>`) ou FY —, ou None se `sel` não for uma delas."""
+    sel = sel or ""
+    if sel.startswith(WOW_HIST_FROM):
+        q = _qkey_date(sel[len(WOW_HIST_FROM):])
+        if q and WOW_HIST_FIRST_Q <= q <= _quarter_start_of(_today()):
+            return q, _quarter_end_of(_today())
+        return None
+    rng = WOW_HIST_FY.get(sel)
+    return rng if (rng and rng[0] <= _today()) else None
+
+
+def _wow_hist_sel() -> str:
+    """Chave da janela na URL (?weeks=), normalizada: 'q', régua, FY ou o nº
+    de semanas. Valor desconhecido cai no padrão de semanas."""
+    raw = (request.args.get("weeks") or "").strip()
+    if raw == WOW_HIST_QUARTER_KEY or _wow_hist_range(raw):
+        return raw
+    return str(_wow_hist_weeks())
 
 
 def _wow_hist_window(f):
     """(nº de semanas, domingos) da série do Histórico PoP.
 
-    Dois modos: os chips numéricos, que são janelas MÓVEIS terminando no último
-    domingo, e o modo Quarter (`?weeks=q`), que ancora a série no início do
-    trimestre do filtro. O Quarter existe porque "quanto o pipe cresceu no
-    trimestre" não é respondível por janela móvel — 12 semanas atravessam a
-    virada e misturam dois quarters. Reaproveita `_fc_hist_sundays`, que já é o
-    calendário do Histórico do Forecast, pra as duas telas recortarem o
-    trimestre exatamente do mesmo jeito."""
-    if request.args.get("weeks") == WOW_HIST_QUARTER_KEY:
+    Três modos: os chips numéricos, que são janelas MÓVEIS terminando no último
+    domingo; as janelas de calendário (régua de trimestres e FY), ancoradas no
+    domingo de antes do início; e o legado `?weeks=q`, o trimestre do filtro.
+    O calendário existe porque "quanto o pipe cresceu no trimestre" não é
+    respondível por janela móvel — 12 semanas atravessam a virada e misturam
+    dois quarters. Reaproveita `_fc_hist_sundays`, que já é o calendário do
+    Histórico do Forecast, pra as telas recortarem do mesmo jeito."""
+    sel = _wow_hist_sel()
+    if sel == WOW_HIST_QUARTER_KEY:
         q0, q1 = _fc_hist_quarter(f)
         suns = _fc_hist_sundays(q0, q1)
         return max(0, len(suns) - 1), suns
+    rng = _wow_hist_range(sel)
+    if rng:
+        suns = _fc_hist_sundays(*rng)
+        return max(0, len(suns) - 1), suns
     w = _wow_hist_weeks()
     return w, _wow_hist_sundays(w)
+
+
+def _hist_ruler(quarters, sel, start, end, url_of):
+    """Células da régua de trimestres: cada uma abre a série do trimestre dela
+    até hoje; acesas as que a janela selecionada cobre (start..end)."""
+    out = []
+    for q in quarters:
+        qe = _quarter_end_of(q)
+        out.append({"label": _quarter_label(q), "url": url_of(q),
+                    "on": bool(start and end and q <= end and qe >= start),
+                    "title": f"{_quarter_label(q)} até hoje"
+                             + ("" if q == _quarter_start_of(_today()) else
+                                f" ({_quarter_label(q)} → {_quarter_label(_quarter_start_of(_today()))})")})
+    return out
 
 
 def _wow_hist_focus() -> str:
@@ -10086,25 +10146,138 @@ _HIST_POS_SEGS = (("novo", "#15803d"), ("cresceu", "#86efac"))
 _HIST_NEG_SEGS = (("encolheu", "#fdba74"), ("lost", "#dc2626"))
 
 
+# Largura-alvo dos gráficos do Histórico (px do viewBox). Pedido do Pedro
+# (06/11/2026): janela longa (Q2+Q3+Q4, FY, FY25+FY26) tem que CABER na tela —
+# com passo fixo de 40px por semana, 80 semanas viravam 3.300px de rolagem
+# lateral e rótulos encavalados.
+_HIST_FIT_W = 1100
+_HIST_LEFT = 92
+# Acima disso o gráfico de movimento (e a matriz/small multiples) agrupa por
+# MÊS: 26 semanas ainda cabem com rótulo legível, 30+ não.
+HIST_MONTHLY_ABOVE = 26
+_MES_ABR = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+
+
+def _hist_fit_step(n, max_step=64, min_step=8):
+    """Passo horizontal que faz `n` colunas caberem em `_HIST_FIT_W`."""
+    room = _HIST_FIT_W - _HIST_LEFT - 30
+    return max(min_step, min(max_step, room / max(n, 1)))
+
+
+def _hist_clip_top(vals):
+    """(topo do eixo, cortou?) de um lado do gráfico de movimento.
+
+    Usa o topo robusto (`_robust_top`, cerca de Tukey) quando UMA semana fora da
+    curva achataria todas as outras: a barra dela é cortada no topo, ganha a
+    marca de corte e o valor REAL escrito em cima. Com poucas colunas ou sem
+    outlier de verdade (até 30% acima do topo robusto), fica o máximo real."""
+    vals = [v for v in vals if v > 0]
+    real = max(vals, default=0.0)
+    if len(vals) < 6 or real <= 0:
+        return real, False
+    rt = _robust_top(vals)
+    if real <= rt * 1.3:
+        return real, False
+    return rt * 1.15, True
+
+
+def _parse_week_span(raw, n):
+    """`week` do drill: "5" (uma semana) ou "5-8" (as semanas de um mês, no modo
+    mensal). Devolve (a, b) inclusivo dentro de 1..n, ou None."""
+    s = str(raw or "").strip()
+    try:
+        if "-" in s:
+            a, b = (int(x) for x in s.split("-", 1))
+        else:
+            a = b = int(s)
+    except ValueError:
+        return None
+    return (a, b) if 1 <= a <= b <= n else None
+
+
+def _week_span_txt(a, b):
+    return f"semana {a}" if a == b else f"semanas {a}–{b}"
+
+
+def _hist_month_buckets(wk_rows):
+    """Semanas agrupadas pelo MÊS do domingo que fecha cada uma (a semana que
+    fecha em 04/10 conta em outubro). Lista de (ano, mês, [linhas])."""
+    out = []
+    for r in wk_rows:
+        d = r["sunday"]
+        if out and out[-1][0] == d.year and out[-1][1] == d.month:
+            out[-1][2].append(r)
+        else:
+            out.append((d.year, d.month, [r]))
+    return out
+
+
+def _hist_month_rows(e, wk_rows, net_cats, fifth):
+    """As linhas semanais somadas por mês, no mesmo formato de `_hist_week_rows`
+    (o `_build_hist_bars` não distingue). `idx` vira "a-b", o intervalo de
+    semanas que o drill reconstrói. Nº de deals sai do frame de eventos — somar
+    o nº semanal contaria 2× o deal que mexeu em duas semanas do mês."""
+    cats = tuple(net_cats) + (fifth,)
+    out = []
+    for y, m, rs in _hist_month_buckets(wk_rows):
+        a, b = rs[0]["idx"], rs[-1]["idx"]
+        sub = e[(e["week_idx"] >= a) & (e["week_idx"] <= b)] if len(e) else e
+        row = {"idx": a if a == b else f"{a}-{b}",
+               "label": f"{_MES_ABR[m - 1]}/{y % 100:02d}",
+               "from_label": rs[0]["from_label"], "to_label": rs[-1]["label"],
+               "sunday": rs[-1]["sunday"], "level": rs[-1]["level"],
+               "weeks": [r["idx"] for r in rs],
+               "virada": next((r.get("virada") for r in rs if r.get("virada")), None)}
+        for c in cats:
+            row[c] = sum(r[c] for r in rs)
+            row["deals_" + c] = (int(sub[sub["category"] == c]["deal_id"].nunique())
+                                 if len(sub) else 0)
+        row["net"] = sum(row[c] for c in net_cats)
+        row["fifth"] = row[fifth]
+        out.append(row)
+    return out
+
+
+def _hist_people_cols(people, col_rows):
+    """Painel por pessoa no grão das colunas do gráfico (semana ou mês)."""
+    if not col_rows or "weeks" not in col_rows[0]:
+        return people
+    out = []
+    for p in people:
+        vals = [sum(p["weekly"][w - 1] for w in r["weeks"]) for r in col_rows]
+        out.append({**p, "weekly": vals, "pos_weeks": sum(1 for v in vals if v > 0)})
+    return out
+
+
 def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
                      neg=_HIST_NEG_SEGS, net_cats=_WOW_NET_CATS):
-    """Geometria SVG do gráfico de movimento: uma coluna por semana, empilhada
-    dos dois lados da linha do zero (novo/cresceu acima, encolheu/lost abaixo),
-    com marcador de saldo. `drill_url(idx, cats)` monta a URL de cada segmento.
+    """Geometria SVG do gráfico de movimento: uma coluna por semana (ou mês),
+    empilhada dos dois lados da linha do zero (novo/cresceu acima, encolheu/lost
+    abaixo), com marcador de saldo. `drill_url(idx, cats)` monta a URL de cada
+    segmento.
 
     A escala é ASSINADA e compartilhada: o mesmo R$ tem a mesma altura acima e
     abaixo do zero, senão uma semana de perdas pareceria menor que uma de ganhos
-    do mesmo tamanho.
+    do mesmo tamanho. Cada lado usa o topo robusto (`_hist_clip_top`): a coluna
+    fora da curva é cortada e mostra o valor real, em vez de achatar as outras.
+
+    O saldo de cada coluna fica numa LINHA EMBAIXO do eixo X, como o saldo por
+    AE da tela PoP Early/Late — lido em fila, não flutuando em cima das barras.
 
     `pos`/`neg` são os canais (chave, cor) de cada lado, na ordem do zero pra
     fora; o PoP Histórico por quarter acrescenta os dois de close date."""
-    _TOP, _PLOT, _BOT = 26, 330, 86
-    _LEFT = 92
-    _STEP = 64 if weeks <= 13 else 40
-    _BW = round(_STEP * 0.58)
+    _TOP, _PLOT, _BOT = 30, 330, 74
+    _LEFT = _HIST_LEFT
+    n = max(len(wk_rows), 1)
+    # Coluna de MÊS pode ser mais larga: 8 meses (FY26 no PoP Q) no passo
+    # semanal de 64px ocupavam metade do painel.
+    _STEP = _hist_fit_step(n, max_step=110 if (wk_rows and "weeks" in wk_rows[0]) else 64)
+    _BW = round(_STEP * 0.6, 1)
 
-    pos_max = max(sum(r[k] for k, _ in pos) for r in wk_rows) if wk_rows else 0.0
-    neg_max = max(-sum(r[k] for k, _ in neg) for r in wk_rows) if wk_rows else 0.0
+    pos_tot = [sum(r[k] for k, _ in pos) for r in wk_rows]
+    neg_tot = [-sum(r[k] for k, _ in neg) for r in wk_rows]
+    pos_max, clip_p = _hist_clip_top(pos_tot)
+    neg_max, clip_n = _hist_clip_top(neg_tot)
     if pos_max <= 0 and neg_max <= 0:
         # Recorte sem movimento nenhum (filtro que não casa com ninguém, ou um
         # time que não mexeu o Late na janela). Sem isto, pos_max/span = 0 grudava
@@ -10115,8 +10288,8 @@ def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
     zero_y = _TOP + _PLOT * (pos_max / span)
 
     def _y(v):
-        """R$ (assinado) → coordenada y."""
-        return zero_y - (v / span) * _PLOT
+        """R$ (assinado) → coordenada y, presa na área do gráfico."""
+        return min(_TOP + _PLOT, max(_TOP, zero_y - (v / span) * _PLOT))
 
     # Passo ÚNICO nos dois lados do zero (ver _nice_money_step): a mesma régua
     # acima e abaixo é o que deixa comparar um ganho com uma perda de bater o
@@ -10133,116 +10306,224 @@ def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
         yL.append({"label": "−" + fmt_brl(k * step_v), "y": round(_y(-k * step_v), 1)})
         k += 1
 
+    # Rótulo do eixo X: mês (modo mensal) cabe sempre; dd/mm só com passo ≥ 34,
+    # senão vai o 1º domingo de cada mês. O saldo ("+R$ 1,23M", ~55px) alterna
+    # em duas fileiras quando a coluna é mais estreita que ele.
+    monthly = bool(wk_rows) and "weeks" in wk_rows[0]
+    stagger = _STEP < 62
+    tiny = _STEP < 34
+    base_y = _TOP + _PLOT
     cols = []
     for i, r in enumerate(wk_rows):
         cx = _LEFT + i * _STEP + _STEP / 2
         segs, top_v, bot_v = [], 0.0, 0.0
-        # Empilha do zero pra fora, na ordem em que a legenda lista.
+        # Empilha do zero pra fora, na ordem em que a legenda lista. O que passa
+        # do topo do eixo é desenhado só até ele (a barra cortada).
         for key, cor in pos:
             v = r[key]
             if v <= 0:
                 continue
-            segs.append({"ch": key, "fill": cor,
-                         "x": round(cx - _BW / 2, 1), "w": _BW,
-                         "y": round(_y(top_v + v), 1),
-                         "h": round((v / span) * _PLOT, 1),
-                         "amt": fmt_brl(v), "deals": r["deals_" + key],
-                         "url": drill_url(r["idx"], key)})
-            top_v += v
+            vd = min(v, pos_max - top_v)
+            if vd > 0:
+                segs.append({"ch": key, "fill": cor,
+                             "x": round(cx - _BW / 2, 1), "w": _BW,
+                             "y": round(_y(top_v + vd), 1),
+                             "h": round((vd / span) * _PLOT, 1),
+                             "amt": fmt_brl(v), "deals": r["deals_" + key],
+                             "url": drill_url(r["idx"], key)})
+            top_v += max(vd, 0)
         for key, cor in neg:
             v = -r[key]                        # guardados negativos
             if v <= 0:
                 continue
-            segs.append({"ch": key, "fill": cor,
-                         "x": round(cx - _BW / 2, 1), "w": _BW,
-                         "y": round(_y(-bot_v), 1),
-                         "h": round((v / span) * _PLOT, 1),
-                         "amt": fmt_brl(v), "deals": r["deals_" + key],
-                         "url": drill_url(r["idx"], key)})
-            bot_v += v
+            vd = min(v, neg_max - bot_v)
+            if vd > 0:
+                segs.append({"ch": key, "fill": cor,
+                             "x": round(cx - _BW / 2, 1), "w": _BW,
+                             "y": round(_y(-bot_v), 1),
+                             "h": round((vd / span) * _PLOT, 1),
+                             "amt": fmt_brl(v), "deals": r["deals_" + key],
+                             "url": drill_url(r["idx"], key)})
+            bot_v += max(vd, 0)
+        cut_p = clip_p and pos_tot[i] > pos_max + 1e-6
+        cut_n = clip_n and neg_tot[i] > neg_max + 1e-6
+        if monthly:
+            xl = r["label"]
+        elif not tiny:
+            # dd/mm (o rótulo cheio "5 jul 2026" não cabe na horizontal); o "*"
+            # do PoP Histórico Q (cópia trocada) acompanha.
+            xl = r["sunday"].strftime("%d/%m") + ("*" if str(r["label"]).endswith("*") else "")
+        else:
+            d = r["sunday"]
+            prev = wk_rows[i - 1]["sunday"] if i else None
+            xl = (f"{_MES_ABR[d.month - 1]}/{d.year % 100:02d}"
+                  if (prev is None or prev.month != d.month) else "")
+        lo2 = stagger and (i % 2 == 1)
         cols.append({
             "idx": r["idx"], "label": r["label"], "segs": segs,
+            "tip": (f"{r['from_label']} → {r['to_label']}" if monthly
+                    else f"semana que fechou em {r['label']}"),
             "cx": round(cx, 1), "zx": round(_LEFT + i * _STEP, 1),
             "net": r["net"], "net_label": fmt_brl(abs(r["net"])),
             "net_y": round(_y(r["net"]), 1),
             "top_y": round(_y(top_v), 1), "bot_y": round(_y(-bot_v), 1),
+            "xl": xl, "xl_y": base_y + 16,
+            "saldo_y": base_y + (54 if lo2 else 37),
+            "cut_p": cut_p, "cut_n": cut_n,
+            "cut_p_label": fmt_brl(pos_tot[i]), "cut_n_label": "−" + fmt_brl(neg_tot[i]),
             "url": drill_url(r["idx"], ",".join(net_cats)),
         })
-    right_x = _LEFT + max(len(wk_rows), 1) * _STEP
-    return {"w": right_x + 30, "h": _TOP + _PLOT + _BOT, "left": _LEFT,
-            "right_x": right_x, "top": _TOP, "step": _STEP, "bw": _BW,
-            "zero_y": round(zero_y, 1), "plot_h": _PLOT,
-            "base_y": _TOP + _PLOT, "yL": yL, "cols": cols}
+    right_x = _LEFT + n * _STEP
+    return {"w": round(right_x + 30, 1), "h": _TOP + _PLOT + _BOT, "left": _LEFT,
+            "right_x": round(right_x, 1), "top": _TOP, "step": round(_STEP, 2), "bw": _BW,
+            "zero_y": round(zero_y, 1), "plot_h": _PLOT, "monthly": monthly,
+            "base_y": base_y, "yL": yL, "cols": cols, "stagger": stagger,
+            "saldo_row_y": base_y + 37}
 
 
-def _build_hist_level(wk_rows, level0, sun0, breaks=None):
-    """Geometria da linha de NÍVEL do pipe. Eixo começa em 0 de propósito: numa
-    série de nível, cortar a base exagera a variação — 5% de oscilação vira um
-    tobogã se o eixo abre no mínimo da série.
+def _build_hist_stairs(col_rows, level0, drill_url, net_cats, fifth, viradas=None,
+                       zero_base=False, closed=False):
+    """"Escada do pipe" (pedido do Pedro, 06/11/2026; substitui a linha de
+    nível): começa numa barra com o pipe do início da janela, cada coluna
+    (semana ou mês) é um degrau que parte de onde a anterior terminou, e fecha
+    numa barra com o pipe do fim. É a ponte "R$ X → R$ Y" desenhada.
 
-    `breaks` (PoP Histórico por quarter): viradas de trimestre, cada uma com a
-    semana `week` em que caiu, a fração `frac` da semana até ela, o nível que
-    SAIU (`out`, régua do trimestre que acabou) e o que ENTROU (`in`, régua do
-    novo). A linha é cortada ali — ligar os dois lados desenharia como
-    movimento o que é só troca de régua."""
-    _TOP, _PLOT, _BOT = 24, 200, 74
-    _LEFT = 92
-    _STEP = 64 if len(wk_rows) <= 13 else 40
+    Cada degrau tem até três pedaços, encadeados:
+      saldo   novo + cresceu − encolheu − lost (verde sobe, vermelho desce);
+      virada  troca de régua de trimestre (só PoP Histórico Q, roxo);
+      outros  o resto até o nível real da coluna — → Late / won, transferência,
+              volta de estágio, reabertura e resíduo (cinza).
+    O "outros" sai por diferença contra o nível medido, então a escada sempre
+    termina exatamente no nível do fim.
+
+    Eixo: abre perto do mínimo (o degrau de uma semana é ~2% do pipe e some
+    num eixo desde o zero); `zero_base` força o zero."""
+    _TOP, _PLOT, _BOT = 28, 300, 48
+    _LEFT = _HIST_LEFT
+    monthly = bool(col_rows) and "weeks" in col_rows[0]
+    n = len(col_rows) + 2
+    _STEP = _hist_fit_step(n, max_step=96 if monthly else 64)
+    _BW = round(min(_STEP * 0.62, 46), 1)
     base_y = _TOP + _PLOT
-    breaks = breaks or []
-    vals = [level0] + [r["level"] for r in wk_rows]
-    # Piso de R$ 1.000 (e não 1.0) no topo do eixo: num recorte sem pipe nenhum,
-    # 4 ticks entre 0 e R$ 1,08 saíam todos como "R$ 0"/"R$ 1" depois do
-    # arredondamento do fmt_brl — cinco rótulos repetidos sem informação.
-    top = max(vals + [b[k] for b in breaks for k in ("out", "in")] + [1000.0]) * 1.08
-    yL = [{"label": fmt_brl(top * k / 4), "y": round(base_y - k / 4 * _PLOT, 1)}
-          for k in range(5)]
-    pts, marks = [], []
-    for i, v in enumerate(vals):
-        cx = _LEFT + (i - 0.5) * _STEP + _STEP / 2   # âncora meia coluna à esquerda
-        cy = base_y - (v / top) * _PLOT
-        pts.append(f"{round(cx, 1)},{round(cy, 1)}")
-        marks.append({"cx": round(cx, 1), "cy": round(cy, 1),
-                      "label": fmt_brl(v),
-                      "date": _fmt_date_short(sun0 if i == 0 else wk_rows[i - 1]["sunday"]),
-                      # A âncora fica exatamente EM CIMA do eixo (x = left), então
-                      # o rótulo centrado invadia os números do eixo Y. Ancorado
-                      # pela esquerda, ele cresce pra dentro do gráfico.
-                      "anchor": "start" if i == 0 else "middle",
-                      "lx": round(cx + (5 if i == 0 else 0), 1),
-                      # Rótulos INTERCALADOS acima/abaixo do ponto. "R$ 4,05M"
-                      # ocupa ~50px e o passo é 64 (40 em 26 semanas), então numa
-                      # única faixa eles se sobrepõem. Intercalar preserva os N
-                      # números — esconder um a cada dois tiraria justamente a
-                      # semana que o leitor foi conferir.
-                      "ly": round(cy - 11 if i % 2 == 0 else cy + 18, 1),
-                      "is_anchor": i == 0})
 
-    # Com virada, a polyline vira trechos: até a virada no nível que saiu, e da
-    # virada em diante a partir do nível que entrou.
-    segs, brk, ini = [], [], 0
-    for b in sorted(breaks, key=lambda b: (b["week"], b["frac"])):
-        bx = round(_LEFT + (b["week"] - 1 + b["frac"]) * _STEP, 1)
-        y_out = round(base_y - (b["out"] / top) * _PLOT, 1)
-        y_in = round(base_y - (b["in"] / top) * _PLOT, 1)
-        segs.append(" ".join(pts[ini:b["week"]] + [f"{bx},{y_out}"]))
-        pts_in = f"{bx},{y_in}"
-        ini = b["week"]
-        brk.append({"x": bx, "y_out": y_out, "y_in": y_in, "label": b["label"],
-                    "in_label": fmt_brl(b["in"]), "out_label": fmt_brl(b["out"]),
-                    "start": pts_in})
-    tail = pts[ini:]
-    if brk:
-        tail = [brk[-1]["start"]] + tail
-        # Cada trecho do meio começa no "entrou" da virada anterior.
-        for j in range(1, len(segs)):
-            segs[j] = brk[j - 1]["start"] + " " + segs[j]
-    segs.append(" ".join(tail))
-    return {"w": _LEFT + len(wk_rows) * _STEP + 30, "h": _TOP + _PLOT + _BOT,
-            "left": _LEFT, "top": _TOP, "base_y": base_y, "step": _STEP,
-            "right_x": _LEFT + len(wk_rows) * _STEP,
-            "yL": yL, "pts": " ".join(pts), "marks": marks,
-            "segs": segs, "breaks": brk}
+    # Virada (PoP Q) por coluna: entrou − saiu.
+    vir = {}
+    for v in viradas or []:
+        j = next((j for j, r in enumerate(col_rows)
+                  if v["week"] in r.get("weeks", [r["idx"]])), None)
+        if j is not None:
+            vir.setdefault(j, []).append(v)
+
+    steps, lv = [], level0
+    for j, r in enumerate(col_rows):
+        a = lv
+        b = a + r["net"]
+        dv = sum(v["in"] - v["out"] for v in vir.get(j, []))
+        c0 = b + dv
+        c = r["level"]
+        steps.append({"r": r, "a": a, "b": b, "c0": c0, "c": c, "dv": dv,
+                      "vir": vir.get(j, [])})
+        lv = c
+    level_end = lv
+    pts = [level0, level_end] + [x for s in steps for x in (s["a"], s["b"], s["c0"], s["c"])]
+    vmin, vmax = min(pts), max(pts)
+    if zero_base or vmax <= 0:
+        lo, hi = 0.0, max(vmax, 1000.0) * 1.08
+        st = _nice_money_step(hi, target=5)
+        hi = math.ceil(hi / st) * st
+    else:
+        pad = max((vmax - vmin) * 0.15, vmax * 0.02, 1000.0)
+        st = _nice_money_step(vmax - vmin + 2 * pad, target=5)
+        lo = max(0.0, math.floor((vmin - pad) / st) * st)
+        hi = math.ceil((vmax + pad) / st) * st
+    rng = (hi - lo) or 1.0
+
+    def _y(v):
+        return round(base_y - (max(lo, min(hi, v)) - lo) / rng * _PLOT, 1)
+
+    yL = []
+    t = lo
+    while t <= hi + st * 0.01:
+        yL.append({"label": fmt_brl(t), "y": _y(t)})
+        t += st
+
+    def _cx(i):
+        return round(_LEFT + i * _STEP + _STEP / 2, 1)
+
+    def _blk(v0, v1):
+        y0, y1 = _y(v0), _y(v1)
+        return min(y0, y1), max(1.5, abs(y0 - y1))
+
+    tiny = _STEP < 34
+    show_val = _STEP >= 58
+    cols = []
+    for j, s in enumerate(steps):
+        i = j + 1
+        r = s["r"]
+        cx = _cx(i)
+        ny, nh = _blk(s["a"], s["b"])
+        oy, oh = _blk(s["c0"], s["c"])
+        vy, vh = _blk(s["b"], s["c0"])
+        other = s["c"] - s["c0"]
+        if monthly:
+            xl = r["label"]
+        elif not tiny:
+            xl = r["sunday"].strftime("%d/%m") + ("*" if str(r["label"]).endswith("*") else "")
+        else:
+            d = r["sunday"]
+            prev = steps[j - 1]["r"]["sunday"] if j else None
+            xl = (f"{_MES_ABR[d.month - 1]}/{d.year % 100:02d}"
+                  if (prev is None or prev.month != d.month) else "")
+        tip = [f"{r['from_label']} → {r.get('to_label', r['label'])}" if monthly
+               else f"semana {r['from_label']} → {r['label']}",
+               f"pipe no início {fmt_brl(s['a'])}",
+               f"saldo {'+' if r['net'] >= 0 else '−'}{fmt_brl(abs(r['net']))}"
+               f" (novo + cresceu − encolheu − lost)"]
+        if s["vir"]:
+            tip.append("virada " + ", ".join(
+                f"{v['de']}→{v['para']}: sobrou {fmt_brl(v['out'])}, abriu {fmt_brl(v['in'])}"
+                for v in s["vir"]))
+        tip.append(f"outros {'+' if other >= 0 else '−'}{fmt_brl(abs(other))}"
+                   f" (→ Late/won, transferência, reabertura)")
+        tip.append(f"pipe no fim {fmt_brl(s['c'])}")
+        cols.append({
+            "cx": cx, "x": round(cx - _BW / 2, 1), "zx": round(_LEFT + i * _STEP, 1),
+            "net": r["net"], "net_label": fmt_brl(abs(r["net"])),
+            "net_y": ny, "net_h": nh, "pos": r["net"] >= 0,
+            "lbl_y": (ny - 6) if r["net"] >= 0 else (ny + nh + 13),
+            "vir": bool(s["vir"]), "vir_y": vy, "vir_h": vh,
+            "oth": abs(other) >= 1, "oth_y": oy, "oth_h": oh,
+            "oth_w": round(max(3.0, _BW * 0.24), 1),
+            "conn_x1": round(_cx(i - 1) + _BW / 2, 1), "conn_x2": round(cx - _BW / 2, 1),
+            "conn_y": _y(s["a"]),
+            "xl": xl, "tip": "\n".join(tip),
+            "url": drill_url(r["idx"], ",".join(net_cats)),
+            "url_oth": drill_url(r["idx"], fifth),
+        })
+    i_end = n - 1
+    q_breaks = []
+    for j, s in enumerate(steps):
+        if not j:
+            continue
+        d0, d1 = steps[j - 1]["r"]["sunday"], s["r"]["sunday"]
+        if _quarter_start_of(d0) != _quarter_start_of(d1):
+            q_breaks.append({"x": round(_LEFT + (j + 1) * _STEP, 1),
+                             "label": _quarter_label(_quarter_start_of(d1))})
+    y0, h0 = _blk(lo, level0)
+    y1, h1 = _blk(lo, level_end)
+    delta = level_end - level0
+    return {"w": round(_LEFT + n * _STEP + 16, 1), "h": _TOP + _PLOT + _BOT,
+            "left": _LEFT, "right_x": round(_LEFT + n * _STEP, 1), "top": _TOP,
+            "base_y": base_y, "step": round(_STEP, 2), "bw": _BW, "yL": yL,
+            "cols": cols, "show_val": show_val, "q_breaks": q_breaks,
+            "zero_base": zero_base or lo == 0,
+            "start": {"cx": _cx(0), "x": round(_cx(0) - _BW / 2, 1), "y": y0, "h": h0,
+                      "label": fmt_brl(level0)},
+            "end": {"cx": _cx(i_end), "x": round(_cx(i_end) - _BW / 2, 1), "y": y1, "h": h1,
+                    "label": fmt_brl(level_end), "name": "Fim" if closed else "Hoje",
+                    "conn_x1": round(_cx(i_end - 1) + _BW / 2, 1),
+                    "conn_x2": round(_cx(i_end) - _BW / 2, 1), "conn_y": _y(level_end)},
+            "delta": delta, "delta_label": fmt_brl(abs(delta))}
 
 
 def _build_hist_spark(people, weeks):
@@ -10278,11 +10559,11 @@ def _render_wow_history(grain="ae"):
     force = request.args.get("refresh") == "1"
     weeks, suns_win = _wow_hist_window(f)
     focus = _wow_hist_focus()
-    # O drill precisa reconstruir a MESMA janela: no modo Quarter isso é a chave
-    # "q", não o número de semanas — passar o número faria o drill montar uma
-    # janela móvel do mesmo tamanho, ancorada no lugar errado.
-    weeks_arg = (WOW_HIST_QUARTER_KEY
-                 if request.args.get("weeks") == WOW_HIST_QUARTER_KEY else weeks)
+    # O drill precisa reconstruir a MESMA janela: nos modos de calendário isso
+    # é a chave (q / régua / FY), não o número de semanas — passar o número
+    # faria o drill montar uma janela móvel do mesmo tamanho, no lugar errado.
+    sel = _wow_hist_sel()
+    weeks_arg = sel
 
     def _scope(x):
         x = _apply_roster_current(x)
@@ -10303,6 +10584,14 @@ def _render_wow_history(grain="ae"):
     people = _wow_hist_people(ev, lv, focus, weeks, grain, f.get("leader"))
     level_end = wk_rows[-1]["level"] if wk_rows else level0
     bridge = _wow_hist_bridge(ev, focus, level0, level_end)
+    fifth = "late" if focus == "early" else "won"
+
+    # Janela longa (> 26 semanas): gráfico de movimento, small multiples e
+    # matriz passam a ser MENSAIS. A linha de nível segue semanal.
+    monthly = weeks > HIST_MONTHLY_ABOVE
+    col_rows = (_hist_month_rows(_wow_events_categorize(ev, focus), wk_rows,
+                                 _WOW_NET_CATS, fifth) if monthly else wk_rows)
+    people_cols = _hist_people_cols(people, col_rows) if monthly else people
 
     def _drill(idx, cats, name=""):
         return url_for("pipeline_wow_history_deals", focus=focus, week=idx,
@@ -10313,33 +10602,52 @@ def _render_wow_history(grain="ae"):
                        leader=(f.get("leader") if not name else None),
                        region=(f.get("region") if not name else None))
 
-    fifth = "late" if focus == "early" else "won"
-    # Chips de navegação da própria página (foco e nº de semanas). Preservam o
+    # Chips de navegação da própria página (foco, janela, eixo). Preservam o
     # resto da querystring pra não zerar Líder/AE/moeda ao trocar de aba.
     def _chip_url(**kw):
         args = {k: v for k, v in request.args.items() if k not in kw and v}
-        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+        args.update({k: v for k, v in kw.items() if v})
+        return request.path + "?" + urllib.parse.urlencode(args)
+
+    zero = request.args.get("zero") == "1"
+    rng = _wow_hist_range(sel)
+    cur_q = _quarter_start_of(_today())
+    ruler = _hist_ruler(_quarter_range(WOW_HIST_FIRST_Q, cur_q), sel,
+                        rng[0] if rng else None, rng[1] if rng else None,
+                        lambda q: _chip_url(weeks=WOW_HIST_FROM + _wq_quarter_key(q)))
+    if sel.startswith(WOW_HIST_FROM) and rng:
+        janela_b = (_quarter_label(rng[0]) if rng[0] == cur_q
+                    else f"{_quarter_label(rng[0])} → {_quarter_label(cur_q)}")
+    elif sel in WOW_HIST_FY:
+        janela_b = WOW_HIST_FY_LABEL.get(sel, sel)
+    elif sel == WOW_HIST_QUARTER_KEY:
+        janela_b = "Quarter"
+    else:
+        janela_b = f"{weeks} semanas"
 
     return render_template(
         "pipeline_wow_history.html", ctx=ctx,
-        focus=focus, grain=grain, weeks=weeks,
+        focus=focus, grain=grain, weeks=weeks, janela_b=janela_b,
         focus_label=("Early · " + _STAGE_BY_ID["93878633"]["name"] if focus == "early"
                      else "Late · Negotiation / Decision / Procurement"),
         fifth_cat=fifth, fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
-        wk_rows=wk_rows, people=people,
+        wk_rows=wk_rows, people=people_cols, col_rows=col_rows, monthly=monthly,
         level0=level0, level_end=level_end, bridge=bridge,
         first_label=_fmt_date_short(suns[0]), last_label=_fmt_date_short(suns[-1]),
-        bars=_build_hist_bars(wk_rows, weeks, _drill),
-        lvl=_build_hist_level(wk_rows, level0, suns[0]),
-        spark=_build_hist_spark(people, weeks),
+        bars=_build_hist_bars(col_rows, weeks, _drill),
+        stairs=_build_hist_stairs(col_rows, level0, _drill, _WOW_NET_CATS, fifth,
+                                  zero_base=zero, closed=bool(rng and rng[1] < _today())),
+        zero=zero,
+        spark=_build_hist_spark(people_cols, len(col_rows)),
         total_net=sum(r["net"] for r in wk_rows),
         total_fifth=sum(r["fifth"] for r in wk_rows),
         best=(max(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
         worst=(min(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
-        week_opts=([(w, f"{w} sem") for w in WOW_HIST_WEEK_OPTS]
-                   + [(WOW_HIST_QUARTER_KEY, "Quarter")]),
-        week_sel=(WOW_HIST_QUARTER_KEY
-                  if request.args.get("weeks") == WOW_HIST_QUARTER_KEY else weeks),
+        week_opts=[(str(w), f"{w} sem") for w in WOW_HIST_WEEK_OPTS],
+        ruler=ruler,
+        fy_opts=[(k, WOW_HIST_FY_LABEL.get(k, k)) for k, (a0, _) in WOW_HIST_FY.items()
+                 if a0 <= _today()],
+        week_sel=sel,
         chip_url=_chip_url, drill=_drill,
     )
 
@@ -10362,12 +10670,10 @@ def pipeline_wow_history_deals():
     par de datas na querystring que possa divergir do que foi clicado."""
     focus = "late" if request.args.get("focus") == "late" else "early"
     weeks, suns_win = _wow_hist_window(get_filters())
-    try:
-        wk = int(request.args.get("week") or 0)
-    except (TypeError, ValueError):
-        wk = 0
-    if not 1 <= wk <= weeks:
+    span = _parse_week_span(request.args.get("week"), weeks)
+    if not span:
         return jsonify(_empty_drill(""))
+    wa, wb = span
 
     name = (request.args.get("name") or "").strip()
     grain = "leader" if request.args.get("grain") == "leader" else "ae"
@@ -10390,7 +10696,7 @@ def pipeline_wow_history_deals():
         return _pt_apply_dim_filter(x, "dtype", get_filters().get("dtype", ""))
 
     ev, _lv, suns = _wow_hist_frames(weeks, _scope, suns=suns_win)
-    ev = ev[ev["week_idx"] == wk]
+    ev = ev[ev["week_idx"].between(wa, wb)]
     ev = _entity_filter(ev, name, grain,
                         request.args.get("leader"), request.args.get("region"))
     ev = _wow_events_categorize(ev, focus)
@@ -10400,7 +10706,7 @@ def pipeline_wow_history_deals():
     ev = ev[ev["category"].isin(_show)]
     rows = _wow_event_rows(ev, focus)
 
-    _janela = f"{_fmt_date_short(suns[wk - 1])} → {_fmt_date_short(suns[wk])}"
+    _janela = f"{_fmt_date_short(suns[wa - 1])} → {_fmt_date_short(suns[wb])}"
     _ev_num = ev[ev["category"] != "sem_var"]
     n_deals = int(_ev_num["deal_id"].nunique())
     _n_mov = int(len(_ev_num))
@@ -10422,7 +10728,7 @@ def pipeline_wow_history_deals():
     _escopo = name or f"PoP {focus} — total"
     _sufixo = _WOW_CAT_LABEL.get(cat, "") if cat else "Saldo"
     return jsonify({
-        "title": f"{_escopo} · {_sufixo} · semana {wk}",
+        "title": f"{_escopo} · {_sufixo} · {_week_span_txt(wa, wb)}",
         "subtitle": subtitle,
         "columns": _wow_drill_columns(grain, name),
         "rows": rows,
@@ -10531,6 +10837,11 @@ def _wq_window(force=False):
         # FY: mesma mecânica do trimestre (véspera do início → domingos → último
         # dia, se já acabou), com as viradas de trimestre no meio da série.
         q0, q1 = WQ_FISCAL_YEARS[sel]
+    if not q0 and sel.startswith(WOW_HIST_FROM):
+        # Régua (pedido do Pedro, 06/11/2026): do trimestre clicado ATÉ HOJE —
+        # Q3+Q4, Q2+Q3+Q4. Mesma mecânica do FY, com as viradas no meio.
+        q0 = next((q for q in qopts if _wq_quarter_key(q) == sel[len(WOW_HIST_FROM):]), None)
+        q1 = _quarter_end_of(_today()) if q0 else None
     if q0:
         alvos = [q0 - timedelta(days=1)]
         s = q0 + timedelta(days=(6 - q0.weekday()) % 7)
@@ -11170,17 +11481,49 @@ def _render_wow_quarter(grain="leader"):
 
     def _chip_url(**kw):
         args = {k: v for k, v in request.args.items() if k not in kw and v}
-        return request.path + "?" + urllib.parse.urlencode({**args, **kw})
+        args.update({k: v for k, v in kw.items() if v})
+        return request.path + "?" + urllib.parse.urlencode(args)
 
-    bars = _build_hist_bars(wk_rows, weeks, _drill, pos=_WQ_POS, neg=_WQ_NEG,
+    # Janela longa (> 26 semanas, ex.: FY26): movimento, small multiples e
+    # matriz por MÊS — mesma regra do PoP Histórico.
+    monthly = weeks > HIST_MONTHLY_ABOVE
+    col_rows = (_hist_month_rows(ev, wk_rows, _WQ_NET_CATS, fifth) if monthly else wk_rows)
+    people_cols = _hist_people_cols(people, col_rows) if monthly else people
+    bars = _build_hist_bars(col_rows, weeks, _drill, pos=_WQ_POS, neg=_WQ_NEG,
                             net_cats=_WQ_NET_CATS)
     # Marcador da virada no gráfico de barras: na fração da semana em que o
-    # trimestre novo começou (quinta, 01/10 → ~57% da semana 27/09→04/10).
-    bar_breaks = [{"x": round(bars["left"] + (v["week"] - 1 + v["frac"]) * bars["step"], 1),
-                   "label": v["para"]} for v in viradas]
+    # trimestre novo começou (quinta, 01/10 → ~57% da semana 27/09→04/10). No
+    # modo mensal, na divisa da coluna do mês em que a virada caiu.
+    if monthly:
+        _col_of = {w: j for j, r in enumerate(col_rows) for w in r["weeks"]}
+        bar_breaks = [{"x": round(bars["left"] + _col_of.get(v["week"], 0) * bars["step"], 1),
+                       "label": v["para"]} for v in viradas]
+    else:
+        bar_breaks = [{"x": round(bars["left"] + (v["week"] - 1 + v["frac"]) * bars["step"], 1),
+                       "label": v["para"]} for v in viradas]
     q_sel = next((q for q in fr["qopts"] if _wq_quarter_key(q) == sel), None)
     fy_sel = sel if (not q_sel and sel in WQ_FISCAL_YEARS) else None
-    janela_b = (_quarter_label(q_sel) if q_sel else fy_sel if fy_sel else f"{weeks} semanas")
+    from_q = (next((q for q in fr["qopts"]
+                    if WOW_HIST_FROM + _wq_quarter_key(q) == sel), None)
+              if sel.startswith(WOW_HIST_FROM) else None)
+    cur_q = _quarter_start_of(_today())
+    if from_q:
+        janela_b = (_quarter_label(from_q) if from_q == cur_q
+                    else f"{_quarter_label(from_q)} → {_quarter_label(cur_q)}")
+    else:
+        janela_b = (_quarter_label(q_sel) if q_sel else fy_sel if fy_sel else f"{weeks} semanas")
+    # Régua: acende o que a janela cobre (trimestre avulso legado, régua ou FY).
+    if from_q:
+        r0, r1 = from_q, _quarter_end_of(_today())
+    elif q_sel:
+        r0, r1 = q_sel, _quarter_end_of(q_sel)
+    elif fy_sel:
+        r0, r1 = WQ_FISCAL_YEARS[fy_sel]
+    else:
+        r0 = r1 = None
+    ruler = _hist_ruler(fr["qopts"], sel, r0, r1,
+                        lambda q: _chip_url(weeks=WOW_HIST_FROM + _wq_quarter_key(q)))
+    zero = request.args.get("zero") == "1"
 
     # Cobertura histórica. Com Deal Type ela não existe: a quota não é aberta
     # por tipo, e pipe só de aquisição contra a quota inteira mentiria.
@@ -11198,29 +11541,30 @@ def _render_wow_quarter(grain="leader"):
     cov = _wq_build_cov(cov_rows, viradas, _cov_drill) if cov_rows else None
     return render_template(
         "pipeline_wow_quarter.html", ctx=ctx,
-        focus=focus, grain=grain, weeks=weeks, janela_b=janela_b, modo_q=bool(q_sel),
-        modo_fy=bool(fy_sel),
+        focus=focus, grain=grain, weeks=weeks, janela_b=janela_b, modo_q=bool(q_sel or (from_q and from_q == cur_q)),
+        modo_fy=bool(fy_sel or (from_q and from_q != cur_q)),
         focus_label=("Early · " + _STAGE_BY_ID["93878633"]["name"] if focus == "early"
                      else "Late · Negotiation / Decision / Procurement"),
         fifth_cat=fifth, fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
-        wk_rows=wk_rows, people=people, viradas=viradas,
+        wk_rows=wk_rows, people=people_cols, col_rows=col_rows, monthly=monthly,
+        viradas=viradas, zero=zero, ruler=ruler,
         level0=level0, level_end=level_end, bridge=bridge,
         first_label=(_fmt_date_short(alvos[0]) if alvos else "—"),
         last_label=(_fmt_date_short(alvos[-1]) if alvos else "—"),
         tem_troca=bool(trocadas),
         bars=bars, bar_breaks=bar_breaks,
-        lvl=_build_hist_level(wk_rows, level0, alvos[0] if alvos else _today(),
-                              breaks=viradas),
-        spark=_build_hist_spark(people, weeks),
+        stairs=_build_hist_stairs(col_rows, level0, _drill, _WQ_NET_CATS, fifth,
+                                  viradas=viradas, zero_base=zero,
+                                  closed=bool(alvos and alvos[-1] < _last_two_sundays()[0])),
+        spark=_build_hist_spark(people_cols, len(col_rows)),
         total_net=sum(r["net"] for r in wk_rows),
         total_fifth=sum(r["fifth"] for r in wk_rows),
         total_puxou=sum(r["puxou"] for r in wk_rows),
         total_escorregou=sum(r["escorregou"] for r in wk_rows),
         best=(max(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
         worst=(min(wk_rows, key=lambda r: r["net"]) if wk_rows else None),
-        week_opts=([(str(w), f"{w} sem") for w in WOW_HIST_WEEK_OPTS]
-                   + [(_wq_quarter_key(q), _quarter_label(q)) for q in fr["qopts"]]
-                   + [(k, k) for k, (a, _) in WQ_FISCAL_YEARS.items() if a <= _today()]),
+        week_opts=[(str(w), f"{w} sem") for w in WOW_HIST_WEEK_OPTS],
+        fy_opts=[(k, k) for k, (a, _) in WQ_FISCAL_YEARS.items() if a <= _today()],
         week_sel=sel, net_cats=",".join(_WQ_NET_CATS),
         hist_channels=list(_WQ_NET_CATS),
         chip_url=_chip_url, drill=_drill,
@@ -11327,18 +11671,16 @@ def _wq_deals_drill():
     janela é reconstruída a partir de (weeks, week), como no Histórico PoP."""
     focus = "late" if request.args.get("focus") == "late" else "early"
     f = get_filters()
-    try:
-        wk = int(request.args.get("week") or 0)
-    except (TypeError, ValueError):
-        wk = 0
     name = (request.args.get("name") or "").strip()
     grain = "leader" if request.args.get("grain") == "leader" else "ae"
     if name and grain == "ae" and name in HIDDEN_FROM_AE_VIEWS:
         return jsonify(_empty_drill(name))
     fr = _wq_frames(focus, _wq_scope(f, entity=False))
     alvos = fr["alvos"]
-    if not 1 <= wk <= len(alvos) - 1:
+    span = _parse_week_span(request.args.get("week"), len(alvos) - 1)
+    if not span:
         return jsonify(_empty_drill(""))
+    wa, wb = span
 
     _all = list(_WQ_NET_CATS) + ["late" if focus == "early" else "won",
                                  "virada_saiu", "virada_entrou"]
@@ -11346,7 +11688,7 @@ def _wq_deals_drill():
     cats = ([c for c in _all if c in {x.strip().lower() for x in _pedido.split(",")}]
             if _pedido else list(_WQ_NET_CATS))
     ev = fr["ev"]
-    ev = ev[(ev["week_idx"] == wk) & ev["category"].isin(cats)]
+    ev = ev[ev["week_idx"].between(wa, wb) & ev["category"].isin(cats)]
     # Recorte de pessoa com a hierarquia do trimestre de cada linha (no Q2/26 o
     # Leonardo inclui o Gustavo) — a mesma régua do escopo da página.
     _L = name if (name and grain == "leader") else ("" if name else
@@ -11390,7 +11732,7 @@ def _wq_deals_drill():
         })
     rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
 
-    _janela = f"{_fmt_date_short(alvos[wk - 1])} → {_fmt_date_short(alvos[wk])}"
+    _janela = f"{_fmt_date_short(alvos[wa - 1])} → {_fmt_date_short(alvos[wb])}"
     _ev_num = ev[ev["category"] != "sem_var"]
     n_deals = int(_ev_num["deal_id"].nunique())
     _n_mov = int(len(_ev_num))
@@ -11409,7 +11751,7 @@ def _wq_deals_drill():
         _sufixo = _WQ_CAT_LABEL.get(cat, "") if cat else "Saldo"
     _escopo = name or f"PoP {focus} por quarter — total"
     return jsonify({
-        "title": f"{_escopo} · {_sufixo} · semana {wk}",
+        "title": f"{_escopo} · {_sufixo} · {_week_span_txt(wa, wb)}",
         "subtitle": f"{_janela} · {_d} · " + (_valor if cat else f"saldo {_valor}"),
         "columns": _with_ae_col([
             {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},

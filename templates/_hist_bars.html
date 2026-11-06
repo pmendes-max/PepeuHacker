@@ -1,0 +1,75 @@
+{# Gráfico de movimento do PoP Histórico / PoP Histórico Q. Geometria em
+   `_build_hist_bars`. O saldo de cada coluna fica numa fileira embaixo do eixo
+   X (como o saldo por AE do PoP Early/Late); coluna fora da curva é cortada no
+   topo do eixo com a marca ≈ e o valor real escrito. Espera: bars e,
+   opcionalmente, bar_breaks. -#}
+<div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
+  <svg viewBox="0 0 {{ bars.w }} {{ bars.h }}" width="100%"
+       style="display:block;max-width:{{ bars.w }}px" font-family="inherit">
+    {% for t in bars.yL %}
+      <line x1="{{ bars.left }}" y1="{{ t.y }}" x2="{{ bars.right_x }}" y2="{{ t.y }}"
+            stroke="var(--border-soft)" stroke-width="1"/>
+      <text x="{{ bars.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
+            fill="var(--muted)">{{ t.label }}</text>
+    {% endfor %}
+    {% for b in (bar_breaks or []) %}
+      <line x1="{{ b.x }}" y1="{{ bars.top - 8 }}" x2="{{ b.x }}" y2="{{ bars.base_y }}"
+            stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4"/>
+      <text x="{{ b.x + 4 }}" y="{{ bars.top + 2 }}" font-size="11" font-weight="700"
+            fill="var(--muted)">{{ b.label }} →</text>
+    {% endfor %}
+    {# Linha do zero por cima das gridlines — é a referência de leitura. #}
+    <line x1="{{ bars.left }}" y1="{{ bars.zero_y }}" x2="{{ bars.right_x }}" y2="{{ bars.zero_y }}"
+          stroke="var(--fg)" stroke-width="1.5"/>
+    <line x1="{{ bars.left }}" y1="{{ bars.base_y }}" x2="{{ bars.right_x }}" y2="{{ bars.base_y }}"
+          stroke="var(--border)" stroke-width="1"/>
+    <text x="{{ bars.left - 10 }}" y="{{ bars.saldo_row_y }}" text-anchor="end" font-size="11"
+          font-weight="700" fill="var(--fg)">Saldo</text>
+
+    {% for c in bars.cols %}
+      <g class="hist-col">
+        {# Zona de clique da coluna inteira: explode o saldo da semana/mês. #}
+        <rect x="{{ c.zx }}" y="{{ bars.top }}" width="{{ bars.step }}"
+              height="{{ bars.plot_h }}" fill="#2563EB" fill-opacity="0"
+              pointer-events="all" style="cursor:pointer" data-drill="{{ c.url }}">
+          <title>{{ c.label }} · {{ c.tip }} — saldo {{ '+' if c.net >= 0 else '−' }}{{ c.net_label }}</title>
+        </rect>
+        {% for s in c.segs %}
+          <rect class="hist-seg" data-ch="{{ s.ch }}" x="{{ s.x }}" y="{{ s.y }}"
+                width="{{ s.w }}" height="{{ s.h }}" fill="{{ s.fill }}"
+                style="cursor:pointer" data-drill="{{ s.url }}">
+            <title>{{ c.label }} · {{ s.amt }} ({{ s.deals }} deals)</title>
+          </rect>
+        {% endfor %}
+        {# Coluna cortada: marca de corte no topo (ou no pé) e o total real. #}
+        {% if c.cut_p %}
+          <path d="M{{ c.cx - bars.bw / 2 - 2 }} {{ bars.top + 9 }} L{{ c.cx + bars.bw / 2 + 2 }} {{ bars.top + 3 }} M{{ c.cx - bars.bw / 2 - 2 }} {{ bars.top + 14 }} L{{ c.cx + bars.bw / 2 + 2 }} {{ bars.top + 8 }}"
+                stroke="var(--surface)" stroke-width="3" fill="none" pointer-events="none"/>
+          <text x="{{ c.cx }}" y="{{ bars.top - 6 }}" text-anchor="middle" font-size="11"
+                font-weight="800" fill="var(--fg)" paint-order="stroke"
+                stroke="var(--surface)" stroke-width="3.5">{{ c.cut_p_label }}</text>
+        {% endif %}
+        {% if c.cut_n %}
+          <path d="M{{ c.cx - bars.bw / 2 - 2 }} {{ bars.base_y - 8 }} L{{ c.cx + bars.bw / 2 + 2 }} {{ bars.base_y - 14 }} M{{ c.cx - bars.bw / 2 - 2 }} {{ bars.base_y - 13 }} L{{ c.cx + bars.bw / 2 + 2 }} {{ bars.base_y - 19 }}"
+                stroke="var(--surface)" stroke-width="3" fill="none" pointer-events="none"/>
+          <text x="{{ c.cx }}" y="{{ bars.base_y - 24 }}" text-anchor="middle" font-size="11"
+                font-weight="800" fill="var(--fg)" paint-order="stroke"
+                stroke="var(--surface)" stroke-width="3.5">{{ c.cut_n_label }}</text>
+        {% endif %}
+        {# Marcador de saldo: traço curto na altura do net. #}
+        <line class="hist-net" x1="{{ c.cx - bars.bw / 2 - 3 }}" y1="{{ c.net_y }}"
+              x2="{{ c.cx + bars.bw / 2 + 3 }}" y2="{{ c.net_y }}"
+              stroke="var(--fg)" stroke-width="2.5" stroke-linecap="round" pointer-events="none"/>
+        {% if c.xl %}
+        <text x="{{ c.cx }}" y="{{ c.xl_y }}" text-anchor="middle" font-size="11"
+              fill="var(--fg-soft)">{{ c.xl }}</text>
+        {% endif %}
+        {# Saldo da coluna, embaixo — clicável como a coluna. #}
+        <text x="{{ c.cx }}" y="{{ c.saldo_y }}" text-anchor="middle" font-size="11"
+              font-weight="800" fill="{{ '#15803d' if c.net > 0 else ('#B91C1C' if c.net < 0 else 'var(--muted)') }}"
+              style="cursor:pointer" data-drill="{{ c.url }}"
+              >{% if c.net > 0 %}+{% elif c.net < 0 %}−{% endif %}{{ c.net_label }}</text>
+      </g>
+    {% endfor %}
+  </svg>
+</div>
