@@ -113,58 +113,8 @@
   <b>= {{ level_end|brl }}</b>
 </div>
 
-{# ============ 1) Nível do pipe ao longo das semanas ============ #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Nível do pipe {{ focus|capitalize }} do trimestre <span class="h2-sub">· quanto havia em cada domingo</span></h2>
-    <span class="ph" style="margin:0">{% if zoom %}eixo NÃO começa em 0{% else %}eixo desde o zero{% endif %} · a linha corta na virada de trimestre</span>
-    <a class="hw-zoom {% if zoom %}is-on{% endif %}" href="{{ chip_url(zoom='' if zoom else '1') }}"
-       title="Abre o eixo perto do mínimo da janela pra ler a oscilação">Zoom no nível</a>
-  </div>
-  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
-    <svg viewBox="0 0 {{ lvl.w }} {{ lvl.h }}" width="100%"
-         style="display:block;max-width:{{ lvl.w }}px" font-family="inherit">
-      {% for t in lvl.yL %}
-        <line x1="{{ lvl.left }}" y1="{{ t.y }}" x2="{{ lvl.right_x }}" y2="{{ t.y }}"
-              stroke="var(--border-soft)" stroke-width="1"/>
-        <text x="{{ lvl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
-              fill="var(--muted)">{{ t.label }}</text>
-      {% endfor %}
-      <line x1="{{ lvl.left }}" y1="{{ lvl.base_y }}" x2="{{ lvl.right_x }}" y2="{{ lvl.base_y }}"
-            stroke="var(--border)" stroke-width="1.5"/>
-      {# Virada: faixa vertical tracejada + o nível que saiu e o que entrou. #}
-      {% for b in lvl.breaks %}
-        <line x1="{{ b.x }}" y1="{{ lvl.top }}" x2="{{ b.x }}" y2="{{ lvl.base_y }}"
-              stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4"/>
-        <text x="{{ b.x + 5 }}" y="{{ lvl.base_y - 8 }}" font-size="11" font-weight="700"
-              fill="var(--muted)">virada {{ b.label }}</text>
-        <line x1="{{ b.x }}" y1="{{ b.y_out }}" x2="{{ b.x }}" y2="{{ b.y_in }}"
-              stroke="#2563EB" stroke-width="1.5" stroke-dasharray="2 3"/>
-        <circle cx="{{ b.x }}" cy="{{ b.y_out }}" r="3.5" fill="var(--surface)" stroke="#94a3b8" stroke-width="2"/>
-        <circle cx="{{ b.x }}" cy="{{ b.y_in }}" r="4" fill="var(--surface)" stroke="#2563EB" stroke-width="2.5"/>
-        <text x="{{ b.x - 6 }}" y="{{ b.y_out + 4 }}" text-anchor="end" font-size="10.5"
-              fill="var(--muted)" paint-order="stroke" stroke="var(--surface)" stroke-width="3">sobrou {{ b.out_label }}</text>
-        <text x="{{ b.x - 7 }}" y="{{ b.y_in + 4 }}" text-anchor="end" font-size="10.5" font-weight="700"
-              fill="#1D4ED8" paint-order="stroke" stroke="var(--surface)" stroke-width="3">abriu {{ b.in_label }}</text>
-      {% endfor %}
-      {% for seg in lvl.segs %}
-        <polyline points="{{ seg }}" fill="none" stroke="#2563EB" stroke-width="2.5"
-                  stroke-linejoin="round" stroke-linecap="round"/>
-      {% endfor %}
-      {% for m in lvl.marks %}
-        <circle cx="{{ m.cx }}" cy="{{ m.cy }}" r="{{ m.r }}"
-                fill="{{ 'var(--surface)' if m.is_anchor else '#2563EB' }}"
-                stroke="#2563EB" stroke-width="2.5"/>
-        {% if m.label %}<text x="{{ m.lx }}" y="{{ m.ly }}" text-anchor="{{ m.anchor }}" font-size="11"
-              font-weight="700" fill="#1D4ED8" paint-order="stroke"
-              stroke="var(--surface)" stroke-width="3.5">{{ m.label }}</text>{% endif %}
-        {% if m.date %}<text x="{{ m.cx }}" y="{{ lvl.base_y + 18 }}" text-anchor="end" font-size="11"
-              fill="var(--fg-soft)" transform="rotate(-40 {{ m.cx }} {{ lvl.base_y + 18 }})">{{ m.date }}</text>{% endif %}
-      {% endfor %}
-    </svg>
-  </div>
-</div>
-
+{# ============ 1) Escada do pipe (nível + saldo, degrau a degrau) ============ #}
+{% include "_hist_stairs.html" %}
 
 {# ============ 2) Cobertura: pipe ÷ quota remanescente em cada domingo ============ #}
 <div class="panel">

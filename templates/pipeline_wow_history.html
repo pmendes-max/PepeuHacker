@@ -82,42 +82,8 @@
   <b>= {{ level_end|brl }}</b>
 </div>
 
-{# ============ 1) Nível do pipe ao longo das semanas ============ #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Nível do pipe {{ focus|capitalize }} <span class="h2-sub">· quanto havia em cada domingo</span></h2>
-    <span class="ph" style="margin:0">{% if zoom %}eixo NÃO começa em 0 — a oscilação parece maior{% else %}eixo desde o zero — cortar a base exagera a oscilação{% endif %}</span>
-    <a class="hw-zoom {% if zoom %}is-on{% endif %}" href="{{ chip_url(zoom='' if zoom else '1') }}"
-       title="Abre o eixo perto do mínimo da janela pra ler a oscilação">Zoom no nível</a>
-  </div>
-  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
-    <svg viewBox="0 0 {{ lvl.w }} {{ lvl.h }}" width="100%"
-         style="display:block;max-width:{{ lvl.w }}px" font-family="inherit">
-      {% for t in lvl.yL %}
-        <line x1="{{ lvl.left }}" y1="{{ t.y }}" x2="{{ lvl.right_x }}" y2="{{ t.y }}"
-              stroke="var(--border-soft)" stroke-width="1"/>
-        <text x="{{ lvl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
-              fill="var(--muted)">{{ t.label }}</text>
-      {% endfor %}
-      <line x1="{{ lvl.left }}" y1="{{ lvl.base_y }}" x2="{{ lvl.right_x }}" y2="{{ lvl.base_y }}"
-            stroke="var(--border)" stroke-width="1.5"/>
-      <polyline points="{{ lvl.pts }}" fill="none" stroke="#2563EB" stroke-width="2.5"
-                stroke-linejoin="round" stroke-linecap="round"/>
-      {% for m in lvl.marks %}
-        {# A âncora é o ponto de PARTIDA (domingo 0): sem movimento medido, só
-           nível. Fica oca pra não ser lida como mais uma semana da série. #}
-        <circle cx="{{ m.cx }}" cy="{{ m.cy }}" r="{{ m.r }}"
-                fill="{{ 'var(--surface)' if m.is_anchor else '#2563EB' }}"
-                stroke="#2563EB" stroke-width="2.5"/>
-        {% if m.label %}<text x="{{ m.lx }}" y="{{ m.ly }}" text-anchor="{{ m.anchor }}" font-size="11"
-              font-weight="700" fill="#1D4ED8" paint-order="stroke"
-              stroke="var(--surface)" stroke-width="3.5">{{ m.label }}</text>{% endif %}
-        {% if m.date %}<text x="{{ m.cx }}" y="{{ lvl.base_y + 18 }}" text-anchor="end" font-size="11"
-              fill="var(--fg-soft)" transform="rotate(-40 {{ m.cx }} {{ lvl.base_y + 18 }})">{{ m.date }}</text>{% endif %}
-      {% endfor %}
-    </svg>
-  </div>
-</div>
+{# ============ 1) Escada do pipe (nível + saldo, degrau a degrau) ============ #}
+{% include "_hist_stairs.html" %}
 
 {# ============ 2) Movimento semana a semana ============ #}
 <div class="panel">

@@ -10381,117 +10381,149 @@ def _build_hist_bars(wk_rows, weeks, drill_url, pos=_HIST_POS_SEGS,
             "saldo_row_y": base_y + 37}
 
 
-def _build_hist_level(wk_rows, level0, sun0, breaks=None, zoom=False):
-    """Geometria da linha de NÍVEL do pipe. Por padrão o eixo começa em 0: numa
-    série de nível, cortar a base exagera a variação — 5% de oscilação vira um
-    tobogã se o eixo abre no mínimo da série. Com `zoom` (botão "Zoom no nível",
-    pedido do Pedro em 06/11/2026) o eixo abre perto do mínimo da janela, pra
-    ler quando o pipe subiu e caiu; a tela avisa que o eixo não parte do zero.
+def _build_hist_stairs(col_rows, level0, drill_url, net_cats, fifth, viradas=None,
+                       zero_base=False, closed=False):
+    """"Escada do pipe" (pedido do Pedro, 06/11/2026; substitui a linha de
+    nível): começa numa barra com o pipe do início da janela, cada coluna
+    (semana ou mês) é um degrau que parte de onde a anterior terminou, e fecha
+    numa barra com o pipe do fim. É a ponte "R$ X → R$ Y" desenhada.
 
-    A série cabe na largura da tela (`_hist_fit_step`). Com passo estreito
-    (janela longa) só o 1º domingo de cada mês, o início e o fim levam rótulo.
+    Cada degrau tem até três pedaços, encadeados:
+      saldo   novo + cresceu − encolheu − lost (verde sobe, vermelho desce);
+      virada  troca de régua de trimestre (só PoP Histórico Q, roxo);
+      outros  o resto até o nível real da coluna — → Late / won, transferência,
+              volta de estágio, reabertura e resíduo (cinza).
+    O "outros" sai por diferença contra o nível medido, então a escada sempre
+    termina exatamente no nível do fim.
 
-    `breaks` (PoP Histórico por quarter): viradas de trimestre, cada uma com a
-    semana `week` em que caiu, a fração `frac` da semana até ela, o nível que
-    SAIU (`out`, régua do trimestre que acabou) e o que ENTROU (`in`, régua do
-    novo). A linha é cortada ali — ligar os dois lados desenharia como
-    movimento o que é só troca de régua."""
-    _TOP, _PLOT, _BOT = 24, 200, 74
+    Eixo: abre perto do mínimo (o degrau de uma semana é ~2% do pipe e some
+    num eixo desde o zero); `zero_base` força o zero."""
+    _TOP, _PLOT, _BOT = 28, 300, 48
     _LEFT = _HIST_LEFT
-    _STEP = _hist_fit_step(len(wk_rows))
+    monthly = bool(col_rows) and "weeks" in col_rows[0]
+    n = len(col_rows) + 2
+    _STEP = _hist_fit_step(n, max_step=96 if monthly else 64)
+    _BW = round(min(_STEP * 0.62, 46), 1)
     base_y = _TOP + _PLOT
-    breaks = breaks or []
-    vals = [level0] + [r["level"] for r in wk_rows]
-    allv = vals + [b[k] for b in breaks for k in ("out", "in")]
-    if zoom and len(allv) > 1 and max(allv) > 0:
-        vmin, vmax = min(allv), max(allv)
-        pad = max((vmax - vmin) * 0.12, vmax * 0.02)
-        st = _nice_money_step(vmax - vmin + 2 * pad, target=4)
-        lo = max(0.0, math.floor((vmin - pad) / st) * st)
-        top = math.ceil((vmax + pad) / st) * st
-        ticks = []
-        t = lo
-        while t <= top + st * 0.01:
-            ticks.append(t)
-            t += st
+
+    # Virada (PoP Q) por coluna: entrou − saiu.
+    vir = {}
+    for v in viradas or []:
+        j = next((j for j, r in enumerate(col_rows)
+                  if v["week"] in r.get("weeks", [r["idx"]])), None)
+        if j is not None:
+            vir.setdefault(j, []).append(v)
+
+    steps, lv = [], level0
+    for j, r in enumerate(col_rows):
+        a = lv
+        b = a + r["net"]
+        dv = sum(v["in"] - v["out"] for v in vir.get(j, []))
+        c0 = b + dv
+        c = r["level"]
+        steps.append({"r": r, "a": a, "b": b, "c0": c0, "c": c, "dv": dv,
+                      "vir": vir.get(j, [])})
+        lv = c
+    level_end = lv
+    pts = [level0, level_end] + [x for s in steps for x in (s["a"], s["b"], s["c0"], s["c"])]
+    vmin, vmax = min(pts), max(pts)
+    if zero_base or vmax <= 0:
+        lo, hi = 0.0, max(vmax, 1000.0) * 1.08
+        st = _nice_money_step(hi, target=5)
+        hi = math.ceil(hi / st) * st
     else:
-        zoom = False
-        lo = 0.0
-        # Piso de R$ 1.000 (e não 1.0) no topo do eixo: num recorte sem pipe
-        # nenhum, 4 ticks entre 0 e R$ 1,08 saíam todos como "R$ 0"/"R$ 1"
-        # depois do arredondamento do fmt_brl — cinco rótulos repetidos.
-        top = max(allv + [1000.0]) * 1.08
-        ticks = [top * k / 4 for k in range(5)]
-    rng = (top - lo) or 1.0
+        pad = max((vmax - vmin) * 0.15, vmax * 0.02, 1000.0)
+        st = _nice_money_step(vmax - vmin + 2 * pad, target=5)
+        lo = max(0.0, math.floor((vmin - pad) / st) * st)
+        hi = math.ceil((vmax + pad) / st) * st
+    rng = (hi - lo) or 1.0
 
     def _y(v):
-        return base_y - ((v - lo) / rng) * _PLOT
+        return round(base_y - (max(lo, min(hi, v)) - lo) / rng * _PLOT, 1)
 
-    yL = [{"label": fmt_brl(t), "y": round(_y(t), 1)} for t in ticks]
-    dense = _STEP < 34
-    last_date_i = -99
-    pts, marks = [], []
-    for i, v in enumerate(vals):
-        cx = _LEFT + (i - 0.5) * _STEP + _STEP / 2   # âncora meia coluna à esquerda
-        cy = _y(v)
-        d = sun0 if i == 0 else wk_rows[i - 1]["sunday"]
-        pts.append(f"{round(cx, 1)},{round(cy, 1)}")
-        if dense:
-            # Rótulo de data no 1º domingo de cada mês (com folga de 3 pontos
-            # do anterior, senão o domingo-âncora e o 1º do mês encavalam); valor
-            # só no início de cada TRIMESTRE, no início e no fim da série.
-            prev = (sun0 if i == 1 else wk_rows[i - 2]["sunday"]) if i else None
-            new_month = prev is None or prev.month != d.month
-            new_q = prev is None or (prev.month - 1) // 3 != (d.month - 1) // 3
-            show = i == 0 or i == len(vals) - 1 or (new_q and i >= 3 and len(vals) - i > 3)
-            date_lbl = ""
-            if (i == 0 or new_month) and i - last_date_i >= 3:
-                date_lbl = f"{_MES_ABR[d.month - 1]}/{d.year % 100:02d}"
-                last_date_i = i
+    yL = []
+    t = lo
+    while t <= hi + st * 0.01:
+        yL.append({"label": fmt_brl(t), "y": _y(t)})
+        t += st
+
+    def _cx(i):
+        return round(_LEFT + i * _STEP + _STEP / 2, 1)
+
+    def _blk(v0, v1):
+        y0, y1 = _y(v0), _y(v1)
+        return min(y0, y1), max(1.5, abs(y0 - y1))
+
+    tiny = _STEP < 34
+    show_val = _STEP >= 58
+    cols = []
+    for j, s in enumerate(steps):
+        i = j + 1
+        r = s["r"]
+        cx = _cx(i)
+        ny, nh = _blk(s["a"], s["b"])
+        oy, oh = _blk(s["c0"], s["c"])
+        vy, vh = _blk(s["b"], s["c0"])
+        other = s["c"] - s["c0"]
+        if monthly:
+            xl = r["label"]
+        elif not tiny:
+            xl = r["sunday"].strftime("%d/%m") + ("*" if str(r["label"]).endswith("*") else "")
         else:
-            show, date_lbl = True, _fmt_date_short(d)
-        marks.append({"cx": round(cx, 1), "cy": round(cy, 1),
-                      "label": fmt_brl(v) if show else "",
-                      "date": date_lbl, "r": 4 if (show or not dense) else 2.2,
-                      # A âncora fica exatamente EM CIMA do eixo (x = left), então
-                      # o rótulo centrado invadia os números do eixo Y. Ancorado
-                      # pela esquerda, ele cresce pra dentro do gráfico.
-                      "anchor": ("start" if i == 0 else
-                                 "end" if (dense and i == len(vals) - 1) else "middle"),
-                      "lx": round(cx + (5 if i == 0 else 0), 1),
-                      # Rótulos INTERCALADOS acima/abaixo do ponto. "R$ 4,05M"
-                      # ocupa ~50px e o passo é 64 (40 em 26 semanas), então numa
-                      # única faixa eles se sobrepõem. No modo denso só os pontos
-                      # de virada de mês têm rótulo, todos acima.
-                      "ly": round(cy - 11 if (dense or i % 2 == 0) else cy + 18, 1),
-                      "is_anchor": i == 0})
-
-    # Com virada, a polyline vira trechos: até a virada no nível que saiu, e da
-    # virada em diante a partir do nível que entrou.
-    segs, brk, ini = [], [], 0
-    for b in sorted(breaks, key=lambda b: (b["week"], b["frac"])):
-        bx = round(_LEFT + (b["week"] - 1 + b["frac"]) * _STEP, 1)
-        y_out = round(_y(b["out"]), 1)
-        y_in = round(_y(b["in"]), 1)
-        segs.append(" ".join(pts[ini:b["week"]] + [f"{bx},{y_out}"]))
-        pts_in = f"{bx},{y_in}"
-        ini = b["week"]
-        brk.append({"x": bx, "y_out": y_out, "y_in": y_in, "label": b["label"],
-                    "in_label": fmt_brl(b["in"]), "out_label": fmt_brl(b["out"]),
-                    "start": pts_in})
-    tail = pts[ini:]
-    if brk:
-        tail = [brk[-1]["start"]] + tail
-        # Cada trecho do meio começa no "entrou" da virada anterior.
-        for j in range(1, len(segs)):
-            segs[j] = brk[j - 1]["start"] + " " + segs[j]
-    segs.append(" ".join(tail))
-    right_x = _LEFT + len(wk_rows) * _STEP
-    return {"w": round(right_x + 30, 1), "h": _TOP + _PLOT + _BOT,
-            "left": _LEFT, "top": _TOP, "base_y": base_y, "step": _STEP,
-            "right_x": round(right_x, 1), "zoom": zoom, "dense": dense,
-            "yL": yL, "pts": " ".join(pts), "marks": marks,
-            "segs": segs, "breaks": brk}
+            d = r["sunday"]
+            prev = steps[j - 1]["r"]["sunday"] if j else None
+            xl = (f"{_MES_ABR[d.month - 1]}/{d.year % 100:02d}"
+                  if (prev is None or prev.month != d.month) else "")
+        tip = [f"{r['from_label']} → {r.get('to_label', r['label'])}" if monthly
+               else f"semana {r['from_label']} → {r['label']}",
+               f"pipe no início {fmt_brl(s['a'])}",
+               f"saldo {'+' if r['net'] >= 0 else '−'}{fmt_brl(abs(r['net']))}"
+               f" (novo + cresceu − encolheu − lost)"]
+        if s["vir"]:
+            tip.append("virada " + ", ".join(
+                f"{v['de']}→{v['para']}: sobrou {fmt_brl(v['out'])}, abriu {fmt_brl(v['in'])}"
+                for v in s["vir"]))
+        tip.append(f"outros {'+' if other >= 0 else '−'}{fmt_brl(abs(other))}"
+                   f" (→ Late/won, transferência, reabertura)")
+        tip.append(f"pipe no fim {fmt_brl(s['c'])}")
+        cols.append({
+            "cx": cx, "x": round(cx - _BW / 2, 1), "zx": round(_LEFT + i * _STEP, 1),
+            "net": r["net"], "net_label": fmt_brl(abs(r["net"])),
+            "net_y": ny, "net_h": nh, "pos": r["net"] >= 0,
+            "lbl_y": (ny - 6) if r["net"] >= 0 else (ny + nh + 13),
+            "vir": bool(s["vir"]), "vir_y": vy, "vir_h": vh,
+            "oth": abs(other) >= 1, "oth_y": oy, "oth_h": oh,
+            "oth_w": round(max(3.0, _BW * 0.24), 1),
+            "conn_x1": round(_cx(i - 1) + _BW / 2, 1), "conn_x2": round(cx - _BW / 2, 1),
+            "conn_y": _y(s["a"]),
+            "xl": xl, "tip": "\n".join(tip),
+            "url": drill_url(r["idx"], ",".join(net_cats)),
+            "url_oth": drill_url(r["idx"], fifth),
+        })
+    i_end = n - 1
+    q_breaks = []
+    for j, s in enumerate(steps):
+        if not j:
+            continue
+        d0, d1 = steps[j - 1]["r"]["sunday"], s["r"]["sunday"]
+        if _quarter_start_of(d0) != _quarter_start_of(d1):
+            q_breaks.append({"x": round(_LEFT + (j + 1) * _STEP, 1),
+                             "label": _quarter_label(_quarter_start_of(d1))})
+    y0, h0 = _blk(lo, level0)
+    y1, h1 = _blk(lo, level_end)
+    delta = level_end - level0
+    return {"w": round(_LEFT + n * _STEP + 16, 1), "h": _TOP + _PLOT + _BOT,
+            "left": _LEFT, "right_x": round(_LEFT + n * _STEP, 1), "top": _TOP,
+            "base_y": base_y, "step": round(_STEP, 2), "bw": _BW, "yL": yL,
+            "cols": cols, "show_val": show_val, "q_breaks": q_breaks,
+            "zero_base": zero_base or lo == 0,
+            "start": {"cx": _cx(0), "x": round(_cx(0) - _BW / 2, 1), "y": y0, "h": h0,
+                      "label": fmt_brl(level0)},
+            "end": {"cx": _cx(i_end), "x": round(_cx(i_end) - _BW / 2, 1), "y": y1, "h": h1,
+                    "label": fmt_brl(level_end), "name": "Fim" if closed else "Hoje",
+                    "conn_x1": round(_cx(i_end - 1) + _BW / 2, 1),
+                    "conn_x2": round(_cx(i_end) - _BW / 2, 1), "conn_y": _y(level_end)},
+            "delta": delta, "delta_label": fmt_brl(abs(delta))}
 
 
 def _build_hist_spark(people, weeks):
@@ -10570,14 +10602,14 @@ def _render_wow_history(grain="ae"):
                        leader=(f.get("leader") if not name else None),
                        region=(f.get("region") if not name else None))
 
-    # Chips de navegação da própria página (foco, janela, zoom). Preservam o
+    # Chips de navegação da própria página (foco, janela, eixo). Preservam o
     # resto da querystring pra não zerar Líder/AE/moeda ao trocar de aba.
     def _chip_url(**kw):
         args = {k: v for k, v in request.args.items() if k not in kw and v}
         args.update({k: v for k, v in kw.items() if v})
         return request.path + "?" + urllib.parse.urlencode(args)
 
-    zoom = request.args.get("zoom") == "1"
+    zero = request.args.get("zero") == "1"
     rng = _wow_hist_range(sel)
     cur_q = _quarter_start_of(_today())
     ruler = _hist_ruler(_quarter_range(WOW_HIST_FIRST_Q, cur_q), sel,
@@ -10603,7 +10635,9 @@ def _render_wow_history(grain="ae"):
         level0=level0, level_end=level_end, bridge=bridge,
         first_label=_fmt_date_short(suns[0]), last_label=_fmt_date_short(suns[-1]),
         bars=_build_hist_bars(col_rows, weeks, _drill),
-        lvl=_build_hist_level(wk_rows, level0, suns[0], zoom=zoom), zoom=zoom,
+        stairs=_build_hist_stairs(col_rows, level0, _drill, _WOW_NET_CATS, fifth,
+                                  zero_base=zero, closed=bool(rng and rng[1] < _today())),
+        zero=zero,
         spark=_build_hist_spark(people_cols, len(col_rows)),
         total_net=sum(r["net"] for r in wk_rows),
         total_fifth=sum(r["fifth"] for r in wk_rows),
@@ -11489,7 +11523,7 @@ def _render_wow_quarter(grain="leader"):
         r0 = r1 = None
     ruler = _hist_ruler(fr["qopts"], sel, r0, r1,
                         lambda q: _chip_url(weeks=WOW_HIST_FROM + _wq_quarter_key(q)))
-    zoom = request.args.get("zoom") == "1"
+    zero = request.args.get("zero") == "1"
 
     # Cobertura histórica. Com Deal Type ela não existe: a quota não é aberta
     # por tipo, e pipe só de aquisição contra a quota inteira mentiria.
@@ -11513,14 +11547,15 @@ def _render_wow_quarter(grain="leader"):
                      else "Late · Negotiation / Decision / Procurement"),
         fifth_cat=fifth, fifth_label=("Movido p/ Late" if fifth == "late" else "Won"),
         wk_rows=wk_rows, people=people_cols, col_rows=col_rows, monthly=monthly,
-        viradas=viradas, zoom=zoom, ruler=ruler,
+        viradas=viradas, zero=zero, ruler=ruler,
         level0=level0, level_end=level_end, bridge=bridge,
         first_label=(_fmt_date_short(alvos[0]) if alvos else "—"),
         last_label=(_fmt_date_short(alvos[-1]) if alvos else "—"),
         tem_troca=bool(trocadas),
         bars=bars, bar_breaks=bar_breaks,
-        lvl=_build_hist_level(wk_rows, level0, alvos[0] if alvos else _today(),
-                              breaks=viradas, zoom=zoom),
+        stairs=_build_hist_stairs(col_rows, level0, _drill, _WQ_NET_CATS, fifth,
+                                  viradas=viradas, zero_base=zero,
+                                  closed=bool(alvos and alvos[-1] < _last_two_sundays()[0])),
         spark=_build_hist_spark(people_cols, len(col_rows)),
         total_net=sum(r["net"] for r in wk_rows),
         total_fifth=sum(r["fifth"] for r in wk_rows),
