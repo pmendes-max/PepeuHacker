@@ -93,6 +93,80 @@
   {{ quota_chart_assets() }}
 </div>
 
+{# ------- Placar dos líderes (aprovado em 06/11/2026) — abaixo do gráfico ------- #}
+{% if placar %}
+<div class="panel pl-placar">
+  <div class="panel-head">
+    <h2>Placar dos líderes <span class="h2-sub">· projeção (realizado + forecast ponderado) contra a meta · {{ range_label }}</span></h2>
+    {% if totals.quota %}<div class="plc-team"><div><small>Time</small><b style="color:{{ att_color(totals.attainment) }}">{{ (totals.attainment*100)|round|int }}%</b></div>
+      <div><small>Projeção</small><b>{{ totals.projection|brl }}</b></div><div><small>Meta</small><b>{{ totals.quota|brl }}</b></div></div>{% endif %}
+  </div>
+  <div class="plc-leg">
+    <span><i style="background:#065F46"></i>Realizado</span><span><i style="background:#3B82F6"></i>Forecast ponderado</span>
+    <span><i style="background:var(--fg);width:3px"></i>Meta</span>
+    <span>Faixas: <b style="color:#15803D">≥150%</b> · <b style="color:#A16207">100–149%</b> · <b style="color:#BE185D">80–99%</b> · <b style="color:#B91C1C">&lt;80%</b></span>
+  </div>
+  <div class="plc-grid">
+    {% for p in placar %}
+    <div class="plc-cd" data-drill="{{ url_for('forecast_deals', name=p.name, grain='leader', date_from=ctx.filters.date_from, date_to=ctx.filters.date_to) }}" title="Ver os deals da projeção de {{ p.name }}">
+      <div class="plc-h">
+        <div><span class="plc-rk">{{ loop.index }}º</span><b>{{ p.name }}</b>{% if p.segment %}<small>{{ p.segment }}</small>{% endif %}</div>
+        <span class="plc-pill plc-{{ p.status }}">{{ {'verde':'≥150%','amarelo':'100–149%','rosa':'80–99%','vermelho':'<80%'}[p.status] }}</span>
+      </div>
+      <div class="plc-big" style="color:{{ p.color }}">{{ (p.att*100)|round|int }}%<small>da meta</small></div>
+      <div class="plc-bar"><i style="width:{{ p.w_real }}%;background:#065F46"></i><i style="width:{{ p.w_fc }}%;background:#3B82F6"></i>
+        <span class="plc-mk" style="left:{{ p.w_meta }}%"></span></div>
+      <div class="plc-nums">
+        <div><small>Realizado</small><b>{{ p.realized|brl }}</b></div>
+        <div><small>Forecast</small><b>{{ p.weighted|brl }}</b></div>
+        <div><small>Meta</small><b>{{ p.quota|brl }}</b></div>
+        <div><small>{{ 'Falta' if p.gap > 0 else 'Acima' }}</small><b class="{{ 'is-neg' if p.gap > 0 else 'is-pos' }}">{{ (p.gap if p.gap > 0 else -p.gap)|brl }}</b></div>
+      </div>
+      <div class="plc-ft">
+        <div>{% if p.spark %}<small>Projeção nos últimos {{ p.spark.n }} domingos</small>
+          <svg width="150" height="34" class="plc-sp" aria-hidden="true"><line x1="0" x2="150" y1="{{ p.spark.meta_y }}" y2="{{ p.spark.meta_y }}" stroke="#94A3B8" stroke-dasharray="3 3"/>
+            <polyline points="{{ p.spark.line }}" fill="none" stroke="{{ p.color }}" stroke-width="2"/>
+            <circle cx="{{ p.spark.end_x }}" cy="{{ p.spark.end_y }}" r="3" fill="{{ p.color }}"/></svg>{% endif %}</div>
+        <div class="plc-mini">
+          {% if p.aes %}<span><b>{{ p.acima }}</b> de {{ p.aes }} AEs ≥100%</span>{% endif %}
+          {% if p.cob is not none %}<span>Cobertura Late <b>{{ '%.1f'|format(p.cob)|replace('.', ',') }}x</b></span>{% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+<style>
+  .pl-placar .panel-head{flex-wrap:wrap;gap:10px}
+  .plc-team{display:flex;gap:20px;background:var(--fg);color:var(--surface);border-radius:12px;padding:8px 14px}
+  .plc-team small{display:block;font-size:11px;opacity:.75}.plc-team b{font-size:17px}
+  .plc-team b[style]{filter:brightness(1.6)}
+  .plc-leg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin:2px 0 12px}
+  .plc-leg i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+  .plc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .plc-cd{border:1px solid var(--border);border-radius:16px;padding:16px 18px;display:flex;flex-direction:column;gap:10px;
+    background:var(--surface);cursor:pointer;transition:border-color .12s}
+  .plc-cd:hover{border-color:#93C5FD}
+  .plc-h{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  .plc-h b{font-size:16px}.plc-h small{display:block;color:var(--muted);font-size:12px}
+  .plc-rk{font-size:12px;font-weight:800;color:var(--muted);margin-right:6px}
+  .plc-pill{font-size:11.5px;font-weight:800;border-radius:999px;padding:3px 10px;white-space:nowrap}
+  .plc-verde{background:#DCFCE7;color:#15803D}.plc-amarelo{background:#FEF9C3;color:#A16207}
+  .plc-rosa{background:#FCE7F3;color:#BE185D}.plc-vermelho{background:#FEE2E2;color:#B91C1C}
+  .plc-big{font-size:40px;font-weight:800;letter-spacing:-1px;line-height:1;font-variant-numeric:tabular-nums}
+  .plc-big small{font-size:13px;font-weight:600;color:var(--muted);margin-left:6px;letter-spacing:0}
+  .plc-bar{position:relative;height:12px;background:var(--surface-2,#EEF2F7);border-radius:6px;display:flex}
+  .plc-bar i{display:block;height:100%}.plc-bar i:first-child{border-radius:6px 0 0 6px}
+  .plc-mk{position:absolute;top:-4px;bottom:-4px;width:2.5px;background:var(--fg);border-radius:2px}
+  .plc-nums{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+  .plc-nums small{display:block;font-size:11px;color:var(--muted)}.plc-nums b{font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .plc-nums .is-neg{color:#B91C1C}.plc-nums .is-pos{color:#15803D}
+  .plc-ft{display:flex;justify-content:space-between;align-items:flex-end;gap:8px;border-top:1px solid var(--border-soft);padding-top:8px}
+  .plc-ft small{display:block;font-size:11px;color:var(--muted)}.plc-sp{display:block;margin-top:2px}
+  .plc-mini{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--fg-soft);text-align:right}
+</style>
+{% endif %}
+
 {# ------- Composição por forecast category (pipeline aberto) ------- #}
 <div class="panel">
   <h2>Composição do pipeline por forecast category</h2>

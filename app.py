@@ -14798,6 +14798,9 @@ def _forecast_page(grain="ae"):
             _row(ae_name, qv["leader"], qv["region"])["quota"] = qv["quota"]
 
     by_ae = list(rows.values())
+    # Linhas POR AE guardadas antes do rollup: o placar dos líderes conta
+    # quantos AEs de cada time estão ≥100% da quota.
+    ae_level = [dict(r) for r in by_ae]
 
     # Grain de líder: agrega as linhas por-AE em linhas por-líder (soma do time).
     if grain == "leader":
@@ -14834,6 +14837,9 @@ def _forecast_page(grain="ae"):
     # Escala do gráfico inclui a meta: sem isso a tracejada da meta de quem está
     # abaixo do alvo (meta > projeção do topo) sairia fora da área plotada.
     chart_max = max([max_projection] + [float(r.get("quota") or 0.0) for r in chart_rows])
+
+    placar = (_fc_placar(by_ae, ae_level, pipe, f, from_d, to_d, force=force)
+              if (grain == "leader" and meta_ok) else [])
 
     # Gráfico de atingimento (`_quota_chart.html`): uma série por pedaço da pilha.
     qc_series = ([{"key": "realized", "label": "Realizado (Won)", "color": "#065F46"}]
@@ -14903,7 +14909,7 @@ def _forecast_page(grain="ae"):
         by_ae=by_ae, chart_rows=chart_rows, by_cat=by_cat, totals=totals,
         not_forecasted=not_forecasted, max_projection=max_projection,
         chart_max=chart_max, range_label=range_label, grain=grain,
-        qc_rows=qc_rows, qc_series=qc_series,
+        qc_rows=qc_rows, qc_series=qc_series, placar=placar,
         dtype_sel=dtype_sel, dtype_label=_pt_dim_label("dtype", dtype_sel),
         hold_ok=hold_ok, meta_ok=meta_ok)
 
@@ -14968,6 +14974,75 @@ def _att_status(a):
 _ATT_COLOR = {"verde": "#15803D", "amarelo": "#A16207", "rosa": "#BE185D",
               "vermelho": "#B91C1C", "sem": "var(--muted)"}
 app.jinja_env.globals["att_color"] = lambda a: _ATT_COLOR[_att_status(a)]
+
+
+def _fc_placar(lead_rows, ae_rows, pipe, f, from_d, to_d, force=False):
+    """Placar dos líderes (aprovado pelo Pedro em 06/11/2026): um cartão por
+    líder, abaixo do gráfico da aba Forecast, pra caber numa tela e virar print.
+    Projeção = realizado + ponderado dos diretores contra a meta (Comp. Target);
+    faixas de cor de `_att_status`.
+
+    Extras de cada cartão:
+      · quantos AEs do time estão ≥100% da quota (linhas por AE, antes do rollup);
+      · cobertura Late = pipe aberto em Negotiation/Decision/Procurement com close
+        date no período ÷ (meta − realizado) — a régua da aba Cobertura;
+      · mini-linha da projeção nos últimos domingos (Histórico do Forecast: Done
+        acumulado + ponderado dos diretores). Se o histórico falhar, o cartão
+        sai sem a linha em vez de derrubar a tela."""
+    out = []
+    late_ids = set(MODEL_STAGE.keys())
+    serie = {}
+    try:
+        q0, q1 = _fc_hist_quarter(f)
+        _ev, lv, suns, com_foto = _fc_hist_frames(q0, q1, _fc_hist_scope(f, cut_from=q0),
+                                                  force=force)
+        _td, done_by = _fc_done_cumulative(f, suns, q0, q1, force=force)
+        for s_ in _fc_series_by_leader(lv, suns, "v_dir", f.get("leader"), com_foto):
+            d = done_by.get(s_["name"], [0.0] * len(suns))
+            serie[s_["name"]] = [(v + d[k]) if v is not None else None
+                                 for k, v in enumerate(s_["values"])][-9:]
+    except Exception:
+        app.logger.exception("placar: série do histórico indisponível")
+    for r in lead_rows:
+        name = r["account_executive"]
+        q = float(r.get("quota") or 0.0)
+        if not q:
+            continue
+        time = set(expand_leader(name))
+        aes = [a for a in ae_rows if a.get("leader") in time and not a.get("is_manager")
+               and float(a.get("quota") or 0.0) > 0]
+        acima = sum(1 for a in aes if (a["realized"] + a["weighted"]) >= a["quota"])
+        lp = (pipe[pipe["leader"].isin(time) & pipe["dealstage"].isin(late_ids)]
+              if len(pipe) else pipe)
+        rem = max(q - r["realized"], 0.0)
+        cob = (float(lp["amount"].sum()) / rem) if (rem and len(lp)) else (0.0 if rem else None)
+        att = r["projection"] / q
+        pts = None
+        vals = [v for v in serie.get(name, []) if v is not None]
+        if len(vals) >= 2:
+            w, h = 150, 34
+            mx_, mn = max(vals + [q]) * 1.05, min(vals) * 0.9
+            sc = (mx_ - mn) or 1.0
+            line = [(i * (w - 6) / (len(vals) - 1) + 3, h - 3 - (v - mn) / sc * (h - 6))
+                    for i, v in enumerate(vals)]
+            pts = {"line": " ".join(f"{x:.1f},{y:.1f}" for x, y in line),
+                   "meta_y": round(h - 3 - (q - mn) / sc * (h - 6), 1),
+                   "end_x": round(line[-1][0], 1), "end_y": round(line[-1][1], 1),
+                   "n": len(vals)}
+        full = max(r["projection"], q) * 1.02
+        st = _att_status(att)
+        out.append({
+            "name": name, "segment": SEGMENT_LABEL.get(LEADER_SEGMENT.get(name), ""),
+            "realized": r["realized"], "weighted": r["weighted"],
+            "projection": r["projection"], "quota": q, "gap": q - r["projection"],
+            "att": att, "status": st, "color": _ATT_COLOR[st],
+            "w_real": round(r["realized"] / full * 100, 2),
+            "w_fc": round(r["weighted"] / full * 100, 2),
+            "w_meta": round(q / full * 100, 2),
+            "aes": len(aes), "acima": acima, "cob": cob, "spark": pts,
+        })
+    out.sort(key=lambda x: x["att"], reverse=True)
+    return out
 
 
 def _forecast_model_page(grain="ae"):
