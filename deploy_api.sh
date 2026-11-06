@@ -13,8 +13,10 @@
 # revisão que está no ar no `pepeuhacker`, então os dois servem o mesmo código.
 # Rode depois de cada ./deploy_cloudrun.sh.
 #
-# QUEM ENTRA: `domain:tractian.com`, o mesmo público do IAP do principal. Agente
-# em nuvem entra com uma service account própria:
+# QUEM ENTRA: as pessoas de acesso.txt, o mesmo público do IAP do principal —
+# quem concede é ./setup_acesso.sh (este script não mexe em quem entra, pra não
+# reabrir o domínio inteiro a cada deploy). Agente em nuvem entra com uma
+# service account própria:
 #   gcloud run services add-iam-policy-binding pepeuhacker-api --region us-central1 \
 #     --project tractian-bi --member=serviceAccount:<sa> --role=roles/run.invoker
 set -euo pipefail
@@ -62,8 +64,7 @@ read -r -p "Continuar? [s/N] " ok
   --add-custom-audiences "$AUD_ADC" \
   --set-env-vars PEPEU_PAPEL=api,PEPEU_CACHE_DIR=/var/cache/pepeuhacker,USD_BRL_RATE=5.05
 
-"$GCLOUD" run services add-iam-policy-binding "$SERVICO" --region "$REGIAO" \
-  --project "$PROJETO" --member="domain:tractian.com" --role=roles/run.invoker >/dev/null
+# Acesso: ./setup_acesso.sh (lista em acesso.txt). Não conceder domínio aqui.
 
 # Confere que o gêmeo NÃO está aberto: sem token o esperado é 401/403. 200 aqui
 # quer dizer que alguém concedeu run.invoker a allUsers.

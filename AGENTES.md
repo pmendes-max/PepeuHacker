@@ -40,7 +40,8 @@ JWT audience` (testado em 19/10/2026). A lista de clientes programáticos do IAP
 não é aceita no nível do serviço, só no do projeto, e o `tractian-bi` é
 compartilhado (o `fse-frontend`, de outro time, também está atrás do IAP). O
 gêmeo é o mesmo app com a MESMA imagem, sem IAP, protegido pelo IAM do Cloud
-Run: `run.invoker` para `domain:tractian.com` (o mesmo público do IAP) e o
+Run: `run.invoker` para as pessoas de `acesso.txt` (o mesmo público do IAP,
+sincronizado por `./setup_acesso.sh`) e o
 audience do ADC do gcloud aceito como custom audience, pra ponte de cada pessoa
 entrar com o próprio login. Sem token: 403.
 

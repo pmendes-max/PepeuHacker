@@ -1,0 +1,6 @@
+# Quem pode abrir o pepeuhacker (site e gêmeo dos agentes).
+# Um por linha. Aceita:
+#   fulano@tractian.com            → uma pessoa
+#   group:time-vendas@tractian.com → um Google Group inteiro
+# Linhas com # são ignoradas. Depois de editar, rode ./setup_acesso.sh
+pmendes@tractian.com

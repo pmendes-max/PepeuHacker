@@ -73,6 +73,7 @@ echo "[3/4] Liberando o domínio tractian.com..."
   --project="$PROJETO" --member="domain:tractian.com" \
   --role=roles/iap.httpsResourceAccessor >/dev/null
 echo "     ok — qualquer e-mail @tractian.com entra"
+echo "     (pra restringir a pessoas específicas: edite acesso.txt e rode ./setup_acesso.sh)"
 
 echo
 echo "[4/4] Removendo o acesso público (allUsers)..."
