@@ -14038,12 +14038,12 @@ _PPD_STAGE_COLOR = {1: "#93C5FD", 2: "#60A5FA", 3: "#3B82F6",
 # da esquerda pra direita, do pior pro melhor, com o "ficou" no meio — o olho lê
 # "vermelho à esquerda = sangrou, verde à direita = andou".
 _PPD_MV_META = {
-    "saiu":    {"label": "Saiu do funil", "color": "#B45309",
+    "saiu":    {"label": "Saiu do funil", "color": "#94A3B8",
                 "hint": "não está na foto final: No Show, outro pipeline, deal "
                         "apagado ou sem AE"},
-    "lost":    {"label": "Lost", "color": "#B91C1C",
+    "lost":    {"label": "Lost", "color": "#DC2626",
                 "hint": "marcado closed lost no período"},
-    "voltou":  {"label": "Voltou de estágio", "color": "#DB2777",
+    "voltou":  {"label": "Voltou de estágio", "color": "#EC4899",
                 "hint": "foi pra um estágio ANTERIOR do funil"},
     "ficou":   {"label": "Ficou no estágio", "color": "#CBD5E1",
                 "hint": "mesmo estágio nas duas meias-noites"},
@@ -14051,7 +14051,7 @@ _PPD_MV_META = {
                 "hint": "foi pro estágio seguinte do funil"},
     "pulou":   {"label": "Pulou etapas", "color": "#047857",
                 "hint": "avançou dois estágios ou mais de uma vez"},
-    "won":     {"label": "Won", "color": "#065F46",
+    "won":     {"label": "Won", "color": "#2563EB",
                 "hint": "virou PO Won no período"},
 }
 _PPD_MV_ORDER = ("saiu", "lost", "voltou", "ficou", "avancou", "pulou", "won")
@@ -14270,6 +14270,45 @@ def _ppd_destino(w) -> dict:
         "repreco": float((both["v_curr"] - both["v_prev"]).sum()),
         "avancou": _m(("avancou", "pulou")), "voltou": _m(("voltou",)),
     }
+    # ---- Progresso e Regresso (pedido do Pedro, 06/11/2026) ----
+    # Por estágio, em DEALS e em RECEITA: a parte que progrediu (avançou, pulou,
+    # won), a que regrediu (voltou, lost, saiu) e a que ficou. `mx_*` é a escala
+    # comum da barra divergente: o maior lado de qualquer estágio.
+    _prog, _reg = ("avancou", "pulou", "won"), ("voltou", "lost", "saiu")
+    mx = {"n": 0.0, "v": 0.0}
+    for r in rows:
+        by = {sg["key"]: sg for sg in r["segs"]}
+        pr = {}
+        for u, tot in (("n", float(r["n"])), ("v", r["total"])):
+            def _it(k):
+                sg = by.get(k)
+                x = float(sg[u]) if sg else 0.0
+                return {"key": k, "label": _PPD_MV_META[k]["label"],
+                        "color": _PPD_MV_META[k]["color"],
+                        "share": (x / tot) if tot else 0.0,
+                        "n": sg["n"] if sg else 0, "v": sg["v"] if sg else 0.0}
+            prog = [_it(k) for k in _prog]
+            reg = [_it(k) for k in _reg]
+            g = sum(i["share"] for i in prog)
+            b = sum(i["share"] for i in reg)
+            mx[u] = max(mx[u], g, b)
+            pr[u] = {"prog": prog, "reg": reg, "g": g, "b": b,
+                     "ficou": max(0.0, 1.0 - g - b) if tot else 0.0,
+                     "mexeu": [i for i in reg + prog if i["share"] > 0]}
+        r["pr"] = pr
+    for u in mx:
+        mx[u] = (mx[u] * 1.2) or 1.0
+    for r in rows:
+        for u in ("n", "v"):
+            d = r["pr"][u]
+            d["gw"] = round(d["g"] / mx[u] * 50, 2)       # % da largura da trilha
+            d["bw"] = round(d["b"] / mx[u] * 50, 2)
+            for lado, w in (("prog", d["g"]), ("reg", d["b"])):
+                for i in d[lado]:
+                    i["w"] = round(i["share"] / w * 100, 2) if w else 0.0
+            m = sum(i["share"] for i in d["mexeu"])
+            for i in d["mexeu"]:
+                i["wm"] = round(i["share"] / m * 100, 2) if m else 0.0
     return {"rows": rows, "span": span or 1.0, "ponte": ponte,
             "entrou": {"segs": ent_segs,
                        "span": max([x["v"] for x in ent_segs], default=0) or 1.0},
