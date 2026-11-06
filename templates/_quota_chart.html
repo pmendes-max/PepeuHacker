@@ -1,0 +1,215 @@
+{# Gráfico de atingimento das telas de Forecast (pedido do Pedro, 06/11/2026):
+   barras verticais empilhadas por série + linha do % de atingimento no eixo da
+   direita, com a referência de 100% tracejada. A quota NÃO é desenhada: aparece
+   como valor embaixo do nome e no tooltip. Cor do % pela faixa (`_att_status`):
+   verde ≥150% · amarelo 100–149% · rosa 80–99% · vermelho <80%.
+   Botões: ordenar por Receita ou por Atingimento. Legenda liga/desliga série
+   (re-empilha e recalcula o %); com `drill_chips` o clique leva os chips ligados.
+
+   Desenhado no navegador a partir de JSON: a largura acompanha o painel, então
+   todo mundo cabe sem rolagem (rola só acima de ~26 pessoas).
+
+   rows: [{name, leader, quota, hold, drill, vals: {ch: valor}}]
+   series: [{key, label, color, ink?, drill_val?}] -#}
+{% macro quota_chart(cid, rows, series, meta_label='Quota', drill_chips=None, team=None) %}
+<div class="qc" id="{{ cid }}" data-meta-label="{{ meta_label }}"{% if drill_chips %} data-drill-chips="{{ drill_chips }}"{% endif %}>
+  <div class="qc-top">
+    <div class="qc-chips" data-qc-chips></div>
+    <div class="qc-sort" role="group" aria-label="Ordenar">
+      <span>Ordenar por</span>
+      <button type="button" class="qc-sb" data-sort="rev">Receita</button>
+      <button type="button" class="qc-sb is-on" data-sort="att">Atingimento</button>
+    </div>
+  </div>
+  <div class="legend legend-toggle qc-legend">
+    {% for s in series %}
+      <button type="button" class="leg-toggle is-on" data-ch="{{ s.key }}"{% if s.drill_val %} data-drill-val="{{ s.drill_val }}"{% endif %}
+              style="--c:{{ s.color }};--ci:{{ s.ink or s.color }}"><span class="leg-dot" style="background:{{ s.color }}"></span>{{ s.label }}</button>
+    {% endfor %}
+    <span class="qc-leg-line"><i></i>% de atingimento (eixo da direita)</span>
+  </div>
+  <div class="qc-wrap">
+    <svg class="qc-svg" role="img" aria-label="Projeção e % de atingimento por pessoa"></svg>
+    <div class="qc-tip" hidden></div>
+  </div>
+  <script type="application/json" data-qc-rows>{{ rows|tojson }}</script>
+  <script type="application/json" data-qc-series>{{ series|tojson }}</script>
+  <script type="application/json" data-qc-team>{{ (team or {})|tojson }}</script>
+</div>
+{% endmacro %}
+
+{% macro quota_chart_assets() %}
+<style>
+  .qc-top{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;justify-content:space-between;margin:2px 0 10px}
+  .qc-chips{display:flex;flex-wrap:wrap;gap:7px}
+  .qc-chip{font-size:12px;font-weight:700;border-radius:999px;padding:4px 11px;white-space:nowrap}
+  .qc-chip.verde{background:#DCFCE7;color:#15803D}
+  .qc-chip.amarelo{background:#FEF9C3;color:#A16207}
+  .qc-chip.rosa{background:#FCE7F3;color:#BE185D}
+  .qc-chip.vermelho{background:#FEE2E2;color:#B91C1C}
+  .qc-chip.sem{background:var(--surface-2,#F1F5F9);color:var(--muted)}
+  .qc-chip.time{background:var(--surface-2,#F1F5F9);color:var(--fg);font-weight:600}
+  .qc-sort{display:inline-flex;align-items:center;gap:8px;font-size:11.5px;font-weight:700;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.04em}
+  .qc-sort button{font-weight:600;font-size:12.5px;font-family:inherit;text-transform:none;letter-spacing:0;border:1px solid var(--border);
+    background:var(--surface);color:var(--fg);padding:5px 11px;cursor:pointer}
+  .qc-sort button:first-of-type{border-radius:8px 0 0 8px}
+  .qc-sort button:last-of-type{border-radius:0 8px 8px 0;margin-left:-9px}
+  .qc-sort button.is-on{background:var(--blue,#2563EB);border-color:var(--blue,#2563EB);color:#fff}
+  .qc-legend{margin-bottom:6px}
+  .qc-leg-line{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--muted)}
+  .qc-leg-line i{width:16px;height:3px;border-radius:2px;background:#1D4ED8;display:inline-block}
+  .qc-wrap{position:relative;overflow-x:auto;overflow-y:hidden}
+  .qc-svg{display:block}
+  .qc-col{cursor:pointer}
+  .qc-col .qc-hz{fill:#2563EB;fill-opacity:0}
+  .qc-col:hover .qc-hz{fill-opacity:.05}
+  .qc-tip{position:absolute;z-index:5;pointer-events:none;background:#0F172A;color:#F8FAFC;border-radius:8px;
+    padding:8px 11px;font-size:12px;line-height:1.5;min-width:200px;box-shadow:0 8px 22px rgba(15,23,42,.22)}
+  .qc-tip .r{display:flex;justify-content:space-between;gap:14px;white-space:nowrap}
+  .qc-tip .h{font-weight:800}
+  .qc-tip .s{opacity:.7}
+</style>
+<script>
+(function(){
+  "use strict";
+  var COR = {verde:"#15803D", amarelo:"#A16207", rosa:"#BE185D", vermelho:"#B91C1C", sem:"#64748B"};
+  var NOME = {verde:"≥150%", amarelo:"100–149%", rosa:"80–99%", vermelho:"<80%", sem:"sem quota"};
+  function status(a){ return a == null ? "sem" : a >= 1.5 ? "verde" : a >= 1 ? "amarelo" : a >= .8 ? "rosa" : "vermelho"; }
+  function brl(v){ return window.fmtBRLCompact ? window.fmtBRLCompact(v) : "R$ " + Math.round(v/1000) + "k"; }
+  function esc(t){ return String(t == null ? "" : t).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
+  function niceStep(max, n){ var raw = max / n, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
+  function nomes(n){ var p = String(n).trim().split(/\s+/); return [p[0], p.length > 1 ? p[p.length-1].charAt(0) + "." : ""]; }
+
+  function init(box){
+    var rows = JSON.parse(box.querySelector("[data-qc-rows]").textContent);
+    var series = JSON.parse(box.querySelector("[data-qc-series]").textContent);
+    var team = JSON.parse(box.querySelector("[data-qc-team]").textContent);
+    var svg = box.querySelector(".qc-svg"), wrap = box.querySelector(".qc-wrap"), tip = box.querySelector(".qc-tip");
+    var metaLbl = box.dataset.metaLabel || "Quota";
+    var sort = "att";
+    try { sort = localStorage.getItem("qc-sort") || "att"; } catch(e) {}
+    box.querySelectorAll(".qc-sb").forEach(function(b){ b.classList.toggle("is-on", b.dataset.sort === sort); });
+
+    function draw(){
+      var on = series.filter(function(s){ var b = box.querySelector('.leg-toggle[data-ch="'+s.key+'"]'); return !b || b.classList.contains("is-on"); });
+      var it = rows.map(function(r){
+        var t = 0; on.forEach(function(s){ t += +(r.vals[s.key] || 0); });
+        return {r: r, t: t, a: r.quota ? t / r.quota : null};
+      });
+      it.sort(sort === "rev"
+        ? function(x, y){ return y.t - x.t; }
+        : function(x, y){ if (x.a == null && y.a == null) return y.t - x.t; if (x.a == null) return 1; if (y.a == null) return -1; return y.a - x.a || y.t - x.t; });
+
+      // ---- resumo por faixa ----
+      var cnt = {verde:0, amarelo:0, rosa:0, vermelho:0, sem:0};
+      it.forEach(function(x){ cnt[status(x.a)]++; });
+      var ch = ["verde","amarelo","rosa","vermelho","sem"].filter(function(k){ return cnt[k]; }).map(function(k){
+        return '<span class="qc-chip '+k+'">'+cnt[k]+' '+(k === "sem" ? "sem quota" : NOME[k])+'</span>'; }).join("");
+      if (team && team.quota) {
+        var tp = it.reduce(function(a, x){ return a + x.t; }, 0);
+        if (team.projection != null && on.length === series.length) tp = team.projection;
+        ch += '<span class="qc-chip time">'+esc(team.label || "Total")+': <b>'+brl(tp)+'</b> de <b>'+brl(team.quota)+'</b> · '+Math.round(tp/team.quota*100)+'%</span>';
+      }
+      box.querySelector("[data-qc-chips]").innerHTML = ch;
+
+      // ---- geometria ----
+      var n = Math.max(it.length, 1);
+      var L = 74, R = 52, TOP = 34, H = 300, BOT = 54;
+      var W = Math.max(wrap.clientWidth || 900, L + R + n * 40);
+      var step = (W - L - R) / n, bw = Math.max(10, Math.min(38, step * .52));
+      var base = TOP + H;
+      var mx = Math.max(1, Math.max.apply(null, it.map(function(x){ return x.t; })));
+      var st = niceStep(mx, 4), top = Math.ceil(mx * 1.05 / st) * st;
+      var as = it.filter(function(x){ return x.a != null; }).map(function(x){ return x.a; }).sort(function(a, b){ return a - b; });
+      var p90 = as.length ? as[Math.min(as.length - 1, Math.floor(as.length * .9))] : 1;
+      var atop = Math.max(1.5, Math.ceil(Math.min(Math.max.apply(null, as.concat([1])), p90 * 1.4) * 4) / 4 + .25);
+      function y(v){ return base - v / top * H; }
+      function ya(a){ return base - Math.min(a, atop) / atop * H; }
+      var o = [];
+      for (var v = 0; v <= top + 1e-6; v += st) {
+        o.push('<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'" stroke="var(--border-soft,#EDF2F7)"/>');
+        o.push('<text x="'+(L-8)+'" y="'+(y(v)+4).toFixed(1)+'" text-anchor="end" font-size="11" fill="var(--muted)">'+brl(v)+'</text>');
+      }
+      var ast = atop > 2.5 ? .5 : .25;
+      for (var a = 0; a <= atop + 1e-6; a += ast)
+        o.push('<text x="'+(W-R+8)+'" y="'+(ya(a)+4).toFixed(1)+'" font-size="11" fill="#1D4ED8">'+Math.round(a*100)+'%</text>');
+      o.push('<line x1="'+L+'" x2="'+(W-R)+'" y1="'+ya(1).toFixed(1)+'" y2="'+ya(1).toFixed(1)+'" stroke="#1D4ED8" stroke-opacity=".55" stroke-dasharray="5 5"/>');
+      o.push('<text x="'+(W-R-4)+'" y="'+(ya(1)-6).toFixed(1)+'" text-anchor="end" font-size="11" font-weight="700" fill="#1D4ED8">100% da '+esc(metaLbl.toLowerCase())+'</text>');
+      o.push('<line x1="'+L+'" x2="'+(W-R)+'" y1="'+base+'" y2="'+base+'" stroke="var(--border,#E2E8F0)" stroke-width="1.5"/>');
+
+      var pts = [];
+      it.forEach(function(x, i){
+        var cx = L + i * step + step / 2, bx = cx - bw / 2, yy = base, r = x.r;
+        var g = '<g class="qc-col" data-i="'+i+'"'+(r.drill ? ' data-drill="'+esc(r.drill)+'"' : '')+'>';
+        g += '<rect class="qc-hz" x="'+(L + i * step).toFixed(1)+'" y="'+TOP+'" width="'+step.toFixed(1)+'" height="'+(H + BOT - 6)+'"/>';
+        on.forEach(function(s){
+          var val = +(r.vals[s.key] || 0), h = val / top * H;
+          if (h < .4) return;
+          yy -= h;
+          g += '<rect data-ch="'+s.key+'" x="'+bx.toFixed(1)+'" y="'+yy.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(h - 1, .8).toFixed(1)+'" fill="'+s.color+'"/>';
+        });
+        if (!x.t) g += '<rect x="'+bx.toFixed(1)+'" y="'+(base-3)+'" width="'+bw.toFixed(1)+'" height="3" rx="1.5" fill="#CBD5E1"/>';
+        var nm = nomes(r.name);
+        g += '<text x="'+cx.toFixed(1)+'" y="'+(base+16)+'" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--fg)">'+esc(nm[0])+(step > 70 && nm[1] ? " " + esc(nm[1]) : "")+'</text>';
+        g += '<text x="'+cx.toFixed(1)+'" y="'+(base+31)+'" text-anchor="middle" font-size="10.5" fill="var(--muted)">'+(r.quota ? (step > 66 ? esc(metaLbl.toLowerCase()) + " " : "") + brl(r.quota) : "sem "+esc(metaLbl.toLowerCase()))+'</text>';
+        g += '</g>';
+        o.push(g);
+        if (x.a != null) pts.push({x: cx, a: x.a, s: status(x.a)});
+      });
+      if (pts.length > 1) o.push('<polyline points="'+pts.map(function(p){ return p.x.toFixed(1)+","+ya(p.a).toFixed(1); }).join(" ")+'" fill="none" stroke="#1D4ED8" stroke-width="2.4" stroke-linejoin="round" pointer-events="none"/>');
+      pts.forEach(function(p){
+        var py = ya(p.a);
+        o.push('<circle cx="'+p.x.toFixed(1)+'" cy="'+py.toFixed(1)+'" r="4.5" fill="var(--surface,#fff)" stroke="#1D4ED8" stroke-width="2.2" pointer-events="none"/>');
+        o.push('<text x="'+p.x.toFixed(1)+'" y="'+(py-9).toFixed(1)+'" text-anchor="middle" font-size="11.5" font-weight="800" fill="'+COR[p.s]+'" paint-order="stroke" stroke="var(--surface,#fff)" stroke-width="3.5" pointer-events="none">'+(p.a > atop ? "▲ " : "")+Math.round(p.a*100)+'%</text>');
+      });
+      var Ht = base + BOT;
+      svg.setAttribute("viewBox", "0 0 "+W+" "+Ht);
+      svg.setAttribute("width", W); svg.setAttribute("height", Ht);
+      svg.innerHTML = o.join("");
+      svg._it = it; svg._on = on;
+    }
+
+    svg.addEventListener("mousemove", function(ev){
+      var g = ev.target.closest(".qc-col");
+      if (!g){ tip.hidden = true; return; }
+      var x = svg._it[+g.dataset.i], r = x.r, h = [];
+      h.push('<div class="h">'+esc(r.name)+'</div>');
+      if (r.leader && r.leader !== r.name) h.push('<div class="s">'+esc(r.leader)+'</div>');
+      svg._on.forEach(function(s){ var v = +(r.vals[s.key] || 0); if (v) h.push('<div class="r"><span>'+esc(s.label)+'</span><b>'+brl(v)+'</b></div>'); });
+      h.push('<div class="r"><span>Projeção</span><b>'+brl(x.t)+'</b></div>');
+      if (r.quota) {
+        var gap = r.quota - x.t;
+        h.push('<div class="r"><span>'+esc(metaLbl)+'</span><b>'+brl(r.quota)+'</b></div>');
+        h.push('<div class="r"><span>Atingimento</span><b style="color:'+({verde:"#4ADE80",amarelo:"#FDE047",rosa:"#F9A8D4",vermelho:"#FCA5A5"})[status(x.a)]+'">'+Math.round(x.a*100)+'%</b></div>');
+        h.push('<div class="r"><span>'+(gap > 0 ? "Falta" : "Acima")+'</span><b>'+brl(Math.abs(gap))+'</b></div>');
+      } else h.push('<div class="s">sem '+esc(metaLbl.toLowerCase())+' no período</div>');
+      if (r.hold) h.push('<div class="r"><span>On-hold (MRR)</span><b>'+brl(r.hold)+'</b></div>');
+      tip.innerHTML = h.join(""); tip.hidden = false;
+      var b = wrap.getBoundingClientRect();
+      var tx = ev.clientX - b.left + wrap.scrollLeft + 14, ty = ev.clientY - b.top + 12;
+      if (tx + tip.offsetWidth > wrap.scrollLeft + wrap.clientWidth - 4) tx -= tip.offsetWidth + 28;
+      if (ty + tip.offsetHeight > wrap.clientHeight) ty = Math.max(0, wrap.clientHeight - tip.offsetHeight - 4);
+      tip.style.left = tx + "px"; tip.style.top = ty + "px";
+    });
+    svg.addEventListener("mouseleave", function(){ tip.hidden = true; });
+    box.querySelectorAll(".qc-sb").forEach(function(b){
+      b.addEventListener("click", function(){
+        sort = b.dataset.sort;
+        try { localStorage.setItem("qc-sort", sort); } catch(e) {}
+        box.querySelectorAll(".qc-sb").forEach(function(x){ x.classList.toggle("is-on", x === b); });
+        draw();
+      });
+    });
+    box.querySelectorAll(".qc-legend .leg-toggle").forEach(function(b){
+      b.addEventListener("click", function(){ b.classList.toggle("is-on"); draw(); });
+    });
+    var t; window.addEventListener("resize", function(){ clearTimeout(t); t = setTimeout(draw, 120); });
+    draw();
+  }
+  function boot(){ document.querySelectorAll(".qc").forEach(function(b){ if (!b.dataset.wired){ b.dataset.wired = "1"; init(b); } }); }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
+})();
+</script>
+{% endmacro %}

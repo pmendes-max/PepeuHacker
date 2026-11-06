@@ -5368,9 +5368,24 @@ def _overview_page(ov_tab, grain="ae"):
     _drill_base = {k: v for k, v in (("date_from", f["date_from"]), ("date_to", f["date_to"]),
                                      ("leader", f["leader"]), ("region", f["region"])) if v}
     _sellers = [r for r in by_ae if not r["is_manager"]]
-    _sort_att = lambda rows, key: sorted(
-        rows, key=lambda r: (r[key] is not None, r[key] if r[key] is not None else -1.0),
-        reverse=True)
+    # Botão Receita | Atingimento (pedido do Pedro, 06/11/2026): `?ordem=receita`
+    # ordena as barras pelo valor realizado; o padrão segue o % de atingimento.
+    _ordem = "receita" if request.args.get("ordem") == "receita" else "ating"
+    _val_of = {"attainment": "realized", "nl_att": "nl_real"}
+
+    def _sort_att(rows, key):
+        if _ordem == "receita":
+            vk = _val_of.get(key, "realized")
+            # Linha de new logo por líder não tem `realized`: cai no `nl_real`.
+            return sorted(rows, key=lambda r: float(
+                (r.get(vk) if r.get(vk) is not None else r.get("nl_real")) or 0.0), reverse=True)
+        return sorted(rows, key=lambda r: (r[key] is not None,
+                                           r[key] if r[key] is not None else -1.0),
+                      reverse=True)
+    _qs = {k: v for k, v in request.args.items() if k != "ordem" and v}
+    rank_sort = {"sel": _ordem,
+                 "receita": request.path + "?" + urllib.parse.urlencode({**_qs, "ordem": "receita"}),
+                 "ating": request.path + ("?" + urllib.parse.urlencode(_qs) if _qs else "")}
 
     rank_board, board_factor = None, None   # Board Target Quota (só grain AE)
     if grain == "leader":
@@ -5548,7 +5563,7 @@ def _overview_page(ov_tab, grain="ae"):
                            by_ae=by_ae, rank=rank, rank_nl=rank_nl, rank_board=rank_board, board_factor=board_factor,
                            insights=insights, acq=acq, exp=exp, range_label=range_label,
                            usd_rate=USD_BRL_RATE, deal_rows=deal_rows, deal_ae=deal_scope,
-                           ov_tab=ov_tab, grain=grain)
+                           ov_tab=ov_tab, grain=grain, rank_sort=rank_sort)
 
 
 @app.route("/demand")
@@ -14689,6 +14704,17 @@ def _forecast_page(grain="ae"):
                      meta["region"] if meta is not None else None)
             r["hold"] = float(hv)
 
+    # Quota do AE (pedido do Pedro, 06/11/2026): a mesma do Modelo Analytics. Quem
+    # tem quota entra mesmo sem pipe nem realizado — é justamente quem mais
+    # precisa aparecer no gráfico. Com Deal Type não há quota (ver `meta_ok`).
+    if meta_ok:
+        for ae_name, qv in _ae_quota_map(f, from_d, to_d, force=force).items():
+            if ae_name in DEPARTED_AES or qv["leader"] not in ALLOWED_LEADERS:
+                continue
+            if not qv["quota"] and ae_name not in rows:
+                continue
+            _row(ae_name, qv["leader"], qv["region"])["quota"] = qv["quota"]
+
     by_ae = list(rows.values())
 
     # Grain de líder: agrega as linhas por-AE em linhas por-líder (soma do time).
@@ -14712,13 +14738,34 @@ def _forecast_page(grain="ae"):
         _apply_leader_meta(by_ae, targets=_fc_targets)
     by_ae.sort(key=lambda r: r["projection"], reverse=True)
 
+    for r in by_ae:
+        q = float(r.get("quota") or 0.0) if meta_ok else 0.0
+        r["quota"] = q
+        r["attainment"] = (r["projection"] / q) if q else None
+        r["status"] = _att_status(r["attainment"])
+
     # Gráfico = Realizado (Won) + forecast ponderado por AE/líder (ambos deal amount).
-    # Gestores ficam fora das barras; inclui quem tem realizado mesmo sem pipeline.
-    chart_rows = [r for r in by_ae if not r["is_manager"] and (r["weighted"] > 0 or r["realized"] > 0)]
+    # Gestores ficam fora das barras; inclui quem tem realizado, pipe OU quota.
+    chart_rows = [r for r in by_ae if not r["is_manager"]
+                  and (r["weighted"] > 0 or r["realized"] > 0 or r["quota"] > 0)]
     max_projection = max((r["projection"] for r in chart_rows), default=0.0)
     # Escala do gráfico inclui a meta: sem isso a tracejada da meta de quem está
     # abaixo do alvo (meta > projeção do topo) sairia fora da área plotada.
     chart_max = max([max_projection] + [float(r.get("quota") or 0.0) for r in chart_rows])
+
+    # Gráfico de atingimento (`_quota_chart.html`): uma série por pedaço da pilha.
+    qc_series = ([{"key": "realized", "label": "Realizado (Won)", "color": "#065F46"}]
+                 + [{"key": c["key"], "label": c["label"], "color": c["color"],
+                     "ink": c["ink"]} for c in cats])
+    qc_rows = [{
+        "name": r["account_executive"], "leader": r.get("leader"),
+        "quota": r["quota"], "hold": r.get("hold") or 0.0,
+        "drill": (url_for("forecast_deals", name=r["account_executive"], grain=grain,
+                          date_from=f["date_from"] or None, date_to=f["date_to"] or None,
+                          dtype=(f.get("dtype") or None))
+                  if r["projection"] > 0 else None),
+        "vals": {"realized": r["realized"], **{c["key"]: r["w_" + c["key"]] for c in cats}},
+    } for r in chart_rows]
 
     # ----- composição por forecast category (só pipeline aberto) -----
     by_cat = []
@@ -14757,6 +14804,12 @@ def _forecast_page(grain="ae"):
         totals["attainment"] = ((totals["projection"] / totals["quota"])
                                 if totals["quota"] else None)
         totals["gap"] = (totals["quota"] - totals["projection"]) if totals["quota"] else None
+    elif meta_ok:
+        # AE: soma das quotas dos AEs (gestor fora, como no Modelo Analytics).
+        totals["quota"] = sum(r["quota"] for r in by_ae if not r["is_manager"])
+        totals["attainment"] = ((totals["projection"] / totals["quota"])
+                                if totals["quota"] else None)
+        totals["gap"] = (totals["quota"] - totals["projection"]) if totals["quota"] else None
     else:
         totals["quota"] = 0.0
         totals["attainment"] = None
@@ -14768,6 +14821,7 @@ def _forecast_page(grain="ae"):
         by_ae=by_ae, chart_rows=chart_rows, by_cat=by_cat, totals=totals,
         not_forecasted=not_forecasted, max_projection=max_projection,
         chart_max=chart_max, range_label=range_label, grain=grain,
+        qc_rows=qc_rows, qc_series=qc_series,
         dtype_sel=dtype_sel, dtype_label=_pt_dim_label("dtype", dtype_sel),
         hold_ok=hold_ok, meta_ok=meta_ok)
 
@@ -14780,6 +14834,58 @@ def forecast_model():
 @app.route("/leaders/forecast/model")
 def leaders_forecast_model():
     return _forecast_model_page("leader")
+
+
+def _ae_quota_map(f, from_d, to_d, force=False) -> dict:
+    """Quota por AE no período, com líder e região: {nome: {quota, leader, region}}.
+
+    MESMA fonte do overview/pipeline e do Modelo Analytics: o roster do
+    trimestre quando existe, senão a curated (`ae_performance`). Respeita os
+    filtros de região, líder e AE. Extraído do Modelo Analytics (06/11/2026)
+    pra a aba Forecast comparar a projeção do AE com a mesma quota."""
+    rq = _roster_window(from_d, to_d)
+    out = {}
+    if rq is not None:
+        scope = expand_leader(f["leader"]) if f["leader"] else None
+        for name, v in _roster_of(rq).items():
+            if f["region"] and (_roster_region() != f["region"]):
+                continue
+            if scope is not None and v["leader"] not in scope:
+                continue
+            if f["ae"] and name != f["ae"]:
+                continue
+            out[name] = {"quota": float(v["quota"]), "leader": v["leader"],
+                         "region": _roster_region()}
+        return out
+    aep = _get_clean_ae_perf(force=force)
+    aep = aep[(aep["quarter"] <= to_d) & (aep["quarter_end"] >= from_d)]
+    if f["region"]:
+        aep = aep[aep["region"] == f["region"]]
+    if f["leader"]:
+        aep = aep[aep["leader"].isin(expand_leader(f["leader"]))]
+    if f["ae"]:
+        aep = aep[aep["account_executive"] == f["ae"]]
+    if not len(aep):
+        return out
+    last = (aep.sort_values("quarter").drop_duplicates("account_executive", keep="last")
+               .set_index("account_executive"))
+    for name, q in aep.groupby("account_executive")["quota_in_brl"].sum().items():
+        out[name] = {"quota": float(q or 0.0), "leader": last.at[name, "leader"],
+                     "region": last.at[name, "region"]}
+    return out
+
+
+def _att_status(a):
+    """Faixa de atingimento das telas de Forecast (pedido do Pedro, 06/11/2026):
+    verde ≥150% · amarelo 100–149% · rosa 80–99% · vermelho <80%."""
+    if a is None:
+        return "sem"
+    return "verde" if a >= 1.5 else "amarelo" if a >= 1.0 else "rosa" if a >= 0.8 else "vermelho"
+
+
+_ATT_COLOR = {"verde": "#15803D", "amarelo": "#A16207", "rosa": "#BE185D",
+              "vermelho": "#B91C1C", "sem": "var(--muted)"}
+app.jinja_env.globals["att_color"] = lambda a: _ATT_COLOR[_att_status(a)]
 
 
 def _forecast_model_page(grain="ae"):
@@ -14830,28 +14936,7 @@ def _forecast_model_page(grain="ae"):
     # Quota por AE — MESMA fonte do overview/pipeline (roster do trimestre, senão curated).
     rq = _roster_window(from_d, to_d)
     period_is_q3 = rq is not None
-    if period_is_q3:
-        scope = expand_leader(f["leader"]) if f["leader"] else None
-        quota_by_ae = {}
-        for name, v in _roster_of(rq).items():
-            if f["region"] and (_roster_region() != f["region"]):
-                continue
-            if scope is not None and v["leader"] not in scope:
-                continue
-            if f["ae"] and name != f["ae"]:
-                continue
-            quota_by_ae[name] = float(v["quota"])
-    else:
-        aep = _get_clean_ae_perf(force=force)
-        aep = aep[(aep["quarter"] <= to_d) & (aep["quarter_end"] >= from_d)]
-        if f["region"]:
-            aep = aep[aep["region"] == f["region"]]
-        if f["leader"]:
-            aep = aep[aep["leader"].isin(expand_leader(f["leader"]))]
-        if f["ae"]:
-            aep = aep[aep["account_executive"] == f["ae"]]
-        quota_by_ae = (aep.groupby("account_executive")["quota_in_brl"].sum().to_dict()
-                       if len(aep) else {})
+    quota_by_ae = {a: v["quota"] for a, v in _ae_quota_map(f, from_d, to_d, force=force).items()}
 
     meta = {}
     for _, r in dd.drop_duplicates("account_executive").iterrows():
@@ -14900,6 +14985,19 @@ def _forecast_model_page(grain="ae"):
     chart = (_build_rank_chart(items, _drill, axis_mode="currency", line_mode="percent",
                                drill_path=mpath, drill_key=dkey) if items else None)
 
+    # Gráfico de atingimento (`_quota_chart.html`), o mesmo da aba Forecast.
+    qc_series = [{"key": "done", "label": "Realizado (Won)", "color": "#065F46"},
+                 {"key": "forecast", "label": "Forecast do modelo", "color": "#2563EB"}]
+    qc_rows = [{
+        "name": r.get("name") or r["account_executive"], "leader": r.get("leader"),
+        "quota": r["quota"], "hold": 0.0,
+        "drill": (url_for("forecast_model_deals", grain=grain,
+                          name=r.get("name") or r["account_executive"],
+                          date_from=f["date_from"] or None, date_to=f["date_to"] or None)
+                  if r["projection"] > 0 else None),
+        "vals": {"done": r["done"], "forecast": r["forecast"]},
+    } for r in rows]
+
     table = sorted(rows, key=lambda r: r["projection"], reverse=True)
     # Done/Forecast/Projeção: sempre do by_ae por-AE (verdade do time). Quota: no
     # grain de líder é a soma dos Board Targets de topo; no AE é a soma das quotas dos AEs.
@@ -14939,6 +15037,7 @@ def _forecast_model_page(grain="ae"):
     range_label = f"{from_d.strftime('%d/%m/%Y')} → {to_d.strftime('%d/%m/%Y')}"
     return render_template("forecast_model.html", ctx=ctx, grain=grain, unit=unit,
                            chart=chart, table=table, totals=totals, range_label=range_label,
+                           qc_rows=qc_rows, qc_series=qc_series,
                            prob=FORECAST_MODEL_PROB, seg_label=SEGMENT_LABEL,
                            stage_order=MODEL_STAGE_ORDER, stage_label=MODEL_STAGE_LABEL,
                            safety=MODEL_SAFETY_FACTOR)

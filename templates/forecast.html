@@ -21,7 +21,7 @@
     <div class="kpi-l">Projeção do quarter <span class="kpi-q">· amount</span></div>
     <div class="kpi-v">{{ totals.projection|brl }}</div>
     <div class="kpi-s">realizado + ponderado{% if totals.attainment is not none %} ·
-      <b>{{ (totals.attainment*100)|round|int }}%</b> da meta{% endif %}</div>
+      <b>{{ (totals.attainment*100)|round|int }}%</b> da {{ 'meta' if grain == 'leader' else 'quota' }}{% endif %}</div>
   </div>
   <div class="kpi grn">
     <div class="kpi-l">Realizado <span class="kpi-q">· amount</span></div>
@@ -84,61 +84,13 @@
 <div class="panel">
   <div class="panel-head">
     <h2>Realizado + Forecast ponderado por {{ 'líder' if grain == 'leader' else 'AE' }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· deal amount</span></h2>
-    <span class="ph" style="margin:0">barra = Realizado (Won) + Σ amount × % do pipeline · clique na legenda pra filtrar</span>
+    <span class="ph" style="margin:0">barra = Realizado (Won) + Σ amount × % do pipeline · linha = % da {{ 'meta' if grain == 'leader' else 'quota' }} · clique na legenda pra filtrar</span>
   </div>
-  <div class="dchart fc-chart" data-drill-chips="cat" data-channels="realized {% for c in cats %}{{ c.key }} {% endfor %}{% if grain == 'leader' %}meta{% endif %}">
-    <div class="legend legend-toggle">
-      <button type="button" class="leg-toggle is-on" data-ch="realized" style="--c:#065F46">
-        <span class="leg-dot" style="background:#065F46"></span>Realizado (Won)
-      </button>
-      {% for c in cats %}
-      <button type="button" class="leg-toggle is-on" data-ch="{{ c.key }}" style="--c:{{ c.color }};--ci:{{ c.ink or c.color }}">
-        <span class="leg-dot" style="background:{{ c.color }}"></span>{{ c.label }}
-      </button>
-      {% endfor %}
-      {% if grain == 'leader' %}
-      {# Meta não é segmento da pilha: é a tracejada de referência de cada barra
-         (o JS separa 'meta' dos canais empilhados). #}
-      <button type="button" class="leg-toggle is-on leg-goal" data-ch="meta" data-drill-skip style="--c:var(--blue)">
-        <span class="leg-dot" style="background:var(--blue);border:1.5px dashed #fff;box-shadow:0 0 0 1px var(--blue)"></span>Meta (Comp. Target)
-      </button>
-      {% endif %}
-    </div>
-    <div class="vbars" style="--count:{{ chart_rows|length }}">
-      {% for r in chart_rows %}
-        {% set ptot = r.projection|round|int %}
-        {% set scale = chart_max or max_projection %}
-        {% set h_pct = (ptot / scale * 100) if scale else 0 %}
-        {% set meta_v = (r.quota|round|int) if r.quota else 0 %}
-        {% set meta_pct = (meta_v / scale * 100) if (scale and meta_v) else 0 %}
-        <div class="vbar{% if ptot <= 0 %} is-empty{% endif %}"
-             data-name="{{ r.account_executive }}" data-leader="{{ r.leader or '' }}"
-             {% if ptot > 0 %}data-drill="{{ url_for('forecast_deals', name=r.account_executive, grain=grain, date_from=ctx.filters.date_from, date_to=ctx.filters.date_to, dtype=(ctx.filters.dtype or None)) }}"{% endif %}
-             data-gross="{{ r.gross|round|int }}" data-hold="{{ r.hold|round|int }}"
-             data-realized="{{ r.realized|round|int }}" data-meta="{{ meta_v }}"
-             {% for c in cats %}data-{{ c.key }}="{{ r['w_' ~ c.key]|round|int }}" {% endfor %}>
-          <div class="vbar-tip"></div>
-          <div class="vbar-track" style="--h:{{ h_pct }}%">
-            {% if meta_v > 0 %}
-            <div class="vbar-mark" style="--gp:{{ meta_pct }}%" data-ch="meta">
-              <span class="vbar-mark-label">{{ r.quota|brl }}</span>
-            </div>
-            {% endif %}
-            <div class="vbar-val">{{ r.projection|brl }}</div>
-            <div class="vbar-col">
-              {% set rv = r.realized|round|int %}
-              {% if rv > 0 %}<div class="vbar-seg" data-ch="realized" style="background:#065F46;flex:{{ rv }}"></div>{% endif %}
-              {% for c in cats %}
-                {% set cv = r['w_' ~ c.key]|round|int %}
-                {% if cv > 0 %}<div class="vbar-seg" data-ch="{{ c.key }}" style="background:{{ c.color }};flex:{{ cv }}"></div>{% endif %}
-              {% endfor %}
-            </div>
-          </div>
-          <div class="vbar-name">{{ r.account_executive }}</div>
-        </div>
-      {% endfor %}
-    </div>
-  </div>
+  {% from "_quota_chart.html" import quota_chart, quota_chart_assets %}
+  {{ quota_chart('qc-fc', qc_rows, qc_series,
+                 meta_label=('Meta' if grain == 'leader' else 'Quota'), drill_chips='cat',
+                 team=({'label': 'Time', 'quota': totals.quota, 'projection': totals.projection} if totals.quota else None)) }}
+  {{ quota_chart_assets() }}
 </div>
 
 {# ------- Composição por forecast category (pipeline aberto) ------- #}
@@ -191,7 +143,7 @@
           <th class="n">Ponderado</th>
           <th class="n grp">Realizado</th>
           <th class="n grp">Projeção</th>
-          {% if grain == 'leader' and meta_ok %}<th class="n">Meta<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">Comp. Target</span></th>
+          {% if meta_ok %}<th class="n">{% if grain == 'leader' %}Meta<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">Comp. Target</span>{% else %}Quota{% endif %}</th>
           <th class="n grp">% atingimento</th>{% endif %}
           <th class="n">On-hold<br><span style="font-weight:400;color:var(--muted-2);font-size:10px">MRR</span></th>
         </tr>
@@ -208,9 +160,9 @@
           <td class="n" style="color:#2563EB">{{ r.weighted|brl }}</td>
           <td class="n grp" style="color:#0F6E56">{% if r.realized %}{{ r.realized|brl }}{% else %}—{% endif %}</td>
           <td class="n grp"><b>{{ r.projection|brl }}</b></td>
-          {% if grain == 'leader' and meta_ok %}
+          {% if meta_ok %}
           <td class="n">{% if r.quota %}{{ r.quota|brl }}{% else %}—{% endif %}</td>
-          <td class="n grp"><b style="color:{{ '#0F6E56' if (r.attainment and r.attainment >= 1) else '#185FA5' }}">{% if r.attainment is not none %}{{ (r.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          <td class="n grp"><b style="color:{{ att_color(r.attainment) }}">{% if r.attainment is not none %}{{ (r.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
           {% endif %}
           <td class="n" style="color:#854F0B">{% if r.hold %}{{ r.hold|brl }}{% else %}—{% endif %}</td>
         </tr>
@@ -228,7 +180,7 @@
           <td class="n grp"><b>{{ totals.projection|brl }}</b></td>
           {% if meta_ok %}
           <td class="n"><b>{{ totals.quota|brl }}</b></td>
-          <td class="n grp"><b style="color:{{ '#0F6E56' if (totals.attainment and totals.attainment >= 1) else '#185FA5' }}">{% if totals.attainment is not none %}{{ (totals.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
+          <td class="n grp"><b style="color:{{ att_color(totals.attainment) }}">{% if totals.attainment is not none %}{{ (totals.attainment*100)|round|int }}%{% else %}—{% endif %}</b></td>
           {% endif %}
           <td class="n" style="color:#854F0B">{% if hold_ok %}<b>{{ totals.hold|brl }}</b>{% else %}—{% endif %}</td>
         </tr>
@@ -246,80 +198,5 @@
 
 {% include "_drilldown.html" %}
 
-<script>
-(function(){
-  "use strict";
-  // Delega no formatador global (base.html) — era uma cópia local da mesma
-  // lógica; duas cópias divergem no primeiro ajuste de formato.
-  const fmtBRL = (n) => window.fmtBRLCompact(n);
-  function refresh(chart){
-    const active = (chart.dataset.channels || '').split(' ').filter(Boolean);
-    // 'meta' é linha de referência, não segmento: fica fora da soma da pilha,
-    // mas ENTRA no max da escala (senão a tracejada de quem está abaixo da meta
-    // sairia pra fora da área plotada).
-    const metaOn = active.includes('meta');
-    const barCh = active.filter(ch => ch !== 'meta');
-    const cont = chart.querySelector('.vbars');
-    const rows = Array.from(cont.children).filter(c => c.classList.contains('vbar'));
-    const labelFor = ch => {
-      const b = chart.querySelector('.leg-toggle[data-ch="'+ch+'"]');
-      return b ? b.textContent.trim() : ch;
-    };
-    rows.forEach(r => { let t=0; barCh.forEach(ch => t += parseFloat(r.dataset[ch]||'0')); r._t = t; });
-    const metaMax = metaOn ? Math.max(0, ...rows.map(r => parseFloat(r.dataset.meta||'0'))) : 0;
-    const max = Math.max(1, metaMax, ...rows.map(r => r._t));
-    rows.sort((a,b) => b._t - a._t);
-    const frag = document.createDocumentFragment(); let vis = 0;
-    rows.forEach(r => {
-      frag.appendChild(r);
-      r.querySelector('.vbar-track').style.setProperty('--h', (r._t/max*100) + '%');
-      r.querySelectorAll('.vbar-seg').forEach(seg => {
-        const ch = seg.dataset.ch, v = parseFloat(r.dataset[ch]||'0');
-        if (active.includes(ch) && v > 0) { seg.style.display=''; seg.style.flex = String(v); }
-        else seg.style.display = 'none';
-      });
-      r.querySelector('.vbar-val').textContent = fmtBRL(r._t);
-      if (r._t > 0) { r.classList.remove('is-empty'); vis++; } else r.classList.add('is-empty');
-      // Tracejada da meta: reposiciona no max vigente e some com o toggle.
-      const meta = parseFloat(r.dataset.meta||'0');
-      const mark = r.querySelector('.vbar-mark');
-      if (mark) {
-        if (metaOn && meta > 0) {
-          mark.style.display = '';
-          mark.style.setProperty('--gp', (meta/max*100) + '%');
-        } else mark.style.display = 'none';
-      }
-      const tip = r.querySelector('.vbar-tip');
-      const parts = ['<b>'+r.dataset.name+'</b>'];
-        // No grain de líder o 'leader' É o próprio nome da barra — não repete a linha.
-      if (r.dataset.leader && r.dataset.leader !== r.dataset.name)
-        parts.push('<span style="opacity:.7">'+r.dataset.leader+'</span>');
-      barCh.forEach(ch => { const v = parseFloat(r.dataset[ch]||'0'); if (v>0) parts.push(labelFor(ch)+': '+fmtBRL(v)); });
-      parts.push('Projeção: <b>'+fmtBRL(r._t)+'</b> <span style="opacity:.6">amount</span>');
-      if (metaOn && meta > 0) {
-        const pace = r._t >= meta ? '✓ ' + fmtBRL(r._t - meta) + ' acima'
-                                  : '−' + fmtBRL(meta - r._t) + ' pra meta';
-        parts.push('Meta: <b>'+fmtBRL(meta)+'</b> · '
-                   + Math.round(r._t/meta*100) + '% · ' + pace);
-      }
-      const hold = parseFloat(r.dataset.hold||'0');
-      if (hold > 0) parts.push('On-hold (MRR): '+fmtBRL(hold));
-      tip.innerHTML = parts.join('<br>');
-    });
-    cont.appendChild(frag);
-    cont.style.setProperty('--count', Math.max(vis,1));
-  }
-  document.querySelectorAll('.fc-chart').forEach(chart => {
-    chart.querySelectorAll('.leg-toggle').forEach(btn => {
-      btn.addEventListener('click', () => {
-        btn.classList.toggle('is-on');
-        const active = Array.from(chart.querySelectorAll('.leg-toggle.is-on')).map(b => b.dataset.ch);
-        chart.dataset.channels = active.join(' ');
-        refresh(chart);
-      });
-    });
-    refresh(chart);
-  });
-})();
-</script>
+
 {% endblock %}

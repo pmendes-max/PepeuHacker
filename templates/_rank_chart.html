@@ -16,7 +16,7 @@
                     order_note='ordenado por % de atingimento (maior → menor) · clique no nome pra ver o detalhe',
                     goal_label='', toggle=false, single=false,
                     modal_endpoint='', modal_grain='', modal_bucket='', modal_kind='',
-                    modal_from='', modal_to='', show_line=true) %}
+                    modal_from='', modal_to='', show_line=true, sort_links=None) %}
 {% set _dd_extra = '&grain=' ~ modal_grain ~ '&bucket=' ~ modal_bucket ~ ('&kind=' ~ modal_kind if modal_kind else '') ~ ('&date_from=' ~ modal_from if modal_from else '') ~ ('&date_to=' ~ modal_to if modal_to else '') %}
 {% if rk and rk.rows %}
 {% set lt = ' leg-toggle is-on' if toggle else '' %}
@@ -24,7 +24,14 @@
   <div class="panel-head">
     {# Só emite o span quando há sub — senão o título fecha com um "·" órfão. #}
     <h2>{{ title }}{% if sub %} <span style="font-size:13px;font-weight:400;color:var(--muted)">· {{ sub }}</span>{% endif %}</h2>
+    {% if sort_links %}
+    {# Botão Receita | Atingimento (pedido do Pedro, 06/11/2026): troca a ordem
+       das barras. Link (não JS): a geometria do gráfico é montada no servidor. #}
+    <span class="rk-sort"><span>Ordenar por</span>
+      <a class="{{ 'is-on' if sort_links.sel == 'receita' }}" href="{{ sort_links.receita }}">Receita</a><a class="{{ 'is-on' if sort_links.sel != 'receita' }}" href="{{ sort_links.ating }}">Atingimento</a></span>
+    {% else %}
     <span class="ph" style="margin:0">{{ order_note }}</span>
+    {% endif %}
   </div>
   {# --c = cor da série, pro chip acender na própria cor (regra global
      .leg-toggle.is-on). Mesma cor do swatch/linha, nunca uma segunda escolha. #}
@@ -110,6 +117,16 @@
 
 {# Script de hover — chame UMA vez por página; itera todas as .rank-wrap. #}
 {% macro rank_chart_script() %}
+<style>
+  .rk-sort{display:inline-flex;align-items:center;gap:0;font-size:11.5px;font-weight:700;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.04em}
+  .rk-sort>span{margin-right:8px}
+  .rk-sort a{font-size:12.5px;font-weight:600;text-transform:none;letter-spacing:0;text-decoration:none;
+    border:1px solid var(--border);background:var(--surface);color:var(--fg);padding:5px 11px}
+  .rk-sort a:first-of-type{border-radius:8px 0 0 8px}
+  .rk-sort a:last-of-type{border-radius:0 8px 8px 0;border-left:0}
+  .rk-sort a.is-on{background:var(--blue,#2563EB);border-color:var(--blue,#2563EB);color:#fff}
+</style>
 <script>
 (function(){
   "use strict";

@@ -71,12 +71,16 @@
 </p>
 {% endif %}
 
-{% from "_rank_chart.html" import rank_chart, rank_chart_script %}
 {% set qlabel = 'Meta' if is_leader else 'Quota' %}
-{{ rank_chart(chart, 'Projeção do modelo · por ' ~ unit, sub='Done + Forecast × ' ~ qlabel ~ ' · % atingimento',
-              currency=true, legend_real='Done + Forecast', legend_quota=qlabel,
-              tip_real='Done+Forecast', tip_quota=qlabel, tip_line='Atingimento', toggle=true) }}
-{% if chart and chart.rows %}{{ rank_chart_script() }}{% endif %}
+{% from "_quota_chart.html" import quota_chart, quota_chart_assets %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Projeção do modelo · por {{ unit }} <span style="font-size:13px;font-weight:400;color:var(--muted)">· Done + Forecast × {{ qlabel }} · % atingimento</span></h2>
+  </div>
+  {{ quota_chart('qc-model', qc_rows, qc_series, meta_label=qlabel,
+                 team=({'label': 'Time', 'quota': totals.quota, 'projection': totals.projection} if totals.quota else None)) }}
+  {{ quota_chart_assets() }}
+</div>
 
 {# ---------- Detalhe por vendedor/líder ---------- #}
 <div class="panel">
@@ -111,7 +115,7 @@
           <td class="n" style="color:#2563EB">{% if r.forecast %}{{ r.forecast|brl }}{% else %}—{% endif %}</td>
           <td class="n grp"><b>{{ r.projection|brl }}</b></td>
           <td class="n">{% if r.quota %}{{ r.quota|brl }}{% else %}—{% endif %}</td>
-          <td class="n grp"><b style="color:{{ '#0F6E56' if (r.attainment and r.attainment >= 1) else '#185FA5' }}">{{ pct(r.attainment) }}</b></td>
+          <td class="n grp"><b style="color:{{ att_color(r.attainment) }}">{{ pct(r.attainment) }}</b></td>
           {% if is_leader %}
           {# Gap = meta − projeção: positivo = falta, negativo = acima. #}
           <td class="n" style="color:{{ '#0F6E56' if (r.gap is not none and r.gap <= 0) else '#185FA5' }}">
