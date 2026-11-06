@@ -5,8 +5,9 @@
 {% set adv_lbl = 'Movido p/ Late' if fifth_cat == 'late' else 'Foi para Won' %}
 <div class="panel">
   <div class="panel-head">
-    <h2>Movimento do pipe {{ focus|capitalize }}{{ ' do trimestre' if viradas is defined }}
-      <span class="h2-sub">· passe o mouse numa semana · clique pra ver os deals</span></h2>
+    <h2>Movimento do pipe {{ focus|capitalize }}
+      <span class="h2-sub">· {{ 'close date no trimestre vigente' if viradas is defined else 'pipe total, qualquer close date' }}
+        · passe o mouse numa semana · clique pra ver os deals</span></h2>
     <a class="hw-zoom {% if zero %}is-on{% endif %}" href="{{ chip_url(zero='' if zero else '1') }}"
        title="Liga/desliga o eixo do pipe a partir do zero">Eixo desde o zero</a>
   </div>
@@ -106,7 +107,8 @@
   <div class="hm-note">
     Saldo = novo + cresceu − encolheu − lost{% if viradas is defined %} + puxado pro trimestre − escorregou{% endif %}.
     {{ adv_lbl }} fica fora do saldo e aparece abaixo do zero, em azul: é saída boa, o funil andando.
-    {% if pl.p2 %}Cobertura = pipe do trimestre ÷ (meta do trimestre − realizado até o domingo); a linha corta na virada de trimestre.{% endif %}
+    {% if pl.p2 %}Cobertura = pipe do trimestre ÷ (meta do trimestre − realizado até o domingo); a linha corta na virada de trimestre.
+    {% elif viradas is not defined %}Sem cobertura aqui de propósito: este pipe inclui close dates de outros trimestres e não tem quota que case com ele. A cobertura está no <a href="{{ url_for('leaders_pipeline_wow_quarter' if grain == 'leader' else 'pipeline_wow_quarter', focus=focus) }}">PoP Histórico Q</a>.{% endif %}
   </div>
 </div>
 <style>
