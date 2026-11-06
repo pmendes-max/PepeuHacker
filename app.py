@@ -10526,6 +10526,190 @@ def _build_hist_stairs(col_rows, level0, drill_url, net_cats, fifth, viradas=Non
             "delta": delta, "delta_label": fmt_brl(abs(delta))}
 
 
+def _build_pop_line(col_rows, level0, drill_url, net_cats, fifth, cat_label,
+                    cov_rows=None, zero_base=False):
+    """Gráfico único do PoP Histórico (pedido do Pedro, 06/11/2026; substitui a
+    escada e as barras de movimento). Três faixas alinhadas no MESMO eixo X:
+
+      1. Pipe   linha do nível do pipe em cada domingo (o movimento);
+      2. Cobertura  linha da cobertura realizada (pipe ÷ quota remanescente),
+                só no PoP Histórico Q — sem a meta, a pedido;
+      3. Saldo e avanço  barra do saldo da semana (verde sobe / vermelho desce)
+                e, abaixo do zero, o que avançou (→ Late ou → Won) em azul.
+
+    Faixas separadas e não eixo duplo: R$ e Nx em escalas diferentes no mesmo
+    plano fazem o cruzamento das linhas parecer significativo sem ser. Uma
+    coluna invisível por semana atravessa as três faixas: tooltip e clique.
+
+    `cov_rows` vem indexado pela ponta (k=0 é a âncora); no modo mensal a
+    cobertura do mês é a do último domingo dele."""
+    monthly = bool(col_rows) and "weeks" in col_rows[0]
+    n = len(col_rows) + 1                       # âncora + colunas
+    _LEFT = _HIST_LEFT
+    _STEP = _hist_fit_step(n, max_step=96 if monthly else 64)
+    right_x = _LEFT + n * _STEP
+    has_cov = bool(cov_rows)
+    GAP = 34
+    P1_TOP, P1_H = 30, 210
+    P2_TOP = P1_TOP + P1_H + GAP
+    P2_H = 110 if has_cov else 0
+    P3_TOP = (P2_TOP + P2_H + GAP) if has_cov else P2_TOP
+    P3_H = 150
+    base3 = P3_TOP + P3_H
+    H = base3 + 40
+
+    def _cx(i):
+        return round(_LEFT + i * _STEP + _STEP / 2, 1)
+
+    # ---- Faixa 1: nível ----
+    levels = [level0] + [r["level"] for r in col_rows]
+    vmin, vmax = min(levels), max(levels)
+    if zero_base or vmax <= 0:
+        lo, hi = 0.0, max(vmax, 1000.0) * 1.08
+        st = _nice_money_step(hi, target=4)
+        hi = math.ceil(hi / st) * st
+    else:
+        pad = max((vmax - vmin) * 0.15, vmax * 0.02, 1000.0)
+        st = _nice_money_step(vmax - vmin + 2 * pad, target=4)
+        lo = max(0.0, math.floor((vmin - pad) / st) * st)
+        hi = math.ceil((vmax + pad) / st) * st
+    rng = (hi - lo) or 1.0
+
+    def _y1(v):
+        return round(P1_TOP + P1_H - (max(lo, min(hi, v)) - lo) / rng * P1_H, 1)
+
+    y1_ticks, t = [], lo
+    while t <= hi + st * 0.01:
+        y1_ticks.append({"label": fmt_brl(t), "y": _y1(t)})
+        t += st
+    lvl_pts = [(_cx(i), _y1(v)) for i, v in enumerate(levels)]
+    lvl_path = " ".join(f"{x},{y}" for x, y in lvl_pts)
+    lvl_area = (f"M{lvl_pts[0][0]},{P1_TOP + P1_H} "
+                + " ".join(f"L{x},{y}" for x, y in lvl_pts)
+                + f" L{lvl_pts[-1][0]},{P1_TOP + P1_H} Z")
+    i_max = max(range(n), key=lambda i: levels[i])
+    i_min = min(range(n), key=lambda i: levels[i])
+    lbl_idx = sorted({0, n - 1, i_max, i_min})
+    lvl_labels = [{"x": _cx(i), "y": _y1(levels[i]) - 10, "txt": fmt_brl(levels[i]),
+                   "anchor": "start" if i == 0 else ("end" if i == n - 1 else "middle")}
+                  for i in lbl_idx]
+
+    # ---- Faixa 2: cobertura ----
+    cov = None
+    if has_cov:
+        by_k = {r["k"]: r for r in cov_rows}
+        ks = [0] + [(max(r["weeks"]) if monthly else r["idx"]) for r in col_rows]
+        cpts = [by_k.get(k) for k in ks]
+        vals = sorted(c["cov"] for c in cpts if c and c["cov"] is not None)
+        ref = vals[min(len(vals) - 1, int(0.9 * len(vals)))] if vals else 1.0
+        raw_top = max(ref, 1.0) * 1.2
+        xstep = 1 if raw_top <= 6 else (2 if raw_top <= 12 else 5)
+        ctop = int(math.ceil(raw_top / xstep) * xstep)
+
+        def _y2(v):
+            return round(P2_TOP + P2_H - min(v, ctop) / ctop * P2_H, 1)
+
+        segs, cur, dots = [], [], []
+        for i, c in enumerate(cpts):
+            nova = (i > 0 and c and cpts[i - 1] and c["regua"] != cpts[i - 1]["regua"])
+            if not c or c["cov"] is None or nova:
+                if len(cur) > 1:
+                    segs.append(" ".join(cur))
+                cur = []
+            if c and c["cov"] is not None:
+                y = _y2(c["cov"])
+                cur.append(f"{_cx(i)},{y}")
+                dots.append({"x": _cx(i), "y": y, "clamped": c["cov"] > ctop})
+        if len(cur) > 1:
+            segs.append(" ".join(cur))
+        last = next((i for i in range(n - 1, -1, -1) if cpts[i] and cpts[i]["cov"] is not None), None)
+        cov = {"ticks": [{"label": _fmt_mult(v), "y": _y2(v)} for v in range(0, ctop + 1, xstep)],
+               "segs": segs, "dots": dots, "pts": cpts,
+               "last": ({"x": _cx(last), "y": _y2(cpts[last]["cov"]) - 10,
+                         "txt": cpts[last]["cov_txt"]} if last is not None else None)}
+
+    # ---- Faixa 3: saldo (acima/abaixo do zero) e avanço (abaixo do zero) ----
+    nets = [r["net"] for r in col_rows]
+    advs = [abs(r["fifth"]) for r in col_rows]
+    up = max([v for v in nets if v > 0] + [1.0])
+    dn = max([-v for v in nets if v < 0] + advs + [1.0])
+    tot = up + dn
+    z3 = round(P3_TOP + up / tot * P3_H, 1)
+    k3 = P3_H / tot
+    bw = round(max(3.0, min(_STEP * 0.32, 18)), 1)
+
+    tiny = _STEP < 34
+    cols = []
+    for j, r in enumerate(col_rows):
+        i = j + 1
+        cx = _cx(i)
+        prev = levels[j]
+        hn = abs(r["net"]) * k3
+        ha = abs(r["fifth"]) * k3
+        if monthly:
+            xl = r["label"]
+        elif not tiny:
+            xl = r["sunday"].strftime("%d/%m") + ("*" if str(r["label"]).endswith("*") else "")
+        else:
+            d = r["sunday"]
+            pd_ = col_rows[j - 1]["sunday"] if j else None
+            xl = (f"{_MES_ABR[d.month - 1]}/{d.year % 100:02d}"
+                  if (pd_ is None or pd_.month != d.month) else "")
+        adv = abs(r["fifth"])
+        taxa = (adv / prev) if prev > 0 else None
+        tip = [{"k": (f"{r['from_label']} → {r.get('to_label', r['label'])}" if monthly
+                      else f"Semana {r['from_label']} → {r['label']}"), "v": "", "h": True},
+               {"k": "Pipe no fim", "v": fmt_brl(r["level"])},
+               {"k": "Variação do pipe", "v": ("+" if r["level"] >= prev else "−")
+                + fmt_brl(abs(r["level"] - prev))},
+               {"k": "Saldo", "v": ("+" if r["net"] >= 0 else "−") + fmt_brl(abs(r["net"])),
+                "c": "pos" if r["net"] >= 0 else "neg"}]
+        for c in net_cats:
+            if abs(r[c]) >= 1:
+                tip.append({"k": "  " + cat_label.get(c, c),
+                            "v": ("+" if r[c] >= 0 else "−") + fmt_brl(abs(r[c]))
+                            + f" · {r['deals_' + c]} deals", "sub": True})
+        tip.append({"k": ("Movido p/ Late" if fifth == "late" else "Foi para Won"),
+                    "v": fmt_brl(adv) + f" · {r['deals_fifth']} deals"
+                    + (f" · {taxa * 100:.1f}% do pipe".replace(".", ",") if taxa else ""),
+                    "c": "adv"})
+        if cov and cov["pts"][i]:
+            c = cov["pts"][i]
+            tip.append({"k": "Cobertura", "v": c["cov_txt"]
+                        + (f" · pipe {fmt_brl(c['pipe'])} ÷ rem. {fmt_brl(c['rem'])}"
+                           if c["tem_meta"] and c["rem"] else "")})
+        cols.append({
+            "cx": cx, "zx": round(_LEFT + i * _STEP, 1), "xl": xl,
+            "net_x": round(cx - bw - 1, 1), "adv_x": round(cx + 1, 1),
+            "net_y": round(z3 - hn if r["net"] >= 0 else z3, 1), "net_h": round(max(hn, 1.0), 1),
+            "pos": r["net"] >= 0, "adv_y": z3, "adv_h": round(max(ha, 1.0 if adv else 0), 1),
+            "tip": tip, "url": drill_url(r["idx"], ",".join(net_cats)),
+            "url_adv": drill_url(r["idx"], fifth),
+        })
+
+    q_breaks = []
+    for j in range(1, len(col_rows)):
+        d0, d1 = col_rows[j - 1]["sunday"], col_rows[j]["sunday"]
+        if _quarter_start_of(d0) != _quarter_start_of(d1):
+            q_breaks.append({"x": round(_LEFT + (j + 1) * _STEP, 1),
+                             "label": _quarter_label(_quarter_start_of(d1))})
+    return {
+        "w": round(right_x + 56, 1), "h": H, "left": _LEFT, "right_x": round(right_x, 1),
+        "step": round(_STEP, 2), "bw": bw,
+        "p1": {"top": P1_TOP, "base": P1_TOP + P1_H, "ticks": y1_ticks, "path": lvl_path,
+               "area": lvl_area, "labels": lvl_labels,
+               "dots": [{"x": x, "y": y} for x, y in lvl_pts]},
+        "p2": ({"top": P2_TOP, "base": P2_TOP + P2_H, **cov} if cov else None),
+        "p3": {"top": P3_TOP, "base": base3, "zero": z3,
+               "ticks": [{"label": "+" + fmt_brl(up), "y": P3_TOP},
+                         {"label": "0", "y": z3},
+                         {"label": "−" + fmt_brl(dn), "y": base3}]},
+        "anchor": {"cx": _cx(0), "label": "início"},
+        "cols": cols, "q_breaks": q_breaks, "zero_base": zero_base or lo == 0,
+        "delta": levels[-1] - level0,
+    }
+
+
 def _build_hist_spark(people, weeks):
     """Mini-gráficos por pessoa, todos na MESMA escala Y — é a escala comum que
     torna a comparação honesta: normalizar cada um pelo próprio máximo faria a
