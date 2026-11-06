@@ -1,0 +1,171 @@
+{# Progresso e Regresso (pedido do Pedro, 06/11/2026) — compartilhado pelo
+   Pipeline DoD/WoW e pelo Forecast DoD/WoW. Dados de `_pr_build` (app.py).
+   Duas visões (barra divergente | composição 100% + só o que se mexeu) e duas
+   medidas (Deals | Receita), todas renderizadas; os botões só trocam atributos
+   do contêiner `.pr-panel` e o CSS mostra o par escolhido. O contêiner
+   (`<div class="panel pr-panel" data-view="div" data-unit="v">`) e o título
+   ficam com quem chama. -#}
+{% macro pr_controls() %}
+    <div class="pr-ctrls">
+      <span class="pr-cl">Visão</span>
+      <div class="dst-unit" role="group" aria-label="Visão">
+        <button type="button" class="dst-u active" data-set-view="div">Progresso × Regresso</button>
+        <button type="button" class="dst-u" data-set-view="bar">Composição 100%</button>
+      </div>
+      <span class="pr-cl">Medir por</span>
+      <div class="dst-unit" role="group" aria-label="Medida">
+        <button type="button" class="dst-u" data-set-unit="n">Deals</button>
+        <button type="button" class="dst-u active" data-set-unit="v">Receita</button>
+      </div>
+    </div>
+{% endmacro %}
+
+{% macro pr_body(rows, drill, ficou_label='Ficou', unit_of='da linha') %}
+  <div class="legend" style="margin:4px 0 10px">
+    {% set _d0 = rows[0].pr.v %}
+    {% for i in _d0.reg + _d0.prog %}<span class="leg-item"><i class="leg-sq" style="background:{{ i.color }}"></i>{{ i.label }}</span>
+    {% endfor %}<span class="leg-item pr-only-bar"><i class="leg-sq pr-hatch"></i>{{ ficou_label }}</span>
+  </div>
+
+  <div class="pr-wrap">
+    <div class="pr-grid">
+      <div></div><div></div>
+      <div class="pr-dirs pr-only-div"><span class="is-neg">◀ Regresso</span><span class="is-pos">Progresso ▶</span></div>
+      <div class="pr-dirs pr-only-bar"><span>% de cada destino</span><span>só o que se mexeu</span></div>
+      {% for b in rows %}
+        <div class="pr-st" data-drill="{{ drill(de=b.key) }}" title="Ver os {{ b.n }} deals que estavam em {{ b.label }}">
+          <b>{{ b.pr_title }}</b>
+          <small>{{ b.n }} deals · {{ b.total|brl }}</small>
+        </div>
+        {% for u in ['n', 'v'] %}
+          {% set d = b.pr[u] %}
+          <div class="pr-fic pr-u-{{ u }}">{% if b.n %}ficou {{ '%.0f'|format(d.ficou * 100) if d.ficou >= 0.1 else ('%.1f'|format(d.ficou * 100))|replace('.', ',') }}%{% endif %}</div>
+          {# ---- Progresso × Regresso (divergente) ---- #}
+          <div class="pr-track pr-only-div pr-u-{{ u }}">
+            {% if b.n %}
+            <div class="pr-side is-reg" style="width:{{ d.bw }}%">
+              {% for i in d.reg if i.share > 0 %}
+                <span class="pr-sg" style="width:{{ i.w }}%;background:{{ i.color }}" data-drill="{{ drill(de=b.key, mv=i.key) }}"
+                      data-tip="{{ b.label }} → {{ i.label }}|{{ i.n }} deal{{ 's' if i.n != 1 else '' }} · {{ i.v|brl }}"></span>
+              {% endfor %}
+            </div>
+            <div class="pr-side is-prog" style="width:{{ d.gw }}%">
+              {% for i in d.prog if i.share > 0 %}
+                <span class="pr-sg" style="width:{{ i.w }}%;background:{{ i.color }}" data-drill="{{ drill(de=b.key, mv=i.key) }}"
+                      data-tip="{{ b.label }} → {{ i.label }}|{{ i.n }} deal{{ 's' if i.n != 1 else '' }} · {{ i.v|brl }}"></span>
+              {% endfor %}
+            </div>
+            {% if d.b > 0 %}<span class="pr-pct is-neg" style="right:calc({{ 50 + d.bw }}% + 8px)">{{ '%.0f'|format(d.b * 100) if d.b >= 0.1 else ('%.1f'|format(d.b * 100))|replace('.', ',') }}%</span>{% endif %}
+            {% if d.g > 0 %}<span class="pr-pct is-pos" style="left:calc({{ 50 + d.gw }}% + 8px)">{{ '%.0f'|format(d.g * 100) if d.g >= 0.1 else ('%.1f'|format(d.g * 100))|replace('.', ',') }}%</span>{% endif %}
+            {% endif %}
+          </div>
+          {# ---- Composição 100% + só o que se mexeu ---- #}
+          <div class="pr-comp pr-only-bar pr-u-{{ u }}">
+            {% if b.n %}
+            <div class="pr-bar">
+              {% for i in d.reg if i.share > 0 %}
+                <span class="pr-sg" style="width:{{ (i.share * 100)|round(3) }}%;background:{{ i.color }}" data-drill="{{ drill(de=b.key, mv=i.key) }}"
+                      data-tip="{{ b.label }} → {{ i.label }}|{{ i.n }} deal{{ 's' if i.n != 1 else '' }} · {{ i.v|brl }}">{% if i.share >= 0.07 %}{{ (i.share * 100)|round|int }}%{% endif %}</span>
+              {% endfor %}
+              <span class="pr-sg pr-hatch" style="width:{{ (d.ficou * 100)|round(3) }}%" data-drill="{{ drill(de=b.key, mv=b.pr.ficou_key) }}"
+                    data-tip="{{ b.label }} → {{ ficou_label }}|{{ '%.0f'|format(d.ficou * 100) }}% {{ unit_of }}">{% if d.ficou >= 0.15 %}Ficou {{ (d.ficou * 100)|round|int }}%{% endif %}</span>
+              {% for i in d.prog if i.share > 0 %}
+                <span class="pr-sg" style="width:{{ (i.share * 100)|round(3) }}%;background:{{ i.color }}" data-drill="{{ drill(de=b.key, mv=i.key) }}"
+                      data-tip="{{ b.label }} → {{ i.label }}|{{ i.n }} deal{{ 's' if i.n != 1 else '' }} · {{ i.v|brl }}">{% if i.share >= 0.07 %}{{ (i.share * 100)|round|int }}%{% endif %}</span>
+              {% endfor %}
+            </div>
+            <div class="pr-zoom">
+              {% for i in d.mexeu %}
+                <span class="pr-sg" style="width:{{ i.wm }}%;background:{{ i.color }}" data-drill="{{ drill(de=b.key, mv=i.key) }}"
+                      data-tip="{{ b.label }} → {{ i.label }}|{{ i.n }} deal{{ 's' if i.n != 1 else '' }} · {{ i.v|brl }}">{% if i.wm >= 9 %}{{ i.n if u == 'n' else i.v|brl }}{% endif %}</span>
+              {% else %}<small class="dst-sub">nada se mexeu</small>{% endfor %}
+            </div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      {% endfor %}
+    </div>
+    <div class="pr-tip" hidden></div>
+  </div>
+{% endmacro %}
+
+{% macro pr_assets() %}
+<style>
+  /* ---- Progresso e Regresso ---- */
+  .pr-panel .is-neg{color:#B91C1C}
+  .pr-panel .is-pos{color:#15803D}
+  .pr-head{flex-wrap:wrap;gap:10px}
+  .pr-ctrls{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+  .pr-cl{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.05em;text-transform:uppercase}
+  .pr-wrap{position:relative;overflow-x:auto}
+  .pr-grid{display:grid;grid-template-columns:minmax(150px,190px) 78px minmax(460px,1fr);
+    align-items:center;column-gap:10px}
+  .pr-dirs{display:flex;justify-content:space-between;font-size:11px;font-weight:800;
+    letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding-bottom:6px}
+  .pr-st{padding:9px 0;border-top:1px solid var(--border-soft);cursor:pointer}
+  .pr-st:hover b{text-decoration:underline}
+  .pr-st b{display:block;font-size:13px}
+  .pr-st small{font-size:11.5px;color:var(--muted)}
+  .pr-fic{font-size:12px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums;
+    border-top:1px solid var(--border-soft);align-self:stretch;display:flex;align-items:center}
+  .pr-track,.pr-comp{border-top:1px solid var(--border-soft);align-self:stretch;min-height:46px}
+  .pr-track{position:relative}
+  .pr-track::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1.5px;background:var(--fg);opacity:.8}
+  .pr-side{position:absolute;top:11px;height:24px;display:flex}
+  .pr-side.is-reg{right:50%;flex-direction:row-reverse}
+  .pr-side.is-prog{left:50%}
+  .pr-side.is-reg .pr-sg:last-child{border-radius:4px 0 0 4px}
+  .pr-side.is-prog .pr-sg:last-child{border-radius:0 4px 4px 0}
+  .pr-pct{position:absolute;top:14px;font-size:12px;font-weight:800;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .pr-sg{display:flex;align-items:center;justify-content:center;height:100%;min-width:2px;cursor:pointer;
+    font-size:10.5px;font-weight:700;color:#fff;overflow:hidden;white-space:nowrap}
+  .pr-sg:hover{filter:brightness(1.12)}
+  .pr-comp{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,1.4fr);gap:14px;align-items:center;padding:9px 0}
+  .pr-bar,.pr-zoom{display:flex;height:24px;border-radius:5px;overflow:hidden}
+  .pr-zoom{height:20px}
+  .pr-hatch{background:repeating-linear-gradient(45deg,#E2E8F0,#E2E8F0 4px,#F1F5F9 4px,#F1F5F9 8px)!important;color:#334155!important}
+  /* troca de visão e de medida: tudo vem renderizado, o CSS mostra um par */
+  .pr-panel[data-view="div"] .pr-only-bar,.pr-panel[data-view="bar"] .pr-only-div{display:none}
+  .pr-panel[data-unit="n"] .pr-u-v,.pr-panel[data-unit="v"] .pr-u-n{display:none}
+  .pr-tip{position:absolute;z-index:5;pointer-events:none;background:#0F172A;color:#F8FAFC;
+    border-radius:8px;padding:7px 10px;font-size:12px;line-height:1.45;white-space:nowrap;box-shadow:0 8px 20px rgba(15,23,42,.2)}
+  .pr-tip b{display:block}
+  .pr-det{margin-top:14px}
+  .pr-det summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--blue,#2563EB)}
+  .pr-det[open] summary{margin-bottom:10px}
+</style>
+<script>
+/* Progresso e Regresso: botões de visão e de medida (só trocam atributos; o
+   CSS mostra o par escolhido) e tooltip das barras. */
+(function(){
+  "use strict";
+  function init(){
+    var panel = document.querySelector('.pr-panel');
+    if (!panel || panel.dataset.wired) return;
+    panel.dataset.wired = '1';
+    panel.querySelectorAll('[data-set-view],[data-set-unit]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var k = btn.dataset.setView ? 'view' : 'unit';
+        panel.dataset[k] = btn.dataset.setView || btn.dataset.setUnit;
+        btn.parentNode.querySelectorAll('.dst-u').forEach(function(b){ b.classList.toggle('active', b === btn); });
+      });
+    });
+    var wrap = panel.querySelector('.pr-wrap'), tip = panel.querySelector('.pr-tip');
+    function esc(t){ return String(t).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+    wrap.addEventListener('mousemove', function(ev){
+      var el = ev.target.closest('[data-tip]');
+      if (!el){ tip.hidden = true; return; }
+      var p = el.dataset.tip.split('|');
+      tip.innerHTML = '<b>' + esc(p[0]) + '</b>' + esc(p[1] || '');
+      tip.hidden = false;
+      var r = wrap.getBoundingClientRect();
+      var x = ev.clientX - r.left + wrap.scrollLeft + 14, y = ev.clientY - r.top + 14;
+      if (x + tip.offsetWidth > wrap.scrollLeft + wrap.clientWidth - 4) x -= tip.offsetWidth + 28;
+      tip.style.left = x + 'px'; tip.style.top = y + 'px';
+    });
+    wrap.addEventListener('mouseleave', function(){ tip.hidden = true; });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>
+{% endmacro %}

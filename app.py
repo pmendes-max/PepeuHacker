@@ -13384,6 +13384,13 @@ _FCW_DEST_RESUMO = ("subiu", "won", "ficou", "piorou")
 _FCW_DEST_LABEL = {"repreco": "Ficou na faixa"}
 
 
+# Rótulos e cores dos destinos no Progresso e Regresso do Forecast — as mesmas
+# cores do Pipeline DoD (Won azul, Lost vermelho, voltar/descer rosa).
+_FCW_PR_META = {"subiu": ("Subiu de faixa", "#10B981"), "ganho": ("Won", "#2563EB"),
+                "desceu": ("Desceu de faixa", "#EC4899"), "perdido": ("Lost", "#DC2626"),
+                "saiu": ("Saiu do forecast", "#94A3B8")}
+
+
 def _fcw_destino(w) -> dict:
     """Destino do volume de CADA faixa: das cinco faixas do parâmetro, quanto
     ficou, quanto evoluiu, quanto piorou e por qual caminho.
@@ -13443,6 +13450,12 @@ def _fcw_destino(w) -> dict:
             # aconteceu", e num trimestre é justamente onde o valor escorrega.
             "repreco_dp": float((fic["v_curr"] - fic["v_prev"]).sum()),
         })
+    # Progresso e Regresso (mesma barra do Pipeline DoD): subir de faixa e virar
+    # Won é progresso; descer, Lost e sair do forecast é regresso.
+    _pr_build(bands, ("subiu", "ganho"), ("desceu", "perdido", "saiu"), "repreco",
+              _FCW_PR_META)
+    for bd in bands:
+        bd["pr_title"] = f"{bd['label']} · {bd['hint']}"
     # Quem veio de FORA do forecast do trimestre. Medido AGORA (v_curr): estes
     # deals não têm valor anterior — mesma regra da linha `out` da matriz.
     #
@@ -13647,13 +13660,16 @@ def _render_forecast_wow(grain="ae"):
     )
 
 
-@app.route("/forecast/wow")
-def forecast_wow():
+# A tela antiga do WoW (migração entre faixas, matriz, pessoas, BI de domingo)
+# saiu do menu em 06/11/2026 — o WoW agora é o do DoD (`_fcd_page`). Continua
+# aqui, num endereço próprio, pra quem tiver o link ou quiser a matriz.
+@app.route("/forecast/wow/faixas")
+def forecast_wow_faixas():
     return _render_forecast_wow("ae")
 
 
-@app.route("/leaders/forecast/wow")
-def leaders_forecast_wow():
+@app.route("/leaders/forecast/wow/faixas")
+def leaders_forecast_wow_faixas():
     return _render_forecast_wow("leader")
 
 
@@ -13953,43 +13969,87 @@ def _fcd_side_txt(sd) -> str:
             f"(sem foto própria da meia-noite)")
 
 
+# Textos que mudam entre o Forecast DoD e o Forecast WoW (pedido do Pedro,
+# 06/11/2026: o WoW com as MESMAS premissas do DoD — foto da meia-noite, cópia
+# do BI só quando ela falta — comparando domingo a domingo, ou seja, as
+# meias-noites de segunda, como o Pipeline WoW).
+_FCD_MODOS = {
+    "dod": {"titulo": "Forecast DoD", "sigla": "Day over day: o dia", "inteiro": "inteiro",
+            "chip": "dia", "pares": _fcd_pairs, "depois": "dia depois",
+            "drill": "leaders_forecast_dod_deals", "mov": "Movimento do dia",
+            "sem_par_h": "Sem par de dias comparável",
+            "sem_par_p": "A tela compara a foto da meia-noite de um dia com a do dia "
+                         "anterior, e ainda não há duas pontas consecutivas nos últimos dias."},
+    "wow": {"titulo": "Forecast WoW", "sigla": "Week over week: a semana", "inteiro": "inteira",
+            "chip": "semana", "pares": lambda **k: _ppw_pairs(**k), "depois": "semana depois",
+            "drill": "forecast_semana_deals", "mov": "Movimento da semana",
+            "sem_par_h": "Sem par de semanas comparável",
+            "sem_par_p": "A tela compara a foto da meia-noite de domingo para segunda "
+                         "com a da semana anterior, e ainda não há duas pontas assim "
+                         "nas últimas semanas."},
+}
+
+
 @app.route("/leaders/forecast/dod")
 def leaders_forecast_dod():
     """DoD do Forecast: o Destino de cada faixa entre a meia-noite de um dia e a
     do anterior. Só no Leaders, de propósito — é leitura de gestão do dia."""
-    grain = "leader"
+    return _fcd_page("dod", "leader")
+
+
+@app.route("/leaders/forecast/wow")
+def leaders_forecast_wow():
+    """WoW do Forecast com as premissas do DoD: domingo a domingo."""
+    return _fcd_page("wow", "leader")
+
+
+@app.route("/forecast/wow")
+def forecast_wow():
+    return _fcd_page("wow", "ae")
+
+
+def _fcd_page(modo, grain):
+    L = _FCD_MODOS[modo]
     ctx = base_context()
     f = ctx["filters"]
     force = request.args.get("refresh") == "1"
     q0, q1 = _fc_hist_quarter(f)
-    pares, curr, prev = _fcd_pairs(force=force)
+    pares, curr, prev = L["pares"](force=force)
     w = _fcd_frame(q0, q1, curr, prev, f, force=force)
 
     def _lbl(sd):
         return f"00h de {_fmt_date_short(sd['dia'])}" if sd else "—"
 
     def _drill(**kw):
-        return url_for("leaders_forecast_dod_deals", grain=grain,
-                       dia=(curr["key"] if curr else None),
+        return url_for(L["drill"], grain=grain,
+                       **{L["chip"]: (curr["key"] if curr else None)},
                        date_from=f.get("date_from"), date_to=f.get("date_to"),
                        dtype=f.get("dtype") or None,
                        leader=(f.get("leader") if not kw.get("name") else None),
                        region=(f.get("region") if not kw.get("name") else None),
-                       **kw)
+                       ae=(f.get("ae") or None), **kw)
 
     def _chip_url(**kw):
         args = {k: v for k, v in request.args.items() if k not in kw and v}
         return request.path + "?" + urllib.parse.urlencode({**args, **kw})
 
+    def _chip_lbl(c, p):
+        return (_fmt_date_curta(p["dia"]) if modo == "dod" else _ppw_semana_txt(p, c))
+
+    if not prev:
+        periodo = "—"
+    elif modo == "dod":
+        periodo = _fmt_date_short(prev["dia"])
+    else:
+        periodo = f"{_ppw_semana_txt(prev, curr)} {curr['dia'].year}"
+
     return render_template(
-        "forecast_dod.html", ctx=ctx, grain=grain,
+        "forecast_dod.html", ctx=ctx, grain=grain, L=L,
         q_label=_fc_hist_label(q0, q1),
         q_range=f"{q0.strftime('%d/%m/%Y')} → {q1.strftime('%d/%m/%Y')}",
         curr_label=_lbl(curr), prev_label=_lbl(prev),
-        # O dia que o par MEDE é o da ponta anterior: 00h de 22 → 00h de 23 é o
-        # dia 22 inteiro. O chip mostra esse dia, que é o que a pessoa procura.
-        dia_medido=(_fmt_date_short(prev["dia"]) if prev else "—"),
-        pares=[{"key": c["key"], "label": _fmt_date_curta(p["dia"]),
+        dia_medido=periodo,
+        pares=[{"key": c["key"], "label": _chip_lbl(c, p),
                 "aprox": "bi" in (c["fonte"], p["fonte"]),
                 "title": f"{_lbl(p)} → {_lbl(c)}"} for c, p in pares],
         dia_sel=(curr["key"] if curr else ""),
@@ -14000,6 +14060,20 @@ def leaders_forecast_dod():
         destino=(_fcw_destino(w) if len(w) else None),
         drill=_drill, chip_url=_chip_url,
     )
+
+
+@app.route("/forecast/semana/deals")
+def forecast_semana_deals():
+    """Drill do Forecast WoW (premissas do DoD, pontas nas segundas 00h)."""
+    f = get_filters()
+    q0, q1 = _fc_hist_quarter(f)
+    pares, curr, prev = _ppw_pairs()
+    name = (request.args.get("name") or "").strip()
+    if not pares:
+        return jsonify(_empty_drill(name))
+    grain = "leader" if request.args.get("grain") == "leader" else "ae"
+    w = _fcd_frame(q0, q1, curr, prev, f)
+    return _fcw_drill_json(w, name, grain, prev["dia"], curr["dia"], "Movimento da semana")
 
 
 @app.route("/leaders/forecast/dod/deals")
@@ -14217,6 +14291,49 @@ def _ppd_frame(curr, prev, f, force=False) -> pd.DataFrame:
     return w.reset_index().rename(columns={"index": "deal_id"})
 
 
+def _pr_build(rows, prog, reg, ficou_key, meta):
+    """Progresso e Regresso (pedido do Pedro, 06/11/2026), compartilhado pelo
+    Pipeline DoD/WoW e pelo Forecast DoD/WoW (`_pr_panel.html`).
+
+    Cada linha (estágio ou faixa) traz `segs` (key, v, n), `n` e `total`. Por
+    medida — `n` (deals) e `v` (receita) — calcula a parte que progrediu, a que
+    regrediu e a que ficou, a largura de cada pedaço na barra divergente (escala
+    comum: o maior lado de qualquer linha) e a barra de "só o que se mexeu".
+    `meta` = {key: (rótulo, cor)} dos destinos."""
+    mx = {"n": 0.0, "v": 0.0}
+    for r in rows:
+        by = {sg["key"]: sg for sg in r["segs"]}
+        pr = {}
+        for u, tot in (("n", float(r["n"])), ("v", float(r["total"]))):
+            def _it(k):
+                sg = by.get(k)
+                x = float(sg[u]) if sg else 0.0
+                return {"key": k, "label": meta[k][0], "color": meta[k][1],
+                        "share": (x / tot) if tot else 0.0,
+                        "n": sg["n"] if sg else 0, "v": sg["v"] if sg else 0.0}
+            pg, rg = [_it(k) for k in prog], [_it(k) for k in reg]
+            g, b = sum(i["share"] for i in pg), sum(i["share"] for i in rg)
+            mx[u] = max(mx[u], g, b)
+            pr[u] = {"prog": pg, "reg": rg, "g": g, "b": b,
+                     "ficou": max(0.0, 1.0 - g - b) if tot else 0.0,
+                     "mexeu": [i for i in rg + pg if i["share"] > 0]}
+        pr["ficou_key"] = ficou_key
+        r["pr"] = pr
+    for u in mx:
+        mx[u] = (mx[u] * 1.2) or 1.0
+    for r in rows:
+        for u in ("n", "v"):
+            d = r["pr"][u]
+            d["gw"] = round(d["g"] / mx[u] * 50, 2)       # % da largura da trilha
+            d["bw"] = round(d["b"] / mx[u] * 50, 2)
+            for lado, w in (("prog", d["g"]), ("reg", d["b"])):
+                for i in d[lado]:
+                    i["w"] = round(i["share"] / w * 100, 2) if w else 0.0
+            m = sum(i["share"] for i in d["mexeu"])
+            for i in d["mexeu"]:
+                i["wm"] = round(i["share"] / m * 100, 2) if m else 0.0
+
+
 def _ppd_destino(w) -> dict:
     """A tela inteira a partir do frame: uma barra por estágio (medida no valor
     da VÉSPERA, então soma exatamente o pipe que o estágio tinha), o bloco de
@@ -14285,45 +14402,10 @@ def _ppd_destino(w) -> dict:
         "repreco": float((both["v_curr"] - both["v_prev"]).sum()),
         "avancou": _m(("avancou", "pulou")), "voltou": _m(("voltou",)),
     }
-    # ---- Progresso e Regresso (pedido do Pedro, 06/11/2026) ----
-    # Por estágio, em DEALS e em RECEITA: a parte que progrediu (avançou, pulou,
-    # won), a que regrediu (voltou, lost, saiu) e a que ficou. `mx_*` é a escala
-    # comum da barra divergente: o maior lado de qualquer estágio.
-    _prog, _reg = ("avancou", "pulou", "won"), ("voltou", "lost", "saiu")
-    mx = {"n": 0.0, "v": 0.0}
+    _pr_build(rows, ("avancou", "pulou", "won"), ("voltou", "lost", "saiu"), "ficou",
+              {k: (_PPD_MV_META[k]["label"], _PPD_MV_META[k]["color"]) for k in _PPD_MV_META})
     for r in rows:
-        by = {sg["key"]: sg for sg in r["segs"]}
-        pr = {}
-        for u, tot in (("n", float(r["n"])), ("v", r["total"])):
-            def _it(k):
-                sg = by.get(k)
-                x = float(sg[u]) if sg else 0.0
-                return {"key": k, "label": _PPD_MV_META[k]["label"],
-                        "color": _PPD_MV_META[k]["color"],
-                        "share": (x / tot) if tot else 0.0,
-                        "n": sg["n"] if sg else 0, "v": sg["v"] if sg else 0.0}
-            prog = [_it(k) for k in _prog]
-            reg = [_it(k) for k in _reg]
-            g = sum(i["share"] for i in prog)
-            b = sum(i["share"] for i in reg)
-            mx[u] = max(mx[u], g, b)
-            pr[u] = {"prog": prog, "reg": reg, "g": g, "b": b,
-                     "ficou": max(0.0, 1.0 - g - b) if tot else 0.0,
-                     "mexeu": [i for i in reg + prog if i["share"] > 0]}
-        r["pr"] = pr
-    for u in mx:
-        mx[u] = (mx[u] * 1.2) or 1.0
-    for r in rows:
-        for u in ("n", "v"):
-            d = r["pr"][u]
-            d["gw"] = round(d["g"] / mx[u] * 50, 2)       # % da largura da trilha
-            d["bw"] = round(d["b"] / mx[u] * 50, 2)
-            for lado, w in (("prog", d["g"]), ("reg", d["b"])):
-                for i in d[lado]:
-                    i["w"] = round(i["share"] / w * 100, 2) if w else 0.0
-            m = sum(i["share"] for i in d["mexeu"])
-            for i in d["mexeu"]:
-                i["wm"] = round(i["share"] / m * 100, 2) if m else 0.0
+        r["pr_title"] = f"{r['num']}. {r['label']}"
     return {"rows": rows, "span": span or 1.0, "ponte": ponte,
             "entrou": {"segs": ent_segs,
                        "span": max([x["v"] for x in ent_segs], default=0) or 1.0},
@@ -16338,7 +16420,7 @@ _MX_ESPELHO = [
     ("/mx/overview/funnel-stages/deals","mx_overview_funnel_stage_deals","overview_funnel_stage_deals"),
     ("/mx/forecast/model",            "mx_forecast_model",       "forecast_model"),
     ("/mx/forecast/model/deals",      "mx_forecast_model_deals", "forecast_model_deals"),
-    ("/mx/forecast/wow",              "mx_forecast_wow",         "forecast_wow"),
+    ("/mx/forecast/wow",              "mx_forecast_wow",         "forecast_wow_faixas"),
     ("/mx/forecast/wow/deals",        "mx_forecast_wow_deals",   "forecast_wow_deals"),
     ("/mx/forecast/dod",              "mx_forecast_dod",         "leaders_forecast_dod"),
     ("/mx/forecast/dod/deals",        "mx_forecast_dod_deals",   "leaders_forecast_dod_deals"),

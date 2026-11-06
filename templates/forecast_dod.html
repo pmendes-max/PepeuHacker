@@ -1,12 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Forecast DoD · pepeuhacker{% endblock %}
+{% block title %}{{ L.titulo }} · pepeuhacker{% endblock %}
 
 {% macro sgn(v) %}{{ '+' if v >= 0 else '−' }}{{ (v if v >= 0 else -v)|brl }}{% endmacro %}
 
 {% block content %}
-<h1>Forecast DoD · {{ q_label }}</h1>
+{% from "_pr_panel.html" import pr_controls, pr_body, pr_assets %}
+<h1>{{ L.titulo }} · {{ q_label }}</h1>
 <p class="page-sub">
-  Day over day: o dia <b>{{ dia_medido }}</b> inteiro — <b>{{ prev_label }}</b> contra
+  {{ L.sigla }} <b>{{ dia_medido }}</b> {{ L.inteiro }} — <b>{{ prev_label }}</b> contra
   <b>{{ curr_label }}</b> · faixa = <i>forecast category</i> do HubSpot, nomeada pelo
   <b>peso</b> dos diretores · trimestre {{ q_range }}
 </p>
@@ -17,7 +18,7 @@
     {% for p in pares %}
       <a class="grain-btn {% if dia_sel == p.key %}active{% endif %}"
          title="{{ p.title }}{% if p.aprox %} · ponta aproximada pela cópia do BI{% endif %}"
-         href="{{ chip_url(dia=p.key) }}">{{ p.label }}{% if p.aprox %}<sup>*</sup>{% endif %}</a>
+         href="{{ chip_url(**{L.chip: p.key}) }}">{{ p.label }}{% if p.aprox %}<sup>*</sup>{% endif %}</a>
     {% endfor %}
   </div>
 </div>
@@ -25,11 +26,8 @@
 
 {% if sem_par %}
 <div class="panel">
-  <h2>Sem par de dias comparável</h2>
-  <p class="ph" style="margin:6px 0 0">
-    A tela compara a foto da meia-noite de um dia com a do dia anterior, e ainda
-    não há duas pontas consecutivas nos últimos dias.
-  </p>
+  <h2>{{ L.sem_par_h }}</h2>
+  <p class="ph" style="margin:6px 0 0">{{ L.sem_par_p }}</p>
 </div>
 
 {% elif sem_dado %}
@@ -55,27 +53,16 @@
   {% endif %}
 </div>
 
-<div class="panel">
-  <div class="panel-head">
-    <h2>Destino de cada faixa <span class="h2-sub">· o volume de {{ prev_label }}, dia depois</span></h2>
-    <div class="dst-unit" role="group" aria-label="Unidade da barra">
-      <button type="button" class="dst-u active" data-unit="pct">% da faixa</button>
-      <button type="button" class="dst-u" data-unit="abs">{{ ctx.money_sym }}</button>
-    </div>
-  </div>
-  <span class="ph" style="margin:0 0 2px">
-    barra = o que a faixa tinha em {{ prev_label }}, medido no valor de origem ·
-    em <b>% da faixa</b> as barras têm o mesmo tamanho e comparam TAXAS; em <b>{{ ctx.money_sym }}</b>
-    comparam TAMANHOS · clique em qualquer pedaço
-  </span>
-
-  <div class="legend" style="margin:12px 0 14px">
-    {% for l in destino.legenda %}
-      <span class="leg-item"><i class="leg-sq{% if l.e_ficou %} is-ficou{% endif %}"
-            style="background:{{ l.color if not l.e_ficou else '#CBD5E1' }}"></i>{{ l.label }}</span>
-    {% endfor %}
+<div class="panel pr-panel" data-view="div" data-unit="v">
+  <div class="panel-head pr-head">
+    <h2>Destino de cada faixa <span class="h2-sub">· o volume de {{ prev_label }}, {{ L.depois }}</span></h2>
+    {{ pr_controls() }}
   </div>
 
+{{ pr_body(destino.bands, drill, ficou_label='Ficou na faixa', unit_of='da faixa') }}
+
+  <details class="pr-det">
+    <summary>Ver tabela detalhada (resumo por destino em cada faixa)</summary>
   <div class="tbl-wrap">
     <table class="fw-tbl dst-tbl">
       <thead>
@@ -131,6 +118,7 @@
       </tbody>
     </table>
   </div>
+  </details>
 
   {# Veio de fora: medido AGORA, porque estes deals não tinham faixa anterior.
      Fora da tabela de propósito — misturá-los com as cinco barras quebraria a
@@ -146,7 +134,7 @@
       {% for sg in destino.entrou.segs %}
         <div class="dst-f-item" data-drill="{{ drill(de='out', mv=sg.key) }}"
              title="Explodir · {{ sg.label }} · {{ sg.v|brl }} · {{ sg.n }} deals">
-          <span class="dst-f-bar" style="width:{{ (sg.v / destino.entrou.span * 76 + 6)|round }}px;background:{{ sg.color }}"></span>
+          <span class="dst-f-bar" style="width:{{ [sg.v / destino.entrou.span * 160, 2]|max|round }}px;background:{{ sg.color }}"></span>
           <span class="dst-f-txt">
             <b style="color:{{ sg.color }}">{{ sg.v|brl }}</b>
             <span class="dst-sub">{{ sg.label }} · {{ sg.n }} deal{{ 's' if sg.n != 1 else '' }}</span>
@@ -160,7 +148,8 @@
     <b>Won é coluna própria e não entra em "Subiu"</b>: virar receita não é ganhar
     confiança, é acabar a aposta — e é o número que se pergunta primeiro. <b>Lost
     conta como piora</b>, junto de quem desceu de faixa e de quem escorregou do
-    trimestre. As quatro colunas de resumo somam 100% da faixa.
+    trimestre. <b>Progresso</b> = subiu de faixa ou virou Won; <b>Regresso</b> = desceu de faixa,
+    Lost ou saiu do forecast. Em <b>Deals</b> as barras são a parte dos deals da faixa; em <b>Receita</b>, a parte do volume.
     Cada barra é medida no <b>valor de origem</b> e por isso soma exatamente o
     nível que a faixa tinha em {{ prev_label }} — a mesma invariante da matriz de
     migração. O que ficou na faixa e mudou de tamanho aparece como
@@ -243,36 +232,7 @@
   .hb-aprox{flex-basis:100%;font-size:12px;color:#B45309}
 </style>
 
-<script>
-/* Troca a unidade da barra do "Destino de cada faixa". Só o COMPRIMENTO da
-   barra muda: os pedaços são % da faixa nas duas unidades, então a composição
-   que o olho comparou continua a mesma — é a moldura que encolhe. Em "% da
-   faixa" todas medem igual e se comparam TAXAS; em "R$" a barra é proporcional
-   ao volume e se comparam TAMANHOS. */
-(function(){
-  "use strict";
-  function init(){
-    var box = document.querySelector('.dst-unit');
-    if (!box || box.dataset.wired) return;
-    box.dataset.wired = '1';
-    var bars = [].slice.call(document.querySelectorAll('.dst-bar'));
-    box.addEventListener('click', function(ev){
-      var btn = ev.target.closest('.dst-u');
-      if (!btn) return;
-      [].forEach.call(box.querySelectorAll('.dst-u'), function(b){
-        b.classList.toggle('active', b === btn);
-      });
-      var unit = btn.dataset.unit;
-      bars.forEach(function(bar){
-        bar.style.width = (unit === 'abs' ? bar.dataset.wAbs : bar.dataset.wPct) + '%';
-      });
-    });
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else { init(); }
-})();
-</script>
+{{ pr_assets() }}
 
 {% include "_drilldown.html" %}
 {% endblock %}
