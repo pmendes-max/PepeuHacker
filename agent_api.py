@@ -228,7 +228,9 @@ _TELAS = {
                             "Pipe early em dois domingos e o que aconteceu deal a deal: novo, cresceu, encolheu, "
                             "lost, won."),
     "/pipeline/wow/late": ("PoP Late", "O mesmo da PoP Early, para o pipe late."),
-    "/pipeline/wow/history": ("PoP Histórico", "N semanas de movimento do pipe early ou late, time e pessoa a pessoa."),
+    "/pipeline/wow/history": ("PoP Histórico", "Movimento semanal do pipe early ou late, time e pessoa a pessoa. Pipe total "
+                              "(qualquer close date); com cd=q, só close date no trimestre vigente e a "
+                              "cobertura histórica."),
     "/pipeline/wow/quarter": ("PoP Histórico Q",
                               "Pipe da semana com close date no trimestre e a cobertura histórica "
                               "(pipe ÷ quota − realizado), por AE; com ae= a meta é a quota do AE."),

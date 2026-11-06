@@ -205,7 +205,6 @@
     <a href="{{ url_for('pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
     <a href="{{ url_for('pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
     <a href="{{ url_for('pipeline_wow_history', **ctx.filters) }}" class="{% if ctx.current_path == '/pipeline/wow/history' %}active{% endif %}">PoP Histórico</a>
-    <a href="{{ url_for('pipeline_wow_quarter', **ctx.filters) }}" class="{% if ctx.current_path == '/pipeline/wow/quarter' %}active{% endif %}" title="PoP Histórico só com o pipe do trimestre vigente: close date dentro do trimestre de cada semana">PoP Histórico Q</a>
     <a href="{{ url_for('pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled'   %}active{% endif %}">Stale</a>
     <a href="{{ url_for('pipeline_activity',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/stalled-activity'   %}active{% endif %}">Inatividade</a>
     <a href="{{ url_for('pipeline_legal',     **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/legal'     %}active{% endif %}">Legal</a>
@@ -222,7 +221,6 @@
     <a href="{{ url_for('leaders_pipeline_wow_early', **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/early' %}active{% endif %}">PoP Early</a>
     <a href="{{ url_for('leaders_pipeline_wow_late',  **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/wow/late'  %}active{% endif %}">PoP Late</a>
     <a href="{{ url_for('leaders_pipeline_wow_history', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow/history' %}active{% endif %}">PoP Histórico</a>
-    <a href="{{ url_for('leaders_pipeline_wow_quarter', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow/quarter' %}active{% endif %}" title="PoP Histórico só com o pipe do trimestre vigente: close date dentro do trimestre de cada semana">PoP Histórico Q</a>
     <a href="{{ url_for('leaders_pipeline_dod', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/dod' %}active{% endif %}" title="Day over day: para onde foi o pipe de cada estágio entre duas meias-noites">DoD</a>
     <a href="{{ url_for('leaders_pipeline_wow', **ctx.filters) }}" class="{% if ctx.current_path == '/leaders/pipeline/wow' %}active{% endif %}" title="Week over week: para onde foi o pipe de cada estágio entre duas segundas-feiras 00h">WoW</a>
     <a href="{{ url_for('leaders_pipeline_stalled',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/stalled'   %}active{% endif %}">Stale</a>

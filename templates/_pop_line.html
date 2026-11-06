@@ -108,7 +108,7 @@
     Saldo = novo + cresceu − encolheu − lost{% if viradas is defined %} + puxado pro trimestre − escorregou{% endif %}.
     {{ adv_lbl }} fica fora do saldo e aparece abaixo do zero, em azul: é saída boa, o funil andando.
     {% if pl.p2 %}Cobertura = pipe do trimestre ÷ (meta do trimestre − realizado até o domingo); a linha corta na virada de trimestre.
-    {% elif viradas is not defined %}Sem cobertura aqui de propósito: este pipe inclui close dates de outros trimestres e não tem quota que case com ele. A cobertura está no <a href="{{ url_for('leaders_pipeline_wow_quarter' if grain == 'leader' else 'pipeline_wow_quarter', focus=focus) }}">PoP Histórico Q</a>.{% endif %}
+    {% elif viradas is not defined %}Sem cobertura aqui de propósito: este pipe inclui close dates de outros trimestres e não tem quota que case com ele. Para ver a cobertura, troque o Close date para <a href="{{ chip_url(cd='q') }}">Trimestre vigente</a>.{% endif %}
   </div>
 </div>
 <style>

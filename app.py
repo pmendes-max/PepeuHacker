@@ -10698,14 +10698,34 @@ def _render_wow_history(grain="ae"):
     )
 
 
+def _wow_hist_cd_q() -> bool:
+    """Botão "Close date" do PoP Histórico (pedido do Pedro, 06/11/2026): as
+    duas telas viraram uma. `cd=q` = só close date no trimestre vigente (o
+    antigo PoP Histórico Q, com cobertura); sem `cd` = pipe total. O México
+    não tem a visão por trimestre: lá o botão nem aparece e `cd` é ignorado."""
+    return request.args.get("cd") == "q" and not request.path.startswith("/mx")
+
+
 @app.route("/pipeline/wow/history")
 def pipeline_wow_history():
-    return _render_wow_history("ae")
+    return _render_wow_quarter("ae") if _wow_hist_cd_q() else _render_wow_history("ae")
 
 
 @app.route("/leaders/pipeline/wow/history")
 def leaders_pipeline_wow_history():
-    return _render_wow_history("leader")
+    return (_render_wow_quarter("leader") if _wow_hist_cd_q()
+            else _render_wow_history("leader"))
+
+
+def _wq_to_history(endpoint):
+    """URL antiga do PoP Histórico Q → a tela única com o botão em "Trimestre
+    vigente". Pedido de agente (format=json) segue respondendo no lugar, pra
+    não quebrar quem já chama o caminho antigo."""
+    if request.args.get("format") == "json":
+        return None
+    args = {k: v for k, v in request.args.items() if v}
+    args["cd"] = "q"
+    return redirect(url_for(endpoint, **args))
 
 
 @app.route("/pipeline/wow/history/deals")
@@ -11685,12 +11705,12 @@ def _wq_cobertura_drill(grain):
 
 @app.route("/leaders/pipeline/wow/quarter")
 def leaders_pipeline_wow_quarter():
-    return _render_wow_quarter("leader")
+    return _wq_to_history("leaders_pipeline_wow_history") or _render_wow_quarter("leader")
 
 
 @app.route("/pipeline/wow/quarter")
 def pipeline_wow_quarter():
-    return _render_wow_quarter("ae")
+    return _wq_to_history("pipeline_wow_history") or _render_wow_quarter("ae")
 
 
 @app.route("/leaders/pipeline/wow/quarter/deals")

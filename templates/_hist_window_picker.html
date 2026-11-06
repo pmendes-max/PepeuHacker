@@ -13,6 +13,16 @@
          href="{{ chip_url(focus=k) }}">{{ lbl }}</a>
     {% endfor %}
   </div>
+  {% if not request.path.startswith('/mx') %}
+  {% set _cdq = request.args.get('cd') == 'q' %}
+  <span class="hw-ruler-lbl" style="padding:0">Close date</span>
+  <div class="grain-switch" role="group" aria-label="Close date">
+    <a class="grain-btn {% if not _cdq %}active{% endif %}" href="{{ chip_url(cd='') }}"
+       title="Todo o pipe do estágio, qualquer close date">Pipe total</a>
+    <a class="grain-btn {% if _cdq %}active{% endif %}" href="{{ chip_url(cd='q') }}"
+       title="Só deals com close date no trimestre de cada semana · com cobertura">Trimestre vigente</a>
+  </div>
+  {% endif %}
   {% if ruler %}
   <div class="hw-ruler" role="group" aria-label="Trimestre inicial (até hoje)">
     <span class="hw-ruler-lbl">De</span>
