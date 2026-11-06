@@ -1,0 +1,55 @@
+{# Seletor de janela do PoP Histórico e do PoP Histórico Q (pedido do Pedro,
+   06/11/2026 — opção "B · régua de trimestres"):
+     · foco Early/Late;
+     · janelas móveis em semanas;
+     · RÉGUA: clicar num trimestre abre a série dele ATÉ HOJE (Q4 → Q3+Q4 →
+       Q2+Q3+Q4…). As células que a janela cobre ficam acesas, então o que está
+       somando fica à vista;
+     · chips de FY.
+   Espera: chip_url, week_opts, week_sel, ruler, fy_opts, focus, zoom. -#}
+<div class="hist-chips">
+  <div class="grain-switch">
+    {% for k, lbl in [('early', 'Early stage'), ('late', 'Late stage')] %}
+      <a class="grain-btn {% if focus == k %}active{% endif %}"
+         href="{{ chip_url(focus=k) }}">{{ lbl }}</a>
+    {% endfor %}
+  </div>
+  <div class="grain-switch">
+    {% for w, lbl in week_opts %}
+      <a class="grain-btn {% if week_sel == w %}active{% endif %}"
+         href="{{ chip_url(weeks=w) }}">{{ lbl }}</a>
+    {% endfor %}
+  </div>
+  {% if ruler %}
+  <div class="hw-ruler" role="group" aria-label="Trimestre inicial (até hoje)">
+    <span class="hw-ruler-lbl">De</span>
+    {% for c in ruler %}
+      <a class="hw-q {% if c.on %}is-on{% endif %}" href="{{ c.url }}" title="{{ c.title }}">{{ c.label }}</a>
+    {% endfor %}
+    <span class="hw-ruler-lbl">até hoje</span>
+  </div>
+  {% endif %}
+  {% if fy_opts %}
+  <div class="grain-switch">
+    {% for k, lbl in fy_opts %}
+      <a class="grain-btn {% if week_sel == k %}active{% endif %}"
+         href="{{ chip_url(weeks=k) }}">{{ lbl }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+
+<style>
+  .hw-ruler{display:inline-flex;align-items:center;gap:3px;flex-wrap:wrap;
+    padding:3px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+  .hw-ruler-lbl{font-size:11.5px;color:var(--muted);font-weight:600;padding:0 6px}
+  .hw-q{font-size:12px;font-weight:600;padding:5px 9px;border-radius:5px;
+    background:var(--surface-2,#F1F5F9);color:var(--muted);text-decoration:none;
+    font-variant-numeric:tabular-nums}
+  .hw-q:hover{color:var(--fg);box-shadow:inset 0 0 0 1px var(--blue,#2563EB)}
+  .hw-q.is-on{background:var(--blue,#2563EB);color:#fff}
+  .hw-zoom{font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;
+    border:1px solid var(--border);color:var(--fg-soft);text-decoration:none;white-space:nowrap}
+  .hw-zoom.is-on{background:var(--blue,#2563EB);border-color:var(--blue,#2563EB);color:#fff}
+  .hw-zoom:hover{border-color:var(--blue,#2563EB)}
+</style>
