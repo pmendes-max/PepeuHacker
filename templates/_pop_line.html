@@ -1,0 +1,153 @@
+{# Gráfico único do PoP Histórico / PoP Histórico Q — opção "A · três faixas
+   alinhadas" (pedido do Pedro, 06/11/2026; substitui a escada e as barras de
+   movimento). Geometria em `_build_pop_line`. Espera: pl, focus, fifth_cat,
+   chip_url, zero e, no PoP Q, viradas. -#}
+{% set adv_lbl = 'Movido p/ Late' if fifth_cat == 'late' else 'Foi para Won' %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Movimento do pipe {{ focus|capitalize }}{{ ' do trimestre' if viradas is defined }}
+      <span class="h2-sub">· passe o mouse numa semana · clique pra ver os deals</span></h2>
+    <a class="hw-zoom {% if zero %}is-on{% endif %}" href="{{ chip_url(zero='' if zero else '1') }}"
+       title="Liga/desliga o eixo do pipe a partir do zero">Eixo desde o zero</a>
+  </div>
+  <div class="legend">
+    <span class="leg-item"><span class="pl-leg-line" style="background:#2563EB"></span>Pipe {{ focus|capitalize }}</span>
+    {% if pl.p2 %}<span class="leg-item"><span class="pl-leg-line" style="background:#0F6E56"></span>Cobertura (pipe ÷ quota remanescente)</span>{% endif %}
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#15803d"></span>Saldo positivo</span>
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#dc2626"></span>Saldo negativo</span>
+    <span class="leg-item"><span class="pl-leg-dot" style="background:#0EA5E9"></span>{{ adv_lbl }}</span>
+  </div>
+  <div class="rank-wrap pl-wrap" style="overflow-x:auto;overflow-y:hidden">
+    <svg class="pl-svg" viewBox="0 0 {{ pl.w }} {{ pl.h }}" width="100%"
+         style="display:block;max-width:{{ pl.w }}px" font-family="inherit">
+      {# ---- divisas de trimestre, atravessando as três faixas ---- #}
+      {% for b in pl.q_breaks %}
+        <line x1="{{ b.x }}" y1="{{ pl.p1.top - 6 }}" x2="{{ b.x }}" y2="{{ pl.p3.base }}"
+              stroke="#7c3aed" stroke-opacity=".35" stroke-width="1" stroke-dasharray="3 4"/>
+        <text x="{{ b.x + 4 }}" y="{{ pl.p1.top - 10 }}" font-size="11" font-weight="700"
+              fill="#7c3aed">{{ b.label }}</text>
+      {% endfor %}
+
+      {# ---- 1) Pipe ---- #}
+      <text x="{{ pl.left }}" y="{{ pl.p1.top - 12 }}" font-size="12" font-weight="700"
+            fill="var(--fg)">Pipe {{ focus|capitalize }}</text>
+      {% for t in pl.p1.ticks %}
+        <line x1="{{ pl.left }}" y1="{{ t.y }}" x2="{{ pl.right_x }}" y2="{{ t.y }}"
+              stroke="var(--border-soft)" stroke-width="1"/>
+        <text x="{{ pl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="11.5"
+              fill="var(--muted)">{{ t.label }}</text>
+      {% endfor %}
+      <path d="{{ pl.p1.area }}" fill="#2563EB" fill-opacity=".07"/>
+      <polyline points="{{ pl.p1.path }}" fill="none" stroke="#2563EB" stroke-width="2.5"
+                stroke-linejoin="round" stroke-linecap="round"/>
+      {% for d in pl.p1.dots %}
+        <circle cx="{{ d.x }}" cy="{{ d.y }}" r="4" fill="var(--surface)" stroke="#2563EB" stroke-width="2"/>
+      {% endfor %}
+      {% for l in pl.p1.labels %}
+        <text x="{{ l.x }}" y="{{ l.y }}" text-anchor="{{ l.anchor }}" font-size="11.5" font-weight="800"
+              fill="var(--fg)" paint-order="stroke" stroke="var(--surface)" stroke-width="3.5">{{ l.txt }}</text>
+      {% endfor %}
+
+      {# ---- 2) Cobertura ---- #}
+      {% if pl.p2 %}
+        <text x="{{ pl.left }}" y="{{ pl.p2.top - 12 }}" font-size="12" font-weight="700"
+              fill="var(--fg)">Cobertura</text>
+        {% for t in pl.p2.ticks %}
+          <line x1="{{ pl.left }}" y1="{{ t.y }}" x2="{{ pl.right_x }}" y2="{{ t.y }}"
+                stroke="var(--border-soft)" stroke-width="1"/>
+          <text x="{{ pl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="11.5"
+                fill="var(--muted)">{{ t.label }}</text>
+        {% endfor %}
+        {% for seg in pl.p2.segs %}
+          <polyline points="{{ seg }}" fill="none" stroke="#0F6E56" stroke-width="2.5"
+                    stroke-linejoin="round" stroke-linecap="round"/>
+        {% endfor %}
+        {% for d in pl.p2.dots %}
+          <circle cx="{{ d.x }}" cy="{{ d.y }}" r="3.5" fill="var(--surface)" stroke="#0F6E56" stroke-width="2"/>
+        {% endfor %}
+        {% if pl.p2.last %}
+          <text x="{{ pl.p2.last.x }}" y="{{ pl.p2.last.y }}" text-anchor="end" font-size="11.5"
+                font-weight="800" fill="var(--fg)" paint-order="stroke" stroke="var(--surface)"
+                stroke-width="3.5">{{ pl.p2.last.txt }}</text>
+        {% endif %}
+      {% endif %}
+
+      {# ---- 3) Saldo e avanço ---- #}
+      <text x="{{ pl.left }}" y="{{ pl.p3.top - 12 }}" font-size="12" font-weight="700"
+            fill="var(--fg)">Saldo da semana · {{ adv_lbl }}</text>
+      {% for t in pl.p3.ticks %}
+        <text x="{{ pl.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="11"
+              fill="var(--muted)">{{ t.label }}</text>
+      {% endfor %}
+      <line x1="{{ pl.left }}" y1="{{ pl.p3.zero }}" x2="{{ pl.right_x }}" y2="{{ pl.p3.zero }}"
+            stroke="var(--border)" stroke-width="1.5"/>
+      <text x="{{ pl.anchor.cx }}" y="{{ pl.p3.base + 22 }}" text-anchor="middle" font-size="11"
+            font-weight="700" fill="var(--fg)">{{ pl.anchor.label }}</text>
+
+      {% for c in pl.cols %}
+        <g class="pl-col" data-tip='{{ c.tip|tojson }}'>
+          <rect class="pl-band" x="{{ c.zx }}" y="{{ pl.p1.top - 4 }}" width="{{ pl.step }}"
+                height="{{ pl.p3.base - pl.p1.top + 8 }}" data-drill="{{ c.url }}"/>
+          <rect x="{{ c.net_x }}" y="{{ c.net_y }}" width="{{ pl.bw }}" height="{{ c.net_h }}" rx="2"
+                fill="{{ '#15803d' if c.pos else '#dc2626' }}" data-drill="{{ c.url }}"/>
+          {% if c.adv_h %}
+          <rect x="{{ c.adv_x }}" y="{{ c.adv_y }}" width="{{ pl.bw }}" height="{{ c.adv_h }}" rx="2"
+                fill="#0EA5E9" data-drill="{{ c.url_adv }}"/>
+          {% endif %}
+          {% if c.xl %}
+          <text x="{{ c.cx }}" y="{{ pl.p3.base + 22 }}" text-anchor="middle" font-size="11"
+                fill="var(--fg-soft)" pointer-events="none">{{ c.xl }}</text>
+          {% endif %}
+        </g>
+      {% endfor %}
+    </svg>
+    <div class="pl-tip" hidden></div>
+  </div>
+  <div class="hm-note">
+    Saldo = novo + cresceu − encolheu − lost{% if viradas is defined %} + puxado pro trimestre − escorregou{% endif %}.
+    {{ adv_lbl }} fica fora do saldo e aparece abaixo do zero, em azul: é saída boa, o funil andando.
+    {% if pl.p2 %}Cobertura = pipe do trimestre ÷ (meta do trimestre − realizado até o domingo); a linha corta na virada de trimestre.{% endif %}
+  </div>
+</div>
+<style>
+  .pl-wrap{position:relative}
+  .pl-band{fill:#2563EB;fill-opacity:0;cursor:pointer}
+  .pl-col:hover .pl-band{fill-opacity:.06}
+  .pl-col rect[data-drill]{cursor:pointer}
+  .pl-leg-line{width:16px;height:3px;border-radius:2px;display:inline-block}
+  .pl-tip{position:absolute;z-index:5;pointer-events:none;min-width:230px;max-width:340px;
+    background:var(--surface);border:1px solid var(--border);border-radius:8px;
+    box-shadow:0 6px 20px rgba(15,23,42,.14);padding:9px 11px;font-size:12px;line-height:1.5}
+  .pl-tip .r{display:flex;justify-content:space-between;gap:14px;white-space:nowrap}
+  .pl-tip .r b{font-variant-numeric:tabular-nums}
+  .pl-tip .h{font-weight:800;margin-bottom:3px}
+  .pl-tip .pl-sub{color:var(--muted);font-size:11.5px;padding-left:12px}
+  .pl-leg-dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .pl-tip .pos b{color:#15803d}.pl-tip .neg b{color:#B91C1C}.pl-tip .adv b{color:#0369A1}
+</style>
+<script>
+(function () {
+  document.querySelectorAll(".pl-wrap").forEach(function (wrap) {
+    var tip = wrap.querySelector(".pl-tip");
+    function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]; }); }
+    wrap.querySelectorAll(".pl-col").forEach(function (g) {
+      g.addEventListener("mousemove", function (ev) {
+        var rows = JSON.parse(g.getAttribute("data-tip") || "[]");
+        tip.innerHTML = rows.map(function (r) {
+          if (r.h) return '<div class="h">' + esc(r.k) + "</div>";
+          return '<div class="r ' + (r.sub ? "pl-sub " : "") + (r.c || "") + '"><span>' + esc(r.k) +
+                 "</span><b>" + esc(r.v) + "</b></div>";
+        }).join("");
+        tip.hidden = false;
+        var b = wrap.getBoundingClientRect();
+        var x = ev.clientX - b.left + wrap.scrollLeft + 16;
+        var y = ev.clientY - b.top + 12;
+        if (x + tip.offsetWidth > wrap.scrollLeft + wrap.clientWidth - 4) x -= tip.offsetWidth + 32;
+        if (y + tip.offsetHeight > wrap.clientHeight) y = Math.max(0, wrap.clientHeight - tip.offsetHeight - 4);
+        tip.style.left = x + "px"; tip.style.top = y + "px";
+      });
+      g.addEventListener("mouseleave", function () { tip.hidden = true; });
+    });
+  });
+})();
+</script>

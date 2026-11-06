@@ -1,23 +1,16 @@
 {# Seletor de janela do PoP Histórico e do PoP Histórico Q (pedido do Pedro,
    06/11/2026 — opção "B · régua de trimestres"):
      · foco Early/Late;
-     · janelas móveis em semanas;
      · RÉGUA: clicar num trimestre abre a série dele ATÉ HOJE (Q4 → Q3+Q4 →
        Q2+Q3+Q4…). As células que a janela cobre ficam acesas, então o que está
-       somando fica à vista;
-     · chips de FY.
+       somando fica à vista.
+   Chips de semanas e de FY saíram em 06/11/2026 (sobrepunham a régua).
    Espera: chip_url, week_opts, week_sel, ruler, fy_opts, focus, zoom. -#}
 <div class="hist-chips">
   <div class="grain-switch">
     {% for k, lbl in [('early', 'Early stage'), ('late', 'Late stage')] %}
       <a class="grain-btn {% if focus == k %}active{% endif %}"
          href="{{ chip_url(focus=k) }}">{{ lbl }}</a>
-    {% endfor %}
-  </div>
-  <div class="grain-switch">
-    {% for w, lbl in week_opts %}
-      <a class="grain-btn {% if week_sel == w %}active{% endif %}"
-         href="{{ chip_url(weeks=w) }}">{{ lbl }}</a>
     {% endfor %}
   </div>
   {% if ruler %}
@@ -27,14 +20,6 @@
       <a class="hw-q {% if c.on %}is-on{% endif %}" href="{{ c.url }}" title="{{ c.title }}">{{ c.label }}</a>
     {% endfor %}
     <span class="hw-ruler-lbl">até hoje</span>
-  </div>
-  {% endif %}
-  {% if fy_opts %}
-  <div class="grain-switch">
-    {% for k, lbl in fy_opts %}
-      <a class="grain-btn {% if week_sel == k %}active{% endif %}"
-         href="{{ chip_url(weeks=k) }}">{{ lbl }}</a>
-    {% endfor %}
   </div>
   {% endif %}
 </div>

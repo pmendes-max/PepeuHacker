@@ -82,37 +82,12 @@
   <b>= {{ level_end|brl }}</b>
 </div>
 
-{# ============ 1) Escada do pipe (nível + saldo, degrau a degrau) ============ #}
-{% include "_hist_stairs.html" %}
+{# ============ 1) Gráfico único: pipe, saldo e avanço ============ #}
+{% if wk_rows %}{% include "_pop_line.html" %}{% endif %}
 
-{# ============ 2) Movimento semana a semana ============ #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Movimento por {{ "mês" if monthly else "semana" }} <span class="h2-sub">· o que entrou e o que saiu</span></h2>
-    <span class="ph" style="margin:0">clique num segmento pra explodir os deals</span>
-  </div>
-  <div class="dchart" data-chart="hist-{{ focus }}" data-drill-chips="cat">
-    <div class="legend legend-toggle">
-      {% for key, label, cor, ink in [
-        ('novo',     'Novo deal',          '#15803d', '#15803d'),
-        ('cresceu',  'Cresceu em amount',  '#86efac', '#047857'),
-        ('encolheu', 'Encolheu em amount', '#fdba74', '#B45309'),
-        ('lost',     'Lost',               '#dc2626', '#B91C1C'),
-      ] %}
-        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}" style="--c:{{ cor }};--ci:{{ ink }}">
-          <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
-        </button>
-      {% endfor %}
-      <span class="hist-leg-net"><span class="hist-leg-tick"></span>saldo {{ "do mês" if monthly else "da semana" }}</span>
-    </div>
-
-    {% if wk_rows %}
-    {% include "_hist_bars.html" %}
-    {% else %}
-    <div class="empty-state">Sem movimento em {{ focus_label }} nessa janela.</div>
-    {% endif %}
-  </div>
-</div>
+{% if not wk_rows %}
+<div class="panel"><div class="empty-state">Sem movimento em {{ focus_label }} nessa janela.</div></div>
+{% endif %}
 
 {# ============ 3) Comparação entre pessoas — small multiples ============ #}
 <div class="panel">

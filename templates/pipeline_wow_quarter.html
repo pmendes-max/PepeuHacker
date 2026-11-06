@@ -113,81 +113,18 @@
   <b>= {{ level_end|brl }}</b>
 </div>
 
-{# ============ 1) Escada do pipe (nível + saldo, degrau a degrau) ============ #}
-{% include "_hist_stairs.html" %}
+{# ============ 1) Gráfico único: pipe, cobertura, saldo e avanço ============ #}
+{% if pl %}{% include "_pop_line.html" %}{% endif %}
 
-{# ============ 2) Cobertura: pipe ÷ quota remanescente em cada domingo ============ #}
+{# ============ 2) Detalhe da cobertura (tabela) ============ #}
 <div class="panel">
   <div class="panel-head">
-    <h2>Cobertura do pipe {{ focus|capitalize }} <span class="h2-sub">· pipe do trimestre ÷ quota remanescente, em cada domingo</span></h2>
-    <span class="ph" style="margin:0">clique numa barra pra ver os deals</span>
+    <h2>Detalhe da cobertura <span class="h2-sub">· pipe do trimestre ÷ quota remanescente, em cada domingo</span></h2>
+    <span class="ph" style="margin:0">clique no pipe ou no realizado pra ver os deals</span>
   </div>
   {% if ctx.filters.dtype %}
     <div class="empty-state">A cobertura não abre por Deal Type: a quota é uma só pra aquisição e expansão. Limpe o filtro Deal Type pra ver.</div>
   {% elif cov %}
-  <div class="legend">
-    <span class="leg-item"><span class="leg-dot" style="background:#0F6E56"></span>Pipe {{ focus|capitalize }} do trimestre</span>
-    <span class="leg-item"><span class="leg-dot" style="background:#94A3B8"></span>Quota remanescente</span>
-    <span class="leg-item"><span class="wq-leg-line"></span>Cobertura (Nx)</span>
-    <span class="leg-item"><span class="wq-leg-goal"></span>Meta de cobertura da semana</span>
-  </div>
-  <div class="rank-wrap" style="overflow-x:auto;overflow-y:hidden">
-    <svg viewBox="0 0 {{ cov.w }} {{ cov.h }}" width="{{ cov.w }}" height="{{ cov.h }}"
-         style="min-width:100%;display:block" font-family="inherit">
-      {% for t in cov.yL %}
-        <line x1="{{ cov.left }}" y1="{{ t.y }}" x2="{{ cov.right_x }}" y2="{{ t.y }}"
-              stroke="var(--border-soft)" stroke-width="1"/>
-        <text x="{{ cov.left - 10 }}" y="{{ t.y + 4.5 }}" text-anchor="end" font-size="12"
-              fill="var(--muted)">{{ t.label }}</text>
-      {% endfor %}
-      {% for t in cov.yR %}
-        <text x="{{ cov.right_x + 8 }}" y="{{ t.y + 4.5 }}" font-size="12"
-              fill="#185FA5">{{ t.label }}</text>
-      {% endfor %}
-      <line x1="{{ cov.left }}" y1="{{ cov.base_y }}" x2="{{ cov.right_x }}" y2="{{ cov.base_y }}"
-            stroke="var(--border)" stroke-width="1.5"/>
-      {% for b in cov.breaks %}
-        <line x1="{{ b.x }}" y1="{{ cov.top - 10 }}" x2="{{ b.x }}" y2="{{ cov.base_y }}"
-              stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4"/>
-        <text x="{{ b.x + 4 }}" y="{{ cov.top - 2 }}" font-size="11" font-weight="700"
-              fill="var(--muted)">{{ b.label }} →</text>
-      {% endfor %}
-      {% for c in cov.cols %}
-        <g>
-          <title>{{ c.label }} · régua {{ c.regua_label }}
-pipe {{ c.pipe|brl }}
-{% if c.tem_meta %}{{ c.meta_fonte }} {{ c.meta|brl }} − realizado {{ c.real|brl }} ({{ c.n_real }} deals) = remanescente {{ c.rem|brl }}{% else %}{{ c.meta_fonte }} · realizado {{ c.real|brl }} ({{ c.n_real }} deals){% endif %}
-cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{% endif %}</title>
-          <rect x="{{ c.pipe_x }}" y="{{ c.pipe_y }}" width="{{ cov.bw }}" height="{{ c.pipe_h }}"
-                fill="#0F6E56" style="cursor:pointer" data-drill="{{ c.url_pipe }}"/>
-          {% if c.tem_meta %}
-          <rect x="{{ c.rem_x }}" y="{{ c.rem_y }}" width="{{ cov.bw }}" height="{{ c.rem_h }}"
-                fill="#94A3B8" style="cursor:pointer" data-drill="{{ c.url_real }}"/>
-          {% endif %}
-          <text x="{{ c.cx }}" y="{{ cov.base_y + 18 }}" text-anchor="end" font-size="11"
-                fill="var(--fg-soft)" transform="rotate(-40 {{ c.cx }} {{ cov.base_y + 18 }})">{{ c.label }}</text>
-        </g>
-      {% endfor %}
-      <path d="{{ cov.goal_d }}" fill="none" stroke="#D97706" stroke-width="2"
-            stroke-dasharray="7 5" stroke-linecap="round"/>
-      {% for seg in cov.segs %}
-        <polyline points="{{ seg }}" fill="none" stroke="#2563EB" stroke-width="3"
-                  stroke-linejoin="round" stroke-linecap="round"/>
-      {% endfor %}
-      {% for c in cov.cols %}
-        {% if c.cov_y is not none %}
-          <circle cx="{{ c.cx }}" cy="{{ c.cov_y }}" r="5"
-                  fill="{{ 'var(--surface)' if c.is_anchor else '#fff' }}" stroke="#2563EB" stroke-width="2.5"/>
-          <text x="{{ c.cx }}" y="{{ c.cov_y - 10 }}" text-anchor="middle" font-size="11.5"
-                font-weight="800" fill="{{ '#0F6E56' if c.hit else '#185FA5' }}" paint-order="stroke"
-                stroke="var(--surface)" stroke-width="3.5">{{ '▲ ' if c.clamped }}{{ c.cov_txt }}</text>
-        {% else %}
-          <text x="{{ c.cx }}" y="{{ cov.top + 12 }}" text-anchor="middle" font-size="10.5"
-                font-weight="700" fill="{{ '#0F6E56' if c.batida else 'var(--muted)' }}">{{ c.cov_txt }}</text>
-        {% endif %}
-      {% endfor %}
-    </svg>
-  </div>
   <div class="rank-wrap" style="overflow-x:auto;margin-top:6px">
     <table class="hm wq-cov-t">
       <thead>
@@ -224,42 +161,6 @@ cobertura {{ c.cov_txt }}{% if c.goal is not none %} · meta {{ c.goal_label }}{
   {% else %}
     <div class="empty-state">Sem semana fechada nessa janela.</div>
   {% endif %}
-</div>
-
-{# ============ 3) Movimento semana a semana ============ #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Movimento por {{ "mês" if monthly else "semana" }} <span class="h2-sub">· o que entrou e o que saiu do pipe do trimestre</span></h2>
-    <span class="ph" style="margin:0">clique num segmento pra explodir os deals</span>
-  </div>
-  <div class="dchart" data-chart="hist-q-{{ focus }}" data-drill-chips="cat">
-    <div class="legend legend-toggle">
-      {% for key, label, cor, ink in [
-        ('novo',       'Novo deal',               '#15803d', '#15803d'),
-        ('cresceu',    'Cresceu em amount',       '#86efac', '#047857'),
-        ('puxou',      'Puxado pro trimestre',    '#0284c7', '#0369a1'),
-        ('encolheu',   'Encolheu em amount',      '#fdba74', '#B45309'),
-        ('lost',       'Lost',                    '#dc2626', '#B91C1C'),
-        ('escorregou', 'Escorregou do trimestre', '#7c3aed', '#6d28d9'),
-      ] %}
-        <button type="button" class="leg-toggle is-on" data-ch="{{ key }}" style="--c:{{ cor }};--ci:{{ ink }}">
-          <span class="leg-dot" style="background:{{ cor }}"></span>{{ label }}
-        </button>
-      {% endfor %}
-      <span class="hist-leg-net"><span class="hist-leg-tick"></span>saldo {{ "do mês" if monthly else "da semana" }}</span>
-    </div>
-
-    {% if wk_rows %}
-    {% include "_hist_bars.html" %}
-    {% if tem_troca %}
-    <div class="hm-note">* a cópia do BI desse domingo faltou ou veio quebrada; a ponta usa a última cópia boa antes dele.</div>
-    {% endif %}
-    {% else %}
-    <div class="empty-state">
-      {% if modo_q %}O trimestre ainda não fechou nenhuma semana.{% else %}Sem movimento em {{ focus_label }} nessa janela.{% endif %}
-    </div>
-    {% endif %}
-  </div>
 </div>
 
 {# ============ 4) Comparação entre pessoas — small multiples ============ #}
