@@ -129,6 +129,8 @@
 </div>
 
 {# ------- Detalhe por AE ------- #}
+{# Detalhe por AE saiu a pedido (06/11/2026): só a visão de líder mantém a tabela. #}
+{% if grain == 'leader' %}
 <div class="panel">
   <h2>Detalhe por {{ 'líder' if grain == 'leader' else 'AE' }}</h2>
   <p class="ph" style="margin:-2px 0 14px">Ponderado, Realizado e Projeção em <b>deal amount</b>; On-hold em <b>MRR</b>.{% if grain == 'leader' and meta_ok %}
@@ -189,6 +191,7 @@
     </table>
   </div>
 </div>
+{% endif %}
 
 {% else %}
 <div class="panel">

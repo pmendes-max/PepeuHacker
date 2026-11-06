@@ -82,6 +82,7 @@
   {{ quota_chart_assets() }}
 </div>
 
+{% if is_leader %}
 {# ---------- Detalhe por vendedor/líder ---------- #}
 <div class="panel">
   <div class="panel-head">
@@ -141,35 +142,8 @@
   </div>
 </div>
 
-{# ---------- Matriz de probabilidades usada ---------- #}
-<div class="panel">
-  <div class="panel-head">
-    <h2>Probabilidades do modelo <span style="font-size:13px;font-weight:400;color:var(--muted)">· conversão Q4+Q1, já com desconto de segurança de {{ ((1-safety)*100)|round|int }}%</span></h2>
-  </div>
-  <div class="tbl-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Segmento</th><th>Estágio</th>
-          <th class="n">Aquisição</th><th class="n">Expansão</th>
-        </tr>
-      </thead>
-      <tbody>
-      {% for seg in ['enterprise','midmarket','commercial'] %}
-        {% for st in stage_order %}
-        <tr>
-          {% if loop.first %}<td class="first"><b>{{ seg_label[seg] }}</b></td>{% else %}<td></td>{% endif %}
-          <td>{{ stage_label[st] }}</td>
-          <td class="n">{{ (prob[seg][st].acq*safety*100)|round|int }}%<span style="color:var(--muted-2);font-size:11px"> ({{ (prob[seg][st].acq*100)|round|int }}%)</span></td>
-          <td class="n">{{ (prob[seg][st].exp*safety*100)|round|int }}%<span style="color:var(--muted-2);font-size:11px"> ({{ (prob[seg][st].exp*100)|round|int }}%)</span></td>
-        </tr>
-        {% endfor %}
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  <p class="ph" style="margin:12px 2px 0">Percentual <b>efetivo</b> (original entre parênteses) — desconto de segurança de {{ ((1-safety)*100)|round|int }}% aplicado a todas as taxas. Só entram deals em <b>Negotiation · Decision · Procurement</b> com close date no trimestre. Times: <b>Commercial</b> = Bernardo · João Tavares · <b>MidMarket</b> = Fernando · Arthur · <b>Enterprise</b> = Scopel · Gustavo Giovani.</p>
-</div>
+{% endif %}
+
 {# Modal do drill do card de Projeção. #}
 {% include "_drilldown.html" %}
 {% endblock %}
