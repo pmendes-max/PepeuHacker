@@ -52,16 +52,26 @@
 
   {% if lay %}
   {% macro val(el) %}{% if peso == 'amt' %}{{ el.amt|brl }}{% else %}{{ el.n|intg }}{% endif %}{% endmacro %}
+  {# Pílula de variação vs janela anterior; (x, y) = canto superior esquerdo. #}
+  {% macro pill(b, x, y) %}{% if b %}<g class="sk-badge {{ 'good' if b.good else 'bad' }}" transform="translate({{ x|round(1) }},{{ y|round(1) }})"><rect width="{{ b.w|round(1) }}" height="18" rx="9"/><text x="{{ (b.w / 2)|round(1) }}" y="13">{{ b.txt }}</text></g>{% endif %}{% endmacro %}
   <div class="sk-wrap">
     <svg class="sk" viewBox="0 0 {{ lay.W }} {{ lay.H|round(0, 'ceil')|int }}" role="img"
-         aria-label="Sankey do funil: deals por etapa, perdas e avanço até o Won">
-      {# Faixas primeiro, nós por cima. #}
+         aria-label="Sankey do funil: origens, deals por etapa, perdas e avanço até o Won">
+      {# Faixas primeiro, nós e rótulos por cima. #}
       {% for l in lay.links %}
-        <path class="sk-link sk-{{ l.kind }}" d="{{ l.d }}"
-              {% if l.kind == 'adv' %}style="fill:{{ l.color }}"{% endif %}
-              data-drill="{{ l.drill }}">
-          <title>{% if l.kind == 'adv' %}{{ l.label }} → {{ lay.nodes[l.num].label }}:{{ l.n|intg }} deals · {{ l.amt|brl }}{% if l.pct is not none %} ({{ l.pct|pctraw }}){% endif %}{% elif l.kind == 'lost' %}Caíram em {{ l.label }}: {{ l.n|intg }} deals · {{ l.amt|brl }}{% else %}Parados em {{ l.label }}: {{ l.n|intg }} deals · {{ l.amt|brl }}{% endif %}</title>
+        <path class="sk-link sk-l-{{ l.kind }}" d="{{ l.d }}" style="fill:{{ l.color }}" data-drill="{{ l.drill }}">
+          <title>{% if l.kind == 'src' %}{{ l.label }} → Scheduled{% elif l.kind == 'adv' %}{{ l.label }} → {{ lay.nodes[l.num].label }}{% elif l.kind == 'lost' %}Caíram em {{ l.label }}{% else %}Parados em {{ l.label }}{% endif %}: {{ l.n|intg }} deals · {{ l.amt|brl }}</title>
         </path>
+      {% endfor %}
+
+      {# Origens (deal type), à esquerda, rótulo alinhado à direita. #}
+      {% for sc in lay.sources %}
+        <rect class="sk-node" x="{{ sc.x }}" y="{{ sc.y }}" width="{{ sc.w }}" height="{{ sc.h }}" rx="2"
+              style="fill:{{ sc.color }}" data-drill="{{ sc.drill }}"><title>{{ sc.label }}: {{ sc.n|intg }} deals · {{ sc.amt|brl }}</title></rect>
+        <text class="sk-t-name" x="{{ sc.x - 12 }}" y="{{ sc.y + 14 }}" text-anchor="end">{{ sc.label }}</text>
+        <text class="sk-t-big sk-c-blue" x="{{ sc.x - 12 }}" y="{{ sc.y + 33 }}" text-anchor="end">{{ val(sc) }}</text>
+        <text class="sk-t-small" x="{{ sc.x - 12 }}" y="{{ sc.y + 48 }}" text-anchor="end">{{ sc.pct|pctraw }} do total</text>
+        {% if sc.badge %}{{ pill(sc.badge, sc.x - 12 - sc.badge.w, sc.y + 55) }}{% endif %}
       {% endfor %}
 
       {% for nd in lay.nodes %}
@@ -69,31 +79,45 @@
               rx="2" style="fill:{{ nd.color }}" data-drill="{{ nd.drill }}">
           <title>{{ nd.label }}: {{ nd.n|intg }} deals · {{ nd.amt|brl }}</title>
         </rect>
-        {# Won é a última coluna: rótulo alinhado à direita pra não sair do quadro. #}
-        {% set tx = nd.x + nd.w if nd.num == 7 else nd.x %}
-        {% set ta = 'end' if nd.num == 7 else 'start' %}
-        <text class="sk-t-stage{% if nd.num == 7 %} sk-t-won{% endif %}" x="{{ tx }}" y="{{ nd.y - 30 }}" text-anchor="{{ ta }}">{{ nd.label }}</text>
-        <text class="sk-t-val" x="{{ tx }}" y="{{ nd.y - 12 }}" text-anchor="{{ ta }}">{{ val(nd) }}{% if nd.num > 1 %} · {{ nd.pct1|pctraw }}{% endif %}</text>
+        {% if nd.num == 7 %}
+          {# Won: última coluna — rótulo em cima, alinhado à direita do nó. #}
+          {% set tx = nd.x + nd.w %}
+          <text class="sk-t-name sk-c-won" x="{{ tx }}" y="{{ nd.y - 76 }}" text-anchor="end">Won</text>
+          <text class="sk-t-big sk-c-won" x="{{ tx }}" y="{{ nd.y - 56 }}" text-anchor="end" data-drill="{{ nd.drill }}">{{ val(nd) }}</text>
+          <text class="sk-t-small" x="{{ tx }}" y="{{ nd.y - 40 }}" text-anchor="end">{{ nd.pct1|pctraw }} de quem entrou</text>
+          {% if nd.badge %}{{ pill(nd.badge, tx - nd.badge.w, nd.y - 32) }}{% endif %}
+        {% else %}
+          {% set cx = nd.x + nd.w / 2 %}
+          <text class="sk-t-name" x="{{ cx }}" y="{{ nd.y - 76 }}" text-anchor="middle">{{ nd.label }}</text>
+          <text class="sk-t-big {{ 'sk-c-blue' if nd.num == 1 else 'sk-c-green' }}" x="{{ cx }}" y="{{ nd.y - 56 }}" text-anchor="middle">{{ val(nd) }}</text>
+          <text class="sk-t-small" x="{{ cx }}" y="{{ nd.y - 40 }}" text-anchor="middle">{% if nd.num == 1 %}entraram no funil{% else %}{{ nd.pct1|pctraw }} do topo{% endif %}</text>
+          {% if nd.badge %}{{ pill(nd.badge, cx - nd.badge.w / 2, nd.y - 32) }}{% endif %}
+        {% endif %}
       {% endfor %}
 
-      {# Taxa de avanço no meio de cada faixa de cima. #}
+      {# Taxa de avanço no meio de cada faixa verde. #}
       {% for l in lay.links if l.kind == 'adv' and l.pct is not none %}
         <g class="sk-pill" data-drill="{{ l.drill }}" transform="translate({{ l.lx }},{{ l.ly }})">
-          <rect x="-26" y="-10" width="52" height="20" rx="10"/>
-          <text y="4">{{ l.pct|pctraw }}</text>
+          <rect x="-40" y="-11" width="80" height="22" rx="11"/>
+          <text y="4">{{ l.pct|pctraw }} seguem</text>
         </g>
       {% endfor %}
 
       {% for dp in lay.drops %}
-        <rect class="sk-drop sk-drop-{{ dp.kind }}" x="{{ dp.x }}" y="{{ dp.y }}" width="{{ dp.w }}" height="{{ dp.h }}"
-              rx="2" data-drill="{{ dp.drill }}"/>
-        <text class="sk-t-drop sk-t-{{ dp.kind }}" x="{{ dp.x + dp.w + 6 }}" y="{{ dp.y + 11 }}" data-drill="{{ dp.drill }}">
-          <tspan font-weight="700">{{ 'Lost' if dp.kind == 'lost' else 'Aberto' }}</tspan> {{ val(dp) }}{% if dp.pct is not none %} · {{ dp.pct|pctraw }}{% endif %}
-        </text>
+        <rect class="sk-node" x="{{ dp.x }}" y="{{ dp.y }}" width="{{ dp.w }}" height="{{ dp.h }}"
+              rx="2" style="fill:{{ dp.color }}" data-drill="{{ dp.drill }}"/>
+        {% set tx = dp.x + dp.w + 8 %}
+        {% if dp.kind == 'lost' %}
+          <text class="sk-t-name" x="{{ tx }}" y="{{ dp.y + 11 }}" data-drill="{{ dp.drill }}">Lost em {{ dp.label }}</text>
+          <text class="sk-t-mid sk-c-red" x="{{ tx }}" y="{{ dp.y + 27 }}" data-drill="{{ dp.drill }}">({{ val(dp) }})<tspan class="sk-t-small" dx="5">{% if dp.pct is not none %}{{ dp.pct|pctraw }} da etapa{% endif %}</tspan></text>
+          {{ pill(dp.badge, tx, dp.y + 33) }}
+        {% else %}
+          <text class="sk-t-small sk-t-open" x="{{ tx }}" y="{{ dp.y + 10 }}" data-drill="{{ dp.drill }}">Em aberto {{ val(dp) }}{% if dp.pct is not none %} · {{ dp.pct|pctraw }}{% endif %}</text>
+        {% endif %}
       {% endfor %}
     </svg>
   </div>
-  <p class="sk-note">Cada deal conta até a etapa mais funda que alcançou. Deal que pulou etapa conta como tendo passado pelas anteriores, por isso os números podem diferir do Funil II. A % ao lado de cada etapa é sobre quem entrou no funil; a % de cada queda e de cada avanço é sobre quem chegou naquela etapa.</p>
+  <p class="sk-note">Cada deal conta até a etapa mais funda que alcançou. Deal que pulou etapa conta como tendo passado pelas anteriores, por isso os números podem diferir do Funil II. A % de cada etapa é sobre quem entrou no funil; a % de cada queda e de cada avanço é sobre quem chegou naquela etapa.{% if prev_label %} <b>↑↓ variação vs safra anterior</b> ({{ prev_label }}) — a safra anterior teve mais tempo para fechar, então Won e Lost tendem a ser maiores nela.{% else %} Escolha um período fechado para ver a variação vs a safra anterior.{% endif %}</p>
   {% else %}
   <p class="ph">Nenhum deal entrou no funil nesse período com esses filtros.</p>
   {% endif %}
@@ -132,27 +156,31 @@
 <style>
   .sk-chips{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
   .sk-wrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
-  .sk{ display:block; width:100%; min-width:880px; height:auto; }
-  .sk-link{ fill-opacity:.28; cursor:pointer; transition:fill-opacity .12s ease; }
-  .sk-link:hover{ fill-opacity:.55; }
-  .sk-lost{ fill:#B91C1C; }
-  .sk-open{ fill:#94A3B8; }
+  .sk{ display:block; width:100%; min-width:1000px; height:auto; }
+  .sk-link{ fill-opacity:.55; cursor:pointer; transition:fill-opacity .12s ease; }
+  .sk-l-adv{ fill-opacity:.75; }
+  .sk-link:hover{ fill-opacity:.9; }
   .sk-node{ cursor:pointer; }
-  .sk-node:hover, .sk-drop:hover{ filter:brightness(1.1); }
-  .sk-drop{ cursor:pointer; }
-  .sk-drop-lost{ fill:#B91C1C; }
-  .sk-drop-open{ fill:#94A3B8; }
+  .sk-node:hover{ filter:brightness(1.1); }
   .sk text{ font-family:inherit; font-variant-numeric:tabular-nums; }
-  .sk-t-stage{ font-size:13px; font-weight:700; fill:var(--fg); }
-  .sk-t-won{ fill:#15803D; }
-  .sk-t-val{ font-size:12px; fill:var(--muted); }
-  .sk-t-drop{ font-size:11.5px; cursor:pointer; }
-  .sk-t-lost{ fill:#B91C1C; }
-  .sk-t-open{ fill:var(--muted); }
+  .sk [data-drill]{ cursor:pointer; }
+  .sk-t-name{ font-size:13px; font-weight:800; fill:var(--fg); }
+  .sk-t-big{ font-size:16px; font-weight:800; }
+  .sk-t-mid{ font-size:13px; font-weight:800; }
+  .sk-t-small{ font-size:11px; font-weight:500; fill:var(--muted); }
+  .sk-t-open{ font-size:11.5px; }
+  .sk-c-blue{ fill:#2747C9; }
+  .sk-c-green{ fill:#1E8E4E; }
+  .sk-c-won{ fill:#15803D; }
+  .sk-c-red{ fill:#C53030; }
+  .sk-badge rect{ fill-opacity:.14; }
+  .sk-badge text{ font-size:11px; font-weight:800; text-anchor:middle; }
+  .sk-badge.good rect{ fill:#1E8E4E; } .sk-badge.good text{ fill:#1E8E4E; }
+  .sk-badge.bad rect{ fill:#C53030; }  .sk-badge.bad text{ fill:#C53030; }
   .sk-pill{ cursor:pointer; }
-  .sk-pill rect{ fill:var(--surface); stroke:color-mix(in srgb, #2563EB 40%, transparent); }
-  .sk-pill text{ font-size:11px; font-weight:700; fill:#1D4ED8; text-anchor:middle; }
-  .sk-pill:hover rect{ fill:color-mix(in srgb, #2563EB 12%, var(--surface)); }
+  .sk-pill rect{ fill:var(--surface); stroke:color-mix(in srgb, #1E8E4E 45%, transparent); }
+  .sk-pill text{ font-size:11px; font-weight:800; fill:#1E8E4E; text-anchor:middle; }
+  .sk-pill:hover rect{ fill:color-mix(in srgb, #1E8E4E 12%, var(--surface)); }
   .sk-note{ font-size:12px; color:var(--muted); margin:10px 0 0; }
   .sk-cell{ cursor:pointer; border-bottom:1px dotted var(--muted-2); }
   .sk-cell:hover{ color:var(--accent, #2563EB); }

@@ -9126,22 +9126,34 @@ def pipeline_funnel2_deals():
 
 # ─────────────────────────────── Sankey do funil ─────────────────────────────
 # Mesma base do Funil II (pivot de 1ª entrada por etapa, mesmos filtros e mesmo
-# chip de base), mas olhando a SAFRA como um fluxo único: de tudo que entrou no
-# funil no período, quanto chegou em cada etapa, quanto caiu em cada uma (Lost)
-# e quanto está parado nela (em aberto), até o Won.
+# chip de base), mas olhando a SAFRA como um fluxo único, no estilo "como a
+# receita vira lucro": as origens (deal type) entram pela esquerda e se juntam
+# no topo do funil; o fluxo verde é o que segue etapa a etapa até o Won; em
+# cada etapa desce em vermelho o que caiu ali (Lost) e em cinza o que está
+# parado ali (em aberto).
 #
 # Cada deal é resumido pela etapa MAIS FUNDA que alcançou (`sk_max`, 7 = Won).
-# A etapa N do Sankey conta os deals com sk_max >= N — então o fluxo é
-# conservativo por construção (o que entra numa etapa ou avança, ou cai, ou está
-# parado ali) e a figura fecha. Consequência assumida: deal que PULOU etapa
-# (ex.: criado direto em Scoping) conta como tendo passado pelas anteriores. É o
-# que difere dos números do Funil II, que contam só entradas reais em cada etapa.
+# A etapa N conta os deals com sk_max >= N — o fluxo é conservativo por
+# construção (quem chega numa etapa ou avança, ou cai, ou está parado ali) e a
+# figura fecha. Consequência assumida: deal que PULOU etapa (ex.: criado direto
+# em Scoping) conta como tendo passado pelas anteriores. É o que difere dos
+# números do Funil II, que contam só entradas reais em cada etapa.
 #
 # Coorte:  base=stage   → 1ª entrada em QUALQUER etapa do funil dentro da janela
 #          base=created → deal criado dentro da janela
 # O destino (avançou/Won/Lost) não é recortado pela janela: vale até hoje.
+#
+# Variação (↑/↓): com período fechado, a mesma conta na janela imediatamente
+# anterior de mesmo tamanho. A safra anterior é mais madura (teve mais tempo de
+# fechar), então Won/Lost tendem a crescer nela — a nota da tela avisa.
 SANKEY_PESOS = [("n", "Deals"), ("amt", "Valor")]
 _SK_STEPS = list(range(1, 7))            # etapas do funil; 7 = Won
+# Origens = deal type. Cores na família azul do "receitas" da referência.
+_SK_SRC = [("acq", "Aquisição", "#2747C9"), ("exp", "Expansão", "#5B7BE6"),
+           ("out", "Sem tipo", "#9DB0F0")]
+_SK_SRC_RAW = {"Aquisition": "acq", "Up & cross sell": "exp"}
+_SK_BLUE, _SK_GREEN_N, _SK_GREEN_L, _SK_WON = "#2747C9", "#1E8E4E", "#5CC77D", "#15803D"
+_SK_RED, _SK_GREY = "#D64545", "#A3AEBD"
 
 
 def _sk_peso() -> str:
@@ -9150,8 +9162,9 @@ def _sk_peso() -> str:
 
 
 def _sk_frame(piv, lo, hi, mode):
-    """Coorte do Sankey com `sk_max` (etapa mais funda, 7=Won) e `sk_out`
-    (won / lost / open). Deal sem nenhuma etapa do funil e sem Won fica fora."""
+    """Coorte do Sankey com `sk_max` (etapa mais funda, 7=Won), `sk_out`
+    (won / lost / open) e `sk_src` (acq / exp / out). Deal sem nenhuma etapa do
+    funil e sem Won fica fora."""
     stage_cols = [f"s{n}" for n in _SK_STEPS]
     if mode == "created":
         m = _f2_created_mask(piv, lo, hi)
@@ -9174,15 +9187,19 @@ def _sk_frame(piv, lo, hi, mode):
     d["sk_out"] = "open"
     d.loc[d["s99"].notna(), "sk_out"] = "lost"
     d.loc[won, "sk_out"] = "won"
+    d["sk_src"] = d["deal_type"].map(_SK_SRC_RAW).fillna("out")
     return d[d["sk_max"] > 0]
 
 
 def _sk_mask(d, kind, num):
     """Máscara de um elemento do Sankey — a mesma do número e do drill.
+      src   → deals da origem `num` (acq/exp/out)
       node  → deals que chegaram na etapa `num` (sk_max >= num; 7 = Won)
       adv   → da etapa `num`, os que passaram pra seguinte
       lost  → caíram na etapa `num` (pararam nela e estão perdidos)
       open  → pararam na etapa `num` e seguem abertos"""
+    if kind == "src":
+        return d["sk_src"] == num
     if kind == "node":
         return d["sk_max"] >= num
     if kind == "adv":
@@ -9192,19 +9209,48 @@ def _sk_mask(d, kind, num):
     return pd.Series(False, index=d.index)
 
 
-def _sk_layout(vals, color_of):
+def _sk_vals(d):
+    """(contagens, valores) de todos os elementos do Sankey para uma coorte."""
+    counts, amts = {}, {}
+    keys = [("src", k) for k, _l, _c in _SK_SRC]
+    for n in _SK_STEPS:
+        keys += [("node", n), ("adv", n), ("lost", n), ("open", n)]
+    keys.append(("node", 7))
+    for key in keys:
+        m = _sk_mask(d, *key)
+        counts[key] = int(m.sum())
+        amts[key] = float(d.loc[m, "amount"].sum())
+    return counts, amts
+
+
+def _sk_badge(cur, prev, bad_if_up=False):
+    """Pílula de variação vs janela anterior: ↑/↓ e %, verde quando é bom."""
+    if prev is None or not prev or cur is None:
+        return None
+    pct = 100.0 * (cur - prev) / prev
+    up = pct >= 0
+    txt = f"{'↑' if up else '↓'} {abs(pct):.0f}%"
+    return {"txt": txt, "good": (up != bad_if_up) or round(pct) == 0,
+            "w": 14 + 6.6 * len(txt)}
+
+
+def _sk_layout(vals, srcs):
     """Geometria do SVG, calculada aqui pra figura bater exatamente com os
     números. `vals[(kind, num)]` é o peso (deals ou valor) de cada elemento.
 
-    Etapas em colunas com o topo alinhado (a silhueta afunila da esquerda pra
-    direita); o fluxo que avança é a faixa reta de cima; o que cai desce em curva
-    pra dois nós entre a etapa e a seguinte: Lost (vermelho) e Em aberto (cinza)."""
-    W, PAD_L, NW = 1180, 24, 16
-    TOP, H_TOP, GAP = 64, 300, 70
-    step = (W - PAD_L - NW - 24) / 6.0
+    Origens empilhadas à esquerda, convergindo no topo do funil (Scheduled).
+    Etapas em colunas com o topo alinhado: a faixa verde de cima é o que avança
+    e afina da esquerda pra direita até o Won. O que sai de cada etapa desce em
+    curva pra logo abaixo da faixa — Lost (vermelho) e Em aberto (cinza) — em
+    escada, acompanhando o afunilamento."""
+    W, NW = 1500, 14
+    X_SRC, X_1, R_PAD = 170, 300, 40
+    TOP, H_TOP, GAP = 120, 330, 34
+    step = (W - R_PAD - X_1 - NW) / 6.0
     v1 = vals[("node", 1)]
     if v1 <= 0:
         return None
+    src_gap = 18
     s = H_TOP / v1
 
     def h(v):            # altura mínima visível pra valor > 0
@@ -9215,40 +9261,64 @@ def _sk_layout(vals, color_of):
         return (f"M{x0:.1f},{y0a:.1f} C{xm:.1f},{y0a:.1f} {xm:.1f},{y1a:.1f} {x1:.1f},{y1a:.1f} "
                 f"L{x1:.1f},{y1b:.1f} C{xm:.1f},{y1b:.1f} {xm:.1f},{y0b:.1f} {x0:.1f},{y0b:.1f} Z")
 
-    y_bot = TOP + H_TOP + GAP
-    nodes, links, drops = [], [], []
-    max_drop = 0.0
+    def xcol(n):
+        return X_1 + (n - 1) * step
+
+    nodes, links, drops, sources = [], [], [], []
+    bottom = TOP + h(v1)
+
+    # Origens → topo do funil. Empilhadas com folga entre si; chegam coladas.
+    y_s, y_in = TOP + 10, TOP
+    for k, lbl, color in srcs:
+        v = vals[("src", k)]
+        if v <= 0:
+            continue
+        hh = h(v)
+        sources.append({"kind": "src", "num": k, "label": lbl, "color": color,
+                        "x": X_SRC, "y": y_s, "w": NW, "h": hh, "v": v,
+                        "pct": 100.0 * v / v1})
+        links.append({"kind": "src", "num": k, "v": v, "color": color,
+                      "d": band(X_SRC + NW, y_s, y_s + hh, X_1, y_in, y_in + hh)})
+        y_in += hh
+        y_s += max(hh, 76) + src_gap
+    bottom = max(bottom, y_s)
+
     for n in list(_SK_STEPS) + [7]:
-        x = PAD_L + (n - 1) * step
+        x = xcol(n)
         v = vals[("node", n)]
-        nodes.append({"kind": "node", "num": n, "x": x, "y": TOP, "w": NW, "h": h(v), "v": v,
-                      "pct1": 100.0 * v / v1, "color": color_of(n)})
+        color = _SK_BLUE if n == 1 else (_SK_WON if n == 7 else _SK_GREEN_N)
+        nodes.append({"kind": "node", "num": n, "x": x, "y": TOP, "w": NW, "h": h(v),
+                      "v": v, "pct1": 100.0 * v / v1, "color": color})
         if n == 7:
             break
-        v_adv, v_lost, v_open = vals[("adv", n)], vals[("lost", n)], vals[("open", n)]
-        x_next = PAD_L + n * step
+        v_adv = vals[("adv", n)]
         if v_adv > 0:
-            links.append({"kind": "adv", "num": n, "v": v_adv, "color": color_of(n),
+            links.append({"kind": "adv", "num": n, "v": v_adv, "color": _SK_GREEN_L,
                           "pct": 100.0 * v_adv / v if v else None,
-                          "lx": (x + NW + x_next) / 2, "ly": TOP + h(v_adv) / 2,
-                          "d": band(x + NW, TOP, TOP + h(v_adv), x_next, TOP, TOP + h(v_adv))})
-        # Nós de queda entre esta etapa e a seguinte.
-        xd = x + NW + step * 0.40
+                          "lx": (x + NW + xcol(n + 1)) / 2, "ly": TOP + h(v_adv) / 2,
+                          "d": band(x + NW, TOP, TOP + h(v_adv), xcol(n + 1), TOP, TOP + h(v_adv))})
+        # Quedas: logo abaixo de onde a faixa verde passa a ter a altura da
+        # etapa seguinte — a escada acompanha o funil.
+        xd = x + NW + step * 0.12      # perto da etapa: sobra espaço pro rótulo
         y_src = TOP + h(v_adv)
-        y_dst = y_bot
-        for kind, vv in (("lost", v_lost), ("open", v_open)):
+        y_dst = TOP + h(v_adv) + GAP
+        for kind in ("lost", "open"):
+            vv = vals[(kind, n)]
             if vv <= 0:
                 continue
             hh = h(vv)
             links.append({"kind": kind, "num": n, "v": vv,
+                          "color": _SK_RED if kind == "lost" else _SK_GREY,
                           "d": band(x + NW, y_src, y_src + hh, xd, y_dst, y_dst + hh)})
-            drops.append({"kind": kind, "num": n, "x": xd, "y": y_dst, "w": NW * 0.75,
-                          "h": hh, "v": vv, "pct": 100.0 * vv / v if v else None})
+            drops.append({"kind": kind, "num": n, "x": xd, "y": y_dst, "w": NW,
+                          "h": hh, "v": vv, "pct": 100.0 * vv / v if v else None,
+                          "color": _SK_RED if kind == "lost" else _SK_GREY})
             y_src += hh
-            y_dst += max(hh + 8, 18)      # 18 = espaço do rótulo de texto
-        max_drop = max(max_drop, y_dst - y_bot)
-    return {"W": W, "H": y_bot + max_drop + 40, "nodes": nodes, "links": links,
-            "drops": drops, "top": TOP, "y_bot": y_bot}
+            # Lost leva 3 linhas de rótulo; Em aberto, 1.
+            y_dst += max(hh + 10, 52 if kind == "lost" else 22)
+        bottom = max(bottom, y_dst)
+    return {"W": W, "H": bottom + 30, "nodes": nodes, "links": links,
+            "drops": drops, "sources": sources, "top": TOP}
 
 
 @app.route("/pipeline/funnel-sankey")
@@ -9286,23 +9356,33 @@ def _pipeline_sankey_page(grain="ae"):
               "url": url_for(request.endpoint, peso=k, base=mode, **_args)}
              for k, lbl in SANKEY_PESOS]
 
-    vals, counts, amts = {}, {}, {}
-    for n in list(_SK_STEPS) + [7]:
-        kinds = ("node",) if n == 7 else ("node", "adv", "lost", "open")
-        for kind in kinds:
-            m = _sk_mask(d, kind, n)
-            counts[(kind, n)] = int(m.sum())
-            amts[(kind, n)] = float(d.loc[m, "amount"].sum())
+    counts, amts = _sk_vals(d)
     vals = amts if peso == "amt" else counts
 
-    lay = _sk_layout(vals, lambda n: _F2_COLORS[n])
+    # Janela anterior de mesmo tamanho (só com período fechado nas duas pontas).
+    prev_vals, prev_label = None, None
+    if lo is not None and hi is not None:
+        span = hi - lo
+        p_lo, p_hi = lo - span, lo
+        pc, pa = _sk_vals(_sk_frame(piv, p_lo, p_hi, mode))
+        prev_vals = pa if peso == "amt" else pc
+        prev_label = (f"{_fmt_date_short(p_lo.date())} → "
+                      f"{_fmt_date_short((p_hi - pd.Timedelta(days=1)).date())}")
+
+    lay = _sk_layout(vals, _SK_SRC)
     if lay:
-        for el in lay["nodes"] + lay["links"] + lay["drops"]:
-            k = el["kind"]
-            el["n"] = counts[(k, el["num"])]
-            el["amt"] = amts[(k, el["num"])]
-            el["label"] = _F2_LABEL[el["num"]]
-            el["drill"] = _drill(k, el["num"])
+        for el in lay["sources"] + lay["nodes"] + lay["links"] + lay["drops"]:
+            key = (el["kind"], el["num"])
+            el["n"] = counts[key]
+            el["amt"] = amts[key]
+            if el["kind"] != "src":
+                el["label"] = _F2_LABEL[el["num"]]
+            else:
+                el["label"] = dict((k, l) for k, l, _c in _SK_SRC)[el["num"]]
+            el["drill"] = _drill(el["kind"], el["num"])
+            el["badge"] = (_sk_badge(vals[key], prev_vals.get(key),
+                                     bad_if_up=el["kind"] in ("lost", "open"))
+                           if prev_vals and el["kind"] in ("src", "node", "lost") else None)
 
     # Tabela: uma linha por etapa, com as 3 saídas e o % sobre quem chegou nela.
     rows = []
@@ -9326,7 +9406,7 @@ def _pipeline_sankey_page(grain="ae"):
         "pipeline_sankey.html", ctx=ctx, grain=grain, lay=lay, rows=rows,
         peso=peso, bases=bases, pesos=pesos, base_label=_f2_base_label(mode)
         if mode == "created" else "entrada no funil em",
-        period_label=_f2_period_label(f),
+        period_label=_f2_period_label(f), prev_label=prev_label,
         total=total, total_amt=amts[("node", 1)],
         won=won, won_amt=amts[("node", 7)], lost_tot=lost_tot, open_tot=open_tot,
         won_pct=(100.0 * won / total) if total else None,
@@ -9337,24 +9417,30 @@ def _pipeline_sankey_page(grain="ae"):
 
 @app.route("/pipeline/funnel-sankey/deals")
 def pipeline_sankey_deals():
-    """Drill do Sankey: os deals por trás de uma etapa, faixa ou nó de queda."""
+    """Drill do Sankey: os deals por trás de uma origem, etapa, faixa ou queda."""
     ctx_f = get_filters()
     mode = _f2_base_mode()
     piv = _f2_scope(ctx_f)
     lo, hi = _f2_window(ctx_f)
     d = _sk_frame(piv, lo, hi, mode)
     kind = (request.args.get("kind") or "node").strip()
-    num = _safe_int(request.args.get("stage"), 0)
-    if kind not in ("node", "adv", "lost", "open") or num not in _F2_LABEL or num == 99:
-        return jsonify(_empty_drill(""))
+    raw = (request.args.get("stage") or "").strip()
+    src_lbl = {k: l for k, l, _c in _SK_SRC}
+    if kind == "src":
+        if raw not in src_lbl:
+            return jsonify(_empty_drill(""))
+        num, title = raw, f"Origem: {src_lbl[raw]}"
+    else:
+        num = _safe_int(raw, 0)
+        if kind not in ("node", "adv", "lost", "open") or num not in _F2_LABEL or num == 99:
+            return jsonify(_empty_drill(""))
+        lbl = _F2_LABEL[num]
+        title = {"node": f"Chegaram em {lbl}",
+                 "adv": f"{lbl} → {_F2_LABEL.get(num + 1, 'Won')}",
+                 "lost": f"Caíram em {lbl} (Lost)",
+                 "open": f"Parados em {lbl} (em aberto)"}[kind]
     sel = d[_sk_mask(d, kind, num)]
-    lbl = _F2_LABEL[num]
-    title = {"node": f"Chegaram em {lbl}",
-             "adv": f"{lbl} → {_F2_LABEL.get(num + 1, 'Won')}",
-             "lost": f"Caíram em {lbl} (Lost)",
-             "open": f"Parados em {lbl} (em aberto)"}[kind]
     _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
-    _fim = {7: "Won"}
     rows = []
     for _, r in sel.iterrows():
         rows.append({
@@ -9362,7 +9448,7 @@ def pipeline_sankey_deals():
             "deal_url":  _hs_deal_url(r.get("deal_id")),
             "ae":        r.get("account_executive") or "—",
             "tipo":      _tipo.get(r.get("deal_type"), r.get("deal_type") or "—"),
-            "ate":       _fim.get(int(r["sk_max"]), _F2_LABEL.get(int(r["sk_max"]), "—")),
+            "ate":       _F2_LABEL.get(int(r["sk_max"]), "—"),
             "status":    {"won": "Won", "lost": "Lost", "open": "Em aberto"}[r["sk_out"]],
             "amount":    float(r.get("amount") or 0),
         })
@@ -9381,7 +9467,6 @@ def pipeline_sankey_deals():
         ],
         "rows": rows,
     })
-
 
 @app.route("/pipeline/wow/early")
 def pipeline_wow_early():
