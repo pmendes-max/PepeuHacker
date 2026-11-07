@@ -162,6 +162,7 @@
     <a href="{{ url_for('mx_pipeline_legal', **ctx.filters) }}"    class="{% if p == '/mx/pipeline/legal' %}active{% endif %}">Legal</a>
     <a href="{{ url_for('mx_pipeline_funnel', **ctx.filters) }}"   class="{% if p == '/mx/pipeline/funnel' %}active{% endif %}">Funil</a>
     <a href="{{ url_for('mx_pipeline_funnel2', **ctx.filters) }}"  class="{% if p == '/mx/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('mx_pipeline_sankey', **ctx.filters) }}"   class="{% if p == '/mx/pipeline/funnel-sankey' %}active{% endif %}" title="Fluxo da safra pelo funil: onde os deals caem e onde avançam até o Won">Sankey</a>
     <a href="{{ url_for('mx_pipeline_visits', **ctx.filters) }}"   class="{% if p == '/mx/pipeline/visits' %}active{% endif %}">Visitas</a>
   </div>
 </div>
@@ -211,6 +212,7 @@
     <a href="{{ url_for('pipeline_legal',     **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/legal'     %}active{% endif %}">Legal</a>
     <a href="{{ url_for('pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel'    %}active{% endif %}">Funil</a>
     <a href="{{ url_for('pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('pipeline_sankey',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/funnel-sankey' %}active{% endif %}" title="Fluxo da safra pelo funil: onde os deals caem e onde avançam até o Won">Sankey</a>
     <a href="{{ url_for('pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/pipeline/visits'    %}active{% endif %}">Visitas</a>
   </div>
 </div>
@@ -230,6 +232,7 @@
     <a href="{{ url_for('leaders_pipeline_legal',     **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/legal'     %}active{% endif %}">Legal</a>
     <a href="{{ url_for('leaders_pipeline_funnel',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel'    %}active{% endif %}">Funil</a>
     <a href="{{ url_for('leaders_pipeline_funnel2',   **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel-ii' %}active{% endif %}">Funil II</a>
+    <a href="{{ url_for('leaders_pipeline_sankey',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/funnel-sankey' %}active{% endif %}" title="Fluxo da safra pelo funil: onde os deals caem e onde avançam até o Won">Sankey</a>
     <a href="{{ url_for('leaders_pipeline_visits',    **ctx.filters) }}"   class="{% if ctx.current_path == '/leaders/pipeline/visits'    %}active{% endif %}">Visitas</a>
   </div>
 </div>

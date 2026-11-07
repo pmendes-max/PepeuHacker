@@ -2389,6 +2389,10 @@ PIPELINE_DOD_PATHS = ("/leaders/pipeline/dod", "/leaders/pipeline/wow")
 # ENTROU na etapa. Janela aberta (sem datas) = histórico inteiro, de propósito.
 FUNNEL2_PATHS = ("/pipeline/funnel-ii", "/leaders/pipeline/funnel-ii")
 
+# Sankey do funil — mesma base do Funil II (coorte por entrada no funil ou por
+# criação), mesma natureza de período.
+SANKEY_PATHS = ("/pipeline/funnel-sankey", "/leaders/pipeline/funnel-sankey")
+
 # WoW do Forecast — o período recorta o QUARTER (close date), igual à aba
 # Forecast e ao Histórico dela; o par de domingos comparados é escolhido no chip
 # da própria página (?par=), não no date-picker. Por isso NÃO entra nas listas de
@@ -2450,6 +2454,7 @@ def filter_presets_for_path(presets: list[dict], path: str) -> list[dict]:
 PERIOD_LABEL_BY_PATH = {**{p: "Close Date" for p in COVERAGE_PATHS},
                         **{p: "Domingos comparados" for p in WOW_PATHS},
                         **{p: "Entrada na etapa" for p in FUNNEL2_PATHS},
+                        **{p: "Entrada no funil" for p in SANKEY_PATHS},
                         **{p: "Fechamento do deal" for p in LEGAL_PATHS}}
 
 
@@ -4429,7 +4434,7 @@ def _extra_filters_for_path(path: str) -> list:
     if path == "/mx/pipeline":
         return [{"key": k, "label": v["label"], "opts": _mx_dim_meta(k)}
                 for k, v in MX_DIMS.items()]
-    if (_rota_base(path) in FUNNEL2_PATHS + WOW_PATHS + WOW_HIST_PATHS
+    if (_rota_base(path) in FUNNEL2_PATHS + SANKEY_PATHS + WOW_PATHS + WOW_HIST_PATHS
             + FORECAST_WOW_PATHS + FORECAST_PATHS + PIPELINE_DOD_PATHS):
         return [{"key": "dtype", "label": _PT_DIMS["dtype"]["label"],
                  "opts": _pt_dim_meta("dtype")}]
@@ -4448,7 +4453,8 @@ def base_context():
     period_label = PERIOD_LABEL_BY_PATH.get(_rota_base(request.path), "Período")
     # No Funil II o que o período recorta é escolhido no chip da página, então o
     # rótulo do filtro segue o chip em vez de ser fixo por rota.
-    if _rota_base(request.path) in FUNNEL2_PATHS and request.args.get("base") == "created":
+    if (_rota_base(request.path) in FUNNEL2_PATHS + SANKEY_PATHS
+            and request.args.get("base") == "created"):
         period_label = "Criação do deal"
     active_preset = request.args.get("preset", "")
 
@@ -9112,6 +9118,265 @@ def pipeline_funnel2_deals():
             {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
             {"key": "ae",        "label": "AE"},
             {"key": "tipo",      "label": "Tipo"},
+            {"key": "amount",    "label": "MRR", "type": "money"},
+        ],
+        "rows": rows,
+    })
+
+
+# ─────────────────────────────── Sankey do funil ─────────────────────────────
+# Mesma base do Funil II (pivot de 1ª entrada por etapa, mesmos filtros e mesmo
+# chip de base), mas olhando a SAFRA como um fluxo único: de tudo que entrou no
+# funil no período, quanto chegou em cada etapa, quanto caiu em cada uma (Lost)
+# e quanto está parado nela (em aberto), até o Won.
+#
+# Cada deal é resumido pela etapa MAIS FUNDA que alcançou (`sk_max`, 7 = Won).
+# A etapa N do Sankey conta os deals com sk_max >= N — então o fluxo é
+# conservativo por construção (o que entra numa etapa ou avança, ou cai, ou está
+# parado ali) e a figura fecha. Consequência assumida: deal que PULOU etapa
+# (ex.: criado direto em Scoping) conta como tendo passado pelas anteriores. É o
+# que difere dos números do Funil II, que contam só entradas reais em cada etapa.
+#
+# Coorte:  base=stage   → 1ª entrada em QUALQUER etapa do funil dentro da janela
+#          base=created → deal criado dentro da janela
+# O destino (avançou/Won/Lost) não é recortado pela janela: vale até hoje.
+SANKEY_PESOS = [("n", "Deals"), ("amt", "Valor")]
+_SK_STEPS = list(range(1, 7))            # etapas do funil; 7 = Won
+
+
+def _sk_peso() -> str:
+    p = (request.args.get("peso") or "").strip()
+    return p if p in dict(SANKEY_PESOS) else "n"
+
+
+def _sk_frame(piv, lo, hi, mode):
+    """Coorte do Sankey com `sk_max` (etapa mais funda, 7=Won) e `sk_out`
+    (won / lost / open). Deal sem nenhuma etapa do funil e sem Won fica fora."""
+    stage_cols = [f"s{n}" for n in _SK_STEPS]
+    if mode == "created":
+        m = _f2_created_mask(piv, lo, hi)
+    else:
+        first = piv[stage_cols + ["s7"]].min(axis=1)
+        m = first.notna()
+        if lo is not None:
+            m &= first >= lo
+        if hi is not None:
+            m &= first < hi
+        m = m.fillna(False)
+    d = piv[m].copy()
+    reached = d[stage_cols].notna().to_numpy()
+    deepest = pd.Series(0, index=d.index)
+    for i, n in enumerate(_SK_STEPS):
+        deepest = deepest.where(~reached[:, i], n)
+    won = d["s7"].notna()
+    deepest = deepest.where(~won, 7)
+    d["sk_max"] = deepest.astype(int)
+    d["sk_out"] = "open"
+    d.loc[d["s99"].notna(), "sk_out"] = "lost"
+    d.loc[won, "sk_out"] = "won"
+    return d[d["sk_max"] > 0]
+
+
+def _sk_mask(d, kind, num):
+    """Máscara de um elemento do Sankey — a mesma do número e do drill.
+      node  → deals que chegaram na etapa `num` (sk_max >= num; 7 = Won)
+      adv   → da etapa `num`, os que passaram pra seguinte
+      lost  → caíram na etapa `num` (pararam nela e estão perdidos)
+      open  → pararam na etapa `num` e seguem abertos"""
+    if kind == "node":
+        return d["sk_max"] >= num
+    if kind == "adv":
+        return d["sk_max"] >= num + 1
+    if kind in ("lost", "open"):
+        return (d["sk_max"] == num) & (d["sk_out"] == kind)
+    return pd.Series(False, index=d.index)
+
+
+def _sk_layout(vals, color_of):
+    """Geometria do SVG, calculada aqui pra figura bater exatamente com os
+    números. `vals[(kind, num)]` é o peso (deals ou valor) de cada elemento.
+
+    Etapas em colunas com o topo alinhado (a silhueta afunila da esquerda pra
+    direita); o fluxo que avança é a faixa reta de cima; o que cai desce em curva
+    pra dois nós entre a etapa e a seguinte: Lost (vermelho) e Em aberto (cinza)."""
+    W, PAD_L, NW = 1180, 24, 16
+    TOP, H_TOP, GAP = 64, 300, 70
+    step = (W - PAD_L - NW - 24) / 6.0
+    v1 = vals[("node", 1)]
+    if v1 <= 0:
+        return None
+    s = H_TOP / v1
+
+    def h(v):            # altura mínima visível pra valor > 0
+        return max(v * s, 1.5) if v > 0 else 0.0
+
+    def band(x0, y0a, y0b, x1, y1a, y1b):
+        xm = (x0 + x1) / 2
+        return (f"M{x0:.1f},{y0a:.1f} C{xm:.1f},{y0a:.1f} {xm:.1f},{y1a:.1f} {x1:.1f},{y1a:.1f} "
+                f"L{x1:.1f},{y1b:.1f} C{xm:.1f},{y1b:.1f} {xm:.1f},{y0b:.1f} {x0:.1f},{y0b:.1f} Z")
+
+    y_bot = TOP + H_TOP + GAP
+    nodes, links, drops = [], [], []
+    max_drop = 0.0
+    for n in list(_SK_STEPS) + [7]:
+        x = PAD_L + (n - 1) * step
+        v = vals[("node", n)]
+        nodes.append({"kind": "node", "num": n, "x": x, "y": TOP, "w": NW, "h": h(v), "v": v,
+                      "pct1": 100.0 * v / v1, "color": color_of(n)})
+        if n == 7:
+            break
+        v_adv, v_lost, v_open = vals[("adv", n)], vals[("lost", n)], vals[("open", n)]
+        x_next = PAD_L + n * step
+        if v_adv > 0:
+            links.append({"kind": "adv", "num": n, "v": v_adv, "color": color_of(n),
+                          "pct": 100.0 * v_adv / v if v else None,
+                          "lx": (x + NW + x_next) / 2, "ly": TOP + h(v_adv) / 2,
+                          "d": band(x + NW, TOP, TOP + h(v_adv), x_next, TOP, TOP + h(v_adv))})
+        # Nós de queda entre esta etapa e a seguinte.
+        xd = x + NW + step * 0.40
+        y_src = TOP + h(v_adv)
+        y_dst = y_bot
+        for kind, vv in (("lost", v_lost), ("open", v_open)):
+            if vv <= 0:
+                continue
+            hh = h(vv)
+            links.append({"kind": kind, "num": n, "v": vv,
+                          "d": band(x + NW, y_src, y_src + hh, xd, y_dst, y_dst + hh)})
+            drops.append({"kind": kind, "num": n, "x": xd, "y": y_dst, "w": NW * 0.75,
+                          "h": hh, "v": vv, "pct": 100.0 * vv / v if v else None})
+            y_src += hh
+            y_dst += max(hh + 8, 18)      # 18 = espaço do rótulo de texto
+        max_drop = max(max_drop, y_dst - y_bot)
+    return {"W": W, "H": y_bot + max_drop + 40, "nodes": nodes, "links": links,
+            "drops": drops, "top": TOP, "y_bot": y_bot}
+
+
+@app.route("/pipeline/funnel-sankey")
+def pipeline_sankey():
+    return _pipeline_sankey_page("ae")
+
+
+@app.route("/leaders/pipeline/funnel-sankey")
+def leaders_pipeline_sankey():
+    return _pipeline_sankey_page("leader")
+
+
+def _pipeline_sankey_page(grain="ae"):
+    ctx = base_context()
+    f = ctx["filters"]
+    mode = _f2_base_mode()
+    peso = _sk_peso()
+    piv = _f2_scope(f, force=request.args.get("refresh") == "1")
+    lo, hi = _f2_window(f)
+    d = _sk_frame(piv, lo, hi, mode)
+
+    keep = {k: v for k, v in f.items() if v and k in
+            ("date_from", "date_to", "leader", "ae", "dtype", "money")}
+    keep["base"] = mode
+
+    def _drill(kind, num):
+        return url_for("pipeline_sankey_deals", kind=kind, stage=num, **keep)
+
+    _args = {k: v for k, v in request.args.items() if v and k not in ("base", "peso", "refresh")}
+    _blbl = {"stage": "Entrada no funil"}       # aqui a coorte é por entrada no FUNIL
+    bases = [{"key": k, "label": _blbl.get(k, lbl), "active": k == mode,
+              "url": url_for(request.endpoint, base=k, peso=peso, **_args)}
+             for k, lbl in _F2_BASES]
+    pesos = [{"key": k, "label": lbl, "active": k == peso,
+              "url": url_for(request.endpoint, peso=k, base=mode, **_args)}
+             for k, lbl in SANKEY_PESOS]
+
+    vals, counts, amts = {}, {}, {}
+    for n in list(_SK_STEPS) + [7]:
+        kinds = ("node",) if n == 7 else ("node", "adv", "lost", "open")
+        for kind in kinds:
+            m = _sk_mask(d, kind, n)
+            counts[(kind, n)] = int(m.sum())
+            amts[(kind, n)] = float(d.loc[m, "amount"].sum())
+    vals = amts if peso == "amt" else counts
+
+    lay = _sk_layout(vals, lambda n: _F2_COLORS[n])
+    if lay:
+        for el in lay["nodes"] + lay["links"] + lay["drops"]:
+            k = el["kind"]
+            el["n"] = counts[(k, el["num"])]
+            el["amt"] = amts[(k, el["num"])]
+            el["label"] = _F2_LABEL[el["num"]]
+            el["drill"] = _drill(k, el["num"])
+
+    # Tabela: uma linha por etapa, com as 3 saídas e o % sobre quem chegou nela.
+    rows = []
+    for n in _SK_STEPS:
+        base_n = counts[("node", n)]
+        r = {"num": n, "label": _F2_LABEL[n], "color": _F2_COLORS[n],
+             "n": base_n, "amt": amts[("node", n)], "drill": _drill("node", n)}
+        for kind in ("adv", "lost", "open"):
+            r[kind] = counts[(kind, n)]
+            r[f"{kind}_amt"] = amts[(kind, n)]
+            r[f"{kind}_pct"] = (100.0 * counts[(kind, n)] / base_n) if base_n else None
+            r[f"{kind}_drill"] = _drill(kind, n)
+        r["next_label"] = _F2_LABEL[n + 1]
+        rows.append(r)
+
+    total = counts[("node", 1)]
+    won = counts[("node", 7)]
+    lost_tot = int((d["sk_out"] == "lost").sum())
+    open_tot = total - won - lost_tot
+    return render_template(
+        "pipeline_sankey.html", ctx=ctx, grain=grain, lay=lay, rows=rows,
+        peso=peso, bases=bases, pesos=pesos, base_label=_f2_base_label(mode)
+        if mode == "created" else "entrada no funil em",
+        period_label=_f2_period_label(f),
+        total=total, total_amt=amts[("node", 1)],
+        won=won, won_amt=amts[("node", 7)], lost_tot=lost_tot, open_tot=open_tot,
+        won_pct=(100.0 * won / total) if total else None,
+        win_rate=(100.0 * won / (won + lost_tot)) if (won + lost_tot) else None,
+        drill_total=_drill("node", 1), drill_won=_drill("node", 7),
+    )
+
+
+@app.route("/pipeline/funnel-sankey/deals")
+def pipeline_sankey_deals():
+    """Drill do Sankey: os deals por trás de uma etapa, faixa ou nó de queda."""
+    ctx_f = get_filters()
+    mode = _f2_base_mode()
+    piv = _f2_scope(ctx_f)
+    lo, hi = _f2_window(ctx_f)
+    d = _sk_frame(piv, lo, hi, mode)
+    kind = (request.args.get("kind") or "node").strip()
+    num = _safe_int(request.args.get("stage"), 0)
+    if kind not in ("node", "adv", "lost", "open") or num not in _F2_LABEL or num == 99:
+        return jsonify(_empty_drill(""))
+    sel = d[_sk_mask(d, kind, num)]
+    lbl = _F2_LABEL[num]
+    title = {"node": f"Chegaram em {lbl}",
+             "adv": f"{lbl} → {_F2_LABEL.get(num + 1, 'Won')}",
+             "lost": f"Caíram em {lbl} (Lost)",
+             "open": f"Parados em {lbl} (em aberto)"}[kind]
+    _tipo = {"Aquisition": "Aquisição", "Up & cross sell": "Expansão"}
+    _fim = {7: "Won"}
+    rows = []
+    for _, r in sel.iterrows():
+        rows.append({
+            "deal_name": r.get("deal_name") or "—",
+            "deal_url":  _hs_deal_url(r.get("deal_id")),
+            "ae":        r.get("account_executive") or "—",
+            "tipo":      _tipo.get(r.get("deal_type"), r.get("deal_type") or "—"),
+            "ate":       _fim.get(int(r["sk_max"]), _F2_LABEL.get(int(r["sk_max"]), "—")),
+            "status":    {"won": "Won", "lost": "Lost", "open": "Em aberto"}[r["sk_out"]],
+            "amount":    float(r.get("amount") or 0),
+        })
+    rows.sort(key=lambda x: x["amount"], reverse=True)
+    base_lbl = _f2_base_label(mode) if mode == "created" else "entrada no funil em"
+    return jsonify({
+        "title": f"{title} · {base_lbl} {_f2_period_label(ctx_f)}",
+        "subtitle": _drill_money_subtitle(len(rows), sum(x["amount"] for x in rows)),
+        "columns": [
+            {"key": "deal_name", "label": "Deal", "wrap": True, "link": "deal_url"},
+            {"key": "ae",        "label": "AE"},
+            {"key": "tipo",      "label": "Tipo"},
+            {"key": "ate",       "label": "Chegou até"},
+            {"key": "status",    "label": "Status"},
             {"key": "amount",    "label": "MRR", "type": "money"},
         ],
         "rows": rows,
@@ -16101,6 +16366,8 @@ _MX_ESPELHO = [
     ("/mx/pipeline/legal/deals",      "mx_pipeline_legal_deals", "pipeline_legal_deals"),
     ("/mx/pipeline/funnel-ii",        "mx_pipeline_funnel2",     "pipeline_funnel2"),
     ("/mx/pipeline/funnel-ii/deals",  "mx_pipeline_funnel2_deals","pipeline_funnel2_deals"),
+    ("/mx/pipeline/funnel-sankey",    "mx_pipeline_sankey",      "pipeline_sankey"),
+    ("/mx/pipeline/funnel-sankey/deals","mx_pipeline_sankey_deals","pipeline_sankey_deals"),
     ("/mx/pipeline/visits",           "mx_pipeline_visits",      "pipeline_visits"),
 ]
 def _regra_do_endpoint(nome):

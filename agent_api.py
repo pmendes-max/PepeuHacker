@@ -221,6 +221,10 @@ _TELAS = {
     "/pipeline/funnel-ii": ("Funil II",
                             "Conversão por etapa (→ próxima, → Won, → Lost). base=created conta pela criação do "
                             "deal; dtype filtra o deal type."),
+    "/pipeline/funnel-sankey": ("Sankey do funil",
+                                "Fluxo da safra pelo funil: quantos chegam em cada etapa, quantos caem (Lost) ou "
+                                "ficam parados em cada uma, até o Won. base=created conta pela criação; peso=amt "
+                                "usa valor; dtype filtra o deal type."),
     "/pipeline/legal": ("Legal",
                         "Ticket médio e conversão de deals fechados com jurídico envolvido × sem. env = definição "
                         "de envolvimento; coh = coorte."),

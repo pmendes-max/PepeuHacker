@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Sankey do funil · pepeuhacker{% endblock %}
+
+{% block content %}
+<h1>Sankey do funil</h1>
+<div class="page-sub">Safra com {{ base_label }} <b>{{ period_label }}</b> · destino até hoje</div>
+
+{# ---------- Totais ---------- #}
+<div class="panel">
+  <div class="stats-strip">
+    <div class="stat c-blue" data-drill="{{ drill_total }}">
+      <div class="stat-l">Entraram no funil</div>
+      <div class="stat-v">{{ total|intg }}</div>
+    </div>
+    <div class="stat c-slate" data-drill="{{ drill_total }}">
+      <div class="stat-l">Valor</div>
+      <div class="stat-v">{{ total_amt|brl }}</div>
+    </div>
+    <div class="stat c-green" data-drill="{{ drill_won }}">
+      <div class="stat-l">Won</div>
+      <div class="stat-v">{{ won|intg }}{% if won_pct is not none %} <small>· {{ won_pct|pctraw }}</small>{% endif %}</div>
+    </div>
+    <div class="stat c-red">
+      <div class="stat-l">Lost</div>
+      <div class="stat-v">{{ lost_tot|intg }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-l">Em aberto</div>
+      <div class="stat-v">{{ open_tot|intg }}</div>
+    </div>
+    <div class="stat is-total">
+      <div class="stat-l">Win rate (fechados)</div>
+      <div class="stat-v">{% if win_rate is not none %}{{ win_rate|pctraw }}{% else %}—{% endif %}</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Fluxo por etapa</h2>
+    <span class="ph" style="margin:0">espessura = {{ 'valor' if peso == 'amt' else 'deals' }} · clique em qualquer faixa para ver os deals</span>
+  </div>
+
+  <div class="sk-chips">
+    <div class="grain-switch">
+      {% for b in bases %}<a class="grain-btn {% if b.active %}active{% endif %}" href="{{ b.url }}">{{ b.label }}</a>{% endfor %}
+    </div>
+    <div class="grain-switch">
+      {% for p in pesos %}<a class="grain-btn {% if p.active %}active{% endif %}" href="{{ p.url }}">{{ p.label }}</a>{% endfor %}
+    </div>
+  </div>
+
+  {% if lay %}
+  {% macro val(el) %}{% if peso == 'amt' %}{{ el.amt|brl }}{% else %}{{ el.n|intg }}{% endif %}{% endmacro %}
+  <div class="sk-wrap">
+    <svg class="sk" viewBox="0 0 {{ lay.W }} {{ lay.H|round(0, 'ceil')|int }}" role="img"
+         aria-label="Sankey do funil: deals por etapa, perdas e avanço até o Won">
+      {# Faixas primeiro, nós por cima. #}
+      {% for l in lay.links %}
+        <path class="sk-link sk-{{ l.kind }}" d="{{ l.d }}"
+              {% if l.kind == 'adv' %}style="fill:{{ l.color }}"{% endif %}
+              data-drill="{{ l.drill }}">
+          <title>{% if l.kind == 'adv' %}{{ l.label }} → {{ lay.nodes[l.num].label }}:{{ l.n|intg }} deals · {{ l.amt|brl }}{% if l.pct is not none %} ({{ l.pct|pctraw }}){% endif %}{% elif l.kind == 'lost' %}Caíram em {{ l.label }}: {{ l.n|intg }} deals · {{ l.amt|brl }}{% else %}Parados em {{ l.label }}: {{ l.n|intg }} deals · {{ l.amt|brl }}{% endif %}</title>
+        </path>
+      {% endfor %}
+
+      {% for nd in lay.nodes %}
+        <rect class="sk-node" x="{{ nd.x }}" y="{{ nd.y }}" width="{{ nd.w }}" height="{{ nd.h }}"
+              rx="2" style="fill:{{ nd.color }}" data-drill="{{ nd.drill }}">
+          <title>{{ nd.label }}: {{ nd.n|intg }} deals · {{ nd.amt|brl }}</title>
+        </rect>
+        {# Won é a última coluna: rótulo alinhado à direita pra não sair do quadro. #}
+        {% set tx = nd.x + nd.w if nd.num == 7 else nd.x %}
+        {% set ta = 'end' if nd.num == 7 else 'start' %}
+        <text class="sk-t-stage{% if nd.num == 7 %} sk-t-won{% endif %}" x="{{ tx }}" y="{{ nd.y - 30 }}" text-anchor="{{ ta }}">{{ nd.label }}</text>
+        <text class="sk-t-val" x="{{ tx }}" y="{{ nd.y - 12 }}" text-anchor="{{ ta }}">{{ val(nd) }}{% if nd.num > 1 %} · {{ nd.pct1|pctraw }}{% endif %}</text>
+      {% endfor %}
+
+      {# Taxa de avanço no meio de cada faixa de cima. #}
+      {% for l in lay.links if l.kind == 'adv' and l.pct is not none %}
+        <g class="sk-pill" data-drill="{{ l.drill }}" transform="translate({{ l.lx }},{{ l.ly }})">
+          <rect x="-26" y="-10" width="52" height="20" rx="10"/>
+          <text y="4">{{ l.pct|pctraw }}</text>
+        </g>
+      {% endfor %}
+
+      {% for dp in lay.drops %}
+        <rect class="sk-drop sk-drop-{{ dp.kind }}" x="{{ dp.x }}" y="{{ dp.y }}" width="{{ dp.w }}" height="{{ dp.h }}"
+              rx="2" data-drill="{{ dp.drill }}"/>
+        <text class="sk-t-drop sk-t-{{ dp.kind }}" x="{{ dp.x + dp.w + 6 }}" y="{{ dp.y + 11 }}" data-drill="{{ dp.drill }}">
+          <tspan font-weight="700">{{ 'Lost' if dp.kind == 'lost' else 'Aberto' }}</tspan> {{ val(dp) }}{% if dp.pct is not none %} · {{ dp.pct|pctraw }}{% endif %}
+        </text>
+      {% endfor %}
+    </svg>
+  </div>
+  <p class="sk-note">Cada deal conta até a etapa mais funda que alcançou. Deal que pulou etapa conta como tendo passado pelas anteriores, por isso os números podem diferir do Funil II. A % ao lado de cada etapa é sobre quem entrou no funil; a % de cada queda e de cada avanço é sobre quem chegou naquela etapa.</p>
+  {% else %}
+  <p class="ph">Nenhum deal entrou no funil nesse período com esses filtros.</p>
+  {% endif %}
+</div>
+
+{% if lay %}
+<div class="panel">
+  <div class="panel-head"><h2>Onde cai e onde avança</h2></div>
+  <div class="table-wrap">
+  <table class="data">
+    <thead><tr>
+      <th>Etapa</th><th class="num">Chegaram</th><th class="num">Avançaram</th>
+      <th class="num">Lost aqui</th><th class="num">Parados aqui</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td class="first"><span class="leg-dot" style="background:{{ r.color }}"></span>{{ r.label }}</td>
+        <td class="num"><span class="sk-cell" data-drill="{{ r.drill }}">{{ r.n|intg }}</span></td>
+        <td class="num"><span class="sk-cell" data-drill="{{ r.adv_drill }}" title="→ {{ r.next_label }}">{{ r.adv|intg }}</span>
+          <small class="muted">{% if r.adv_pct is not none %}{{ r.adv_pct|pctraw }}{% endif %}</small></td>
+        <td class="num sk-c-lost"><span class="sk-cell" data-drill="{{ r.lost_drill }}">{{ r.lost|intg }}</span>
+          <small class="muted">{% if r.lost_pct is not none %}{{ r.lost_pct|pctraw }}{% endif %}</small></td>
+        <td class="num"><span class="sk-cell" data-drill="{{ r.open_drill }}">{{ r.open|intg }}</span>
+          <small class="muted">{% if r.open_pct is not none %}{{ r.open_pct|pctraw }}{% endif %}</small></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
+
+{% include "_drilldown.html" %}
+
+<style>
+  .sk-chips{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
+  .sk-wrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .sk{ display:block; width:100%; min-width:880px; height:auto; }
+  .sk-link{ fill-opacity:.28; cursor:pointer; transition:fill-opacity .12s ease; }
+  .sk-link:hover{ fill-opacity:.55; }
+  .sk-lost{ fill:#B91C1C; }
+  .sk-open{ fill:#94A3B8; }
+  .sk-node{ cursor:pointer; }
+  .sk-node:hover, .sk-drop:hover{ filter:brightness(1.1); }
+  .sk-drop{ cursor:pointer; }
+  .sk-drop-lost{ fill:#B91C1C; }
+  .sk-drop-open{ fill:#94A3B8; }
+  .sk text{ font-family:inherit; font-variant-numeric:tabular-nums; }
+  .sk-t-stage{ font-size:13px; font-weight:700; fill:var(--fg); }
+  .sk-t-won{ fill:#15803D; }
+  .sk-t-val{ font-size:12px; fill:var(--muted); }
+  .sk-t-drop{ font-size:11.5px; cursor:pointer; }
+  .sk-t-lost{ fill:#B91C1C; }
+  .sk-t-open{ fill:var(--muted); }
+  .sk-pill{ cursor:pointer; }
+  .sk-pill rect{ fill:var(--surface); stroke:color-mix(in srgb, #2563EB 40%, transparent); }
+  .sk-pill text{ font-size:11px; font-weight:700; fill:#1D4ED8; text-anchor:middle; }
+  .sk-pill:hover rect{ fill:color-mix(in srgb, #2563EB 12%, var(--surface)); }
+  .sk-note{ font-size:12px; color:var(--muted); margin:10px 0 0; }
+  .sk-cell{ cursor:pointer; border-bottom:1px dotted var(--muted-2); }
+  .sk-cell:hover{ color:var(--accent, #2563EB); }
+  .sk-c-lost .sk-cell{ color:#B91C1C; }
+</style>
+{% endblock %}
