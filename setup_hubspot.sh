@@ -10,8 +10,8 @@
 # `read -s` não ecoa na tela e o valor vai direto pro Secret Manager e pro
 # arquivo local com permissão 600.
 #
-# ANTES DE RODAR, crie o Private App em:
-#   HubSpot → Settings → Integrations → Private Apps → Create private app
+# ANTES DE RODAR, crie a Service key (substituiu os Private Apps em 11/2026):
+#   HubSpot → Development → Legacy Apps → Create → Service key
 # com estes escopos (exigidos pelo hubspot.py):
 #   crm.objects.calls.read
 #   crm.objects.emails.read
@@ -26,17 +26,13 @@ export CLOUDSDK_PYTHON="$HOME/.local/python312/bin/python3"
 PROJETO="tractian-bi"
 SA="senior-leadership@tractian-bi.iam.gserviceaccount.com"
 
-echo "Cole o token do Private App (formato pat-na2-...). Nada será exibido na tela."
+echo "Cole a Service key (ou token de Private App). Nada será exibido na tela."
 read -r -s -p "HUBSPOT_TOKEN: " TOKEN
 echo
 
-case "$TOKEN" in
-  pat-*) : ;;
-  "")   echo "ERRO: vazio. Abortado."; exit 1 ;;
-  *)    echo "AVISO: não começa com 'pat-'. O hubspot.py espera um Private App token."
-        read -r -p "Continuar assim mesmo? [s/N] " ok
-        [ "$ok" = "s" ] || { echo "Abortado."; exit 1; } ;;
-esac
+# Aceita token de Private App legado (pat-...) ou Service key, que substituiu
+# os Private Apps em 11/2026 — os dois vão no mesmo header Bearer.
+[ -n "$TOKEN" ] || { echo "ERRO: vazio. Abortado."; exit 1; }
 
 # ---- 1. Local: o caminho que o hubspot.py procura -------------------------
 mkdir -p "$HOME/.config/hubspot"
