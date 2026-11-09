@@ -18,6 +18,7 @@
 #   crm.objects.meetings.read
 #   crm.objects.contacts.read
 #   crm.objects.owners.read
+#   crm.objects.deals.read     (ponte direta dos deals, hs_sync.py)
 set -euo pipefail
 
 GCLOUD="$HOME/google-cloud-sdk/bin/gcloud"

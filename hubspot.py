@@ -86,7 +86,7 @@ def _headers() -> dict:
         raise HubSpotError(
             "HUBSPOT_TOKEN não configurado. Cria um Private App no HubSpot com escopos "
             "crm.objects.calls.read, crm.objects.emails.read, crm.objects.meetings.read, "
-            "crm.objects.contacts.read, crm.objects.owners.read e cola o token em "
+            "crm.objects.contacts.read, crm.objects.owners.read, crm.objects.deals.read e cola o token em "
             "~/.config/hubspot/env (formato: export HUBSPOT_TOKEN='pat-na2-...')."
         )
     return {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}

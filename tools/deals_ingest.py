@@ -14,29 +14,24 @@ uma linha por deal, ficando com a versão de `hs_lastmodifieddate` mais nova.
 A view `hubspot_deals_live` mescla essa tabela com as outras duas e fica com a
 linha mais recente de cada deal — quando a nekt voltar, ela ganha sozinha.
 
+Desde 11/2026 o app faz esta carga sozinho (`hs_sync.py`, com o HUBSPOT_TOKEN).
+Este script fica como plano B manual, pelo conector do Claude.
+
 Uso:
     python tools/deals_ingest.py load <arquivo.json> [<arquivo.json> ...]
     python tools/deals_ingest.py status
 """
 import json
 import sys
+from pathlib import Path
 from datetime import datetime, timezone
 
 from google.cloud import bigquery
 
-TABELA = "tractian-bi.pepeuhacker.hubspot_deals_mcp"
-SCHEMA = [
-    bigquery.SchemaField("dealId", "STRING", mode="REQUIRED"),
-    bigquery.SchemaField("dealname", "STRING"),
-    bigquery.SchemaField("pipeline", "STRING"),
-    bigquery.SchemaField("dealstage", "STRING"),
-    bigquery.SchemaField("closedate", "TIMESTAMP"),
-    bigquery.SchemaField("hs_manual_forecast_category", "STRING"),
-    bigquery.SchemaField("amount", "FLOAT"),
-    bigquery.SchemaField("hubspot_owner_id", "STRING"),
-    bigquery.SchemaField("hs_lastmodifieddate", "TIMESTAMP"),
-    bigquery.SchemaField("carregado_em", "TIMESTAMP"),
-]
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import hs_sync  # noqa: E402 — mesmas colunas e o mesmo MERGE do sincronizador automático
+
+TABELA = hs_sync.TABELA
 
 
 def _ler(caminho):
@@ -46,60 +41,15 @@ def _ler(caminho):
     return d.get("results", []), d.get("total")
 
 
-def _linha(r, agora):
-    p = r.get("properties") or {}
-    amt = p.get("amount")
-    try:
-        amt = float(amt) if amt not in (None, "") else None
-    except ValueError:
-        amt = None
-    return {
-        "dealId": str(r.get("id") or p.get("hs_object_id")),
-        "dealname": p.get("dealname"),
-        "pipeline": p.get("pipeline"),
-        "dealstage": p.get("dealstage"),
-        "closedate": p.get("closedate") or None,
-        "hs_manual_forecast_category": p.get("hs_manual_forecast_category") or None,
-        "amount": amt,
-        "hubspot_owner_id": p.get("hubspot_owner_id"),
-        "hs_lastmodifieddate": p.get("hs_lastmodifieddate"),
-        "carregado_em": agora,
-    }
-
-
 def load(arquivos):
     agora = datetime.now(timezone.utc).isoformat()
-    por_deal = {}
+    linhas = []
     for a in arquivos:
         res, total = _ler(a)
         print(f"  {a.split('/')[-1]}: {len(res)} deals (total da busca {total})")
-        for r in res:
-            ln = _linha(r, agora)
-            ant = por_deal.get(ln["dealId"])
-            if ant is None or (ln["hs_lastmodifieddate"] or "") >= (ant["hs_lastmodifieddate"] or ""):
-                por_deal[ln["dealId"]] = ln
-    linhas = list(por_deal.values())
-    c = bigquery.Client(project="tractian-bi")
-    c.create_table(bigquery.Table(TABELA, schema=SCHEMA), exists_ok=True)
-    stage = TABELA + "_stage"
-    c.load_table_from_json(
-        linhas, stage,
-        job_config=bigquery.LoadJobConfig(schema=SCHEMA, write_disposition="WRITE_TRUNCATE"),
-    ).result()
-    # MERGE: só substitui quando a versão nova é tão ou mais recente.
-    q = c.query(f"""
-    MERGE `{TABELA}` t
-    USING `{stage}` s ON t.dealId = s.dealId
-    WHEN MATCHED AND (t.hs_lastmodifieddate IS NULL OR s.hs_lastmodifieddate >= t.hs_lastmodifieddate) THEN
-      UPDATE SET dealname = s.dealname, pipeline = s.pipeline, dealstage = s.dealstage,
-                 closedate = s.closedate, hs_manual_forecast_category = s.hs_manual_forecast_category,
-                 amount = s.amount, hubspot_owner_id = s.hubspot_owner_id,
-                 hs_lastmodifieddate = s.hs_lastmodifieddate, carregado_em = s.carregado_em
-    WHEN NOT MATCHED THEN INSERT ROW
-    """)
-    q.result()
-    c.delete_table(stage, not_found_ok=True)
-    print(json.dumps({"deals_lidos": len(linhas), "linhas_afetadas": q.num_dml_affected_rows}))
+        linhas += [hs_sync.linha(r, agora) for r in res]
+    n = hs_sync.merge(linhas)
+    print(json.dumps({"deals_lidos": len(linhas), "linhas_afetadas": n}))
 
 
 def status():

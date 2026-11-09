@@ -15178,6 +15178,24 @@ def _midnight_loop() -> None:
         _snapshot_forecast_midnight()
 
 
+def _hs_sync_loop(interval: int = 600) -> None:
+    """Ponte direta HubSpot → BigQuery (ver `hs_sync.py`), de 10 em 10 min.
+
+    Grava em `pepeuhacker.hubspot_deals_mcp`, que já está no gate do
+    `_refresh_loop`: deal alterado no HubSpot chega à tela em ~10-15 min, sem
+    ninguém rodar carga à mão. Sem HUBSPOT_TOKEN o laço nem começa. Falha numa
+    volta (API fora, cota) só adia para a próxima: a marca d'água vem da tabela,
+    então nada se perde."""
+    import hs_sync
+    while True:
+        try:
+            r = hs_sync.sincronizar()
+            print(f"pepeuhacker · sync HubSpot: {r}", flush=True)
+        except Exception as e:  # noqa: BLE001 — a ponte nunca derruba o app
+            print(f"pepeuhacker · sync HubSpot falhou ({e})", flush=True)
+        time.sleep(interval)
+
+
 # Estado do frescor, preenchido pelo `_refresh_loop` e lido pelo selo das telas.
 # (epoch da última gravação NA FONTE, epoch do último reaquecimento daqui)
 _FRESH_LOCK = threading.Lock()
@@ -16163,6 +16181,10 @@ if __name__ == "__main__":
         threading.Thread(target=_refresh_loop, kwargs={"last_src": _src0},
                          name="cache-refresher", daemon=True).start()
         threading.Thread(target=_midnight_loop, name="forecast-midnight", daemon=True).start()
+        if hubspot.is_configured():
+            threading.Thread(target=_hs_sync_loop, name="hs-sync", daemon=True).start()
+        else:
+            print("pepeuhacker · HUBSPOT_TOKEN ausente: ponte HubSpot desligada", flush=True)
     from waitress import serve
     # HOST: 127.0.0.1 (padrão, só local) ou 0.0.0.0 (exposto na rede/VPN p/ o time
     # testar). SEM autenticação — usar só em rede interna/VPN confiável.
